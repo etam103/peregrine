@@ -14,6 +14,23 @@ pub enum Op {
     Sum(Tensor),
     Scale(Tensor, f32),
     AddBias(Tensor, Tensor), // [batch, features] + [1, features] broadcast
+    Conv2d(Tensor, Tensor, Tensor), // input, kernel, bias
+    MaxPool2d {
+        input: Tensor,
+        max_indices: Vec<usize>, // flat index into input for each output element
+    },
+    Flatten {
+        input: Tensor,
+        original_shape: Vec<usize>, // shape before flatten, for backward reshape
+    },
+}
+
+/// Compute flat index for a 4D tensor with shape [N, C, H, W].
+fn idx4(n: usize, c: usize, h: usize, w: usize, shape: &[usize]) -> usize {
+    n * shape[1] * shape[2] * shape[3]
+        + c * shape[2] * shape[3]
+        + h * shape[3]
+        + w
 }
 
 struct TensorInner {
@@ -179,6 +196,100 @@ impl Tensor {
         Tensor::from_op(data, a.shape.clone(), Op::AddBias(self.clone(), bias.clone()))
     }
 
+    /// 2D convolution: self=[N,Ci,H,W], kernel=[Co,Ci,kH,kW], bias=[Co]. Stride=1, no padding.
+    pub fn conv2d(&self, kernel: &Tensor, bias: &Tensor) -> Tensor {
+        let inp = self.0.borrow();
+        let ker = kernel.0.borrow();
+        let bi = bias.0.borrow();
+        assert_eq!(inp.shape.len(), 4);
+        assert_eq!(ker.shape.len(), 4);
+        let (n, ci, h, w) = (inp.shape[0], inp.shape[1], inp.shape[2], inp.shape[3]);
+        let (co, ci_k, kh, kw) = (ker.shape[0], ker.shape[1], ker.shape[2], ker.shape[3]);
+        assert_eq!(ci, ci_k);
+        assert_eq!(bi.shape, vec![co]);
+        let oh = h - kh + 1;
+        let ow = w - kw + 1;
+        let out_shape = vec![n, co, oh, ow];
+        let mut data = vec![0.0f32; n * co * oh * ow];
+        for b in 0..n {
+            for oc in 0..co {
+                for i in 0..oh {
+                    for j in 0..ow {
+                        let mut sum = bi.data[oc];
+                        for ic in 0..ci {
+                            for ki in 0..kh {
+                                for kj in 0..kw {
+                                    sum += inp.data[idx4(b, ic, i + ki, j + kj, &inp.shape)]
+                                        * ker.data[idx4(oc, ic, ki, kj, &ker.shape)];
+                                }
+                            }
+                        }
+                        data[idx4(b, oc, i, j, &out_shape)] = sum;
+                    }
+                }
+            }
+        }
+        Tensor::from_op(
+            data,
+            out_shape,
+            Op::Conv2d(self.clone(), kernel.clone(), bias.clone()),
+        )
+    }
+
+    /// 2x2 max pooling with stride 2.
+    pub fn max_pool2d(&self) -> Tensor {
+        let inp = self.0.borrow();
+        assert_eq!(inp.shape.len(), 4);
+        let (n, c, h, w) = (inp.shape[0], inp.shape[1], inp.shape[2], inp.shape[3]);
+        assert!(h % 2 == 0 && w % 2 == 0, "H and W must be divisible by 2");
+        let oh = h / 2;
+        let ow = w / 2;
+        let out_shape = vec![n, c, oh, ow];
+        let out_size = n * c * oh * ow;
+        let mut data = vec![0.0f32; out_size];
+        let mut max_indices = vec![0usize; out_size];
+        for b in 0..n {
+            for ch in 0..c {
+                for i in 0..oh {
+                    for j in 0..ow {
+                        let mut best_val = f32::NEG_INFINITY;
+                        let mut best_idx = 0;
+                        for di in 0..2 {
+                            for dj in 0..2 {
+                                let fi = idx4(b, ch, i * 2 + di, j * 2 + dj, &inp.shape);
+                                if inp.data[fi] > best_val {
+                                    best_val = inp.data[fi];
+                                    best_idx = fi;
+                                }
+                            }
+                        }
+                        let oi = idx4(b, ch, i, j, &out_shape);
+                        data[oi] = best_val;
+                        max_indices[oi] = best_idx;
+                    }
+                }
+            }
+        }
+        Tensor::from_op(data, out_shape, Op::MaxPool2d {
+            input: self.clone(),
+            max_indices,
+        })
+    }
+
+    /// Flatten [N, C, H, W] -> [N, C*H*W].
+    pub fn flatten(&self) -> Tensor {
+        let inp = self.0.borrow();
+        assert!(inp.shape.len() >= 2, "need at least 2 dims to flatten");
+        let n = inp.shape[0];
+        let rest: usize = inp.shape[1..].iter().product();
+        let original_shape = inp.shape.clone();
+        Tensor::from_op(
+            inp.data.clone(),
+            vec![n, rest],
+            Op::Flatten { input: self.clone(), original_shape },
+        )
+    }
+
     // ---- Backward (reverse-mode autodiff) ----
 
     pub fn backward(&self) {
@@ -301,6 +412,102 @@ impl Tensor {
                 accumulate_grad(bias, &grad_bias);
                 input.backward_inner();
                 bias.backward_inner();
+            }
+            Op::Conv2d(ref input, ref kernel, ref bias) => {
+                let in_shape = input.shape();
+                let k_shape = kernel.shape();
+                let (n, ci, h, w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
+                let (co, _, kh, kw) = (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
+                let oh = h - kh + 1;
+                let ow = w - kw + 1;
+                let out_shape = vec![n, co, oh, ow];
+                let in_data = input.data();
+                let k_data = kernel.data();
+
+                // grad_bias[oc] = sum over (n, oh, ow) of grad[n,oc,i,j]
+                let mut grad_bias = vec![0.0f32; co];
+                for b in 0..n {
+                    for oc in 0..co {
+                        for i in 0..oh {
+                            for j in 0..ow {
+                                grad_bias[oc] += grad[idx4(b, oc, i, j, &out_shape)];
+                            }
+                        }
+                    }
+                }
+
+                // grad_kernel[oc,ic,ki,kj] = sum over (n,i,j) of
+                //   grad[n,oc,i,j] * input[n,ic,i+ki,j+kj]
+                let mut grad_kernel = vec![0.0f32; co * ci * kh * kw];
+                for b in 0..n {
+                    for oc in 0..co {
+                        for ic in 0..ci {
+                            for ki in 0..kh {
+                                for kj in 0..kw {
+                                    let mut s = 0.0;
+                                    for i in 0..oh {
+                                        for j in 0..ow {
+                                            s += grad[idx4(b, oc, i, j, &out_shape)]
+                                                * in_data[idx4(b, ic, i + ki, j + kj, &in_shape)];
+                                        }
+                                    }
+                                    grad_kernel[idx4(oc, ic, ki, kj, &k_shape)] += s;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // grad_input[n,ic,ih,iw] = sum over (oc,ki,kj) of
+                //   grad[n,oc,ih-ki,iw-kj] * kernel[oc,ic,ki,kj]
+                //   where ih-ki and iw-kj are valid output positions
+                let mut grad_input = vec![0.0f32; n * ci * h * w];
+                for b in 0..n {
+                    for ic in 0..ci {
+                        for ih in 0..h {
+                            for iw in 0..w {
+                                let mut s = 0.0;
+                                for oc in 0..co {
+                                    for ki in 0..kh {
+                                        for kj in 0..kw {
+                                            let oi = ih as isize - ki as isize;
+                                            let oj = iw as isize - kj as isize;
+                                            if oi >= 0 && oi < oh as isize
+                                                && oj >= 0 && oj < ow as isize
+                                            {
+                                                s += grad[idx4(b, oc, oi as usize, oj as usize, &out_shape)]
+                                                    * k_data[idx4(oc, ic, ki, kj, &k_shape)];
+                                            }
+                                        }
+                                    }
+                                }
+                                grad_input[idx4(b, ic, ih, iw, &in_shape)] += s;
+                            }
+                        }
+                    }
+                }
+
+                accumulate_grad(input, &grad_input);
+                accumulate_grad(kernel, &grad_kernel);
+                accumulate_grad(bias, &grad_bias);
+                input.backward_inner();
+                kernel.backward_inner();
+                bias.backward_inner();
+            }
+            Op::MaxPool2d { ref input, ref max_indices } => {
+                let in_size = input.size();
+                let mut grad_input = vec![0.0f32; in_size];
+                for (out_idx, &in_idx) in max_indices.iter().enumerate() {
+                    grad_input[in_idx] += grad[out_idx];
+                }
+                accumulate_grad(input, &grad_input);
+                input.backward_inner();
+            }
+            Op::Flatten { ref input, .. } => {
+                // Gradient has same flat data, just needs to be accumulated as-is
+                // since the underlying data layout is identical.
+                accumulate_grad(input, &grad);
+                input.backward_inner();
             }
         }
     }
