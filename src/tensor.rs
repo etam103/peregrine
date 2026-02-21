@@ -23,6 +23,8 @@ pub enum Op {
         input: Tensor,
         original_shape: Vec<usize>, // shape before flatten, for backward reshape
     },
+    Select(Tensor, Vec<usize>),       // (input, indices into input's flat data)
+    BceLoss(Tensor, Vec<f32>),        // (logits, constant targets)
 }
 
 /// Compute flat index for a 4D tensor with shape [N, C, H, W].
@@ -290,16 +292,77 @@ impl Tensor {
         )
     }
 
+    /// Gather elements by flat index, preserving autograd connectivity.
+    /// out[i] = self.data[indices[i]]
+    pub fn select(&self, indices: &[usize]) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = indices.iter().map(|&i| inner.data[i]).collect();
+        let n = indices.len();
+        Tensor::from_op(data, vec![n], Op::Select(self.clone(), indices.to_vec()))
+    }
+
+    /// BCE with logits loss, reduced to scalar mean. Targets are constants.
+    /// Numerically stable: bce(x,t) = max(x,0) - x*t + ln(1 + exp(-|x|))
+    pub fn bce_with_logits_loss(&self, targets: &[f32]) -> Tensor {
+        let inner = self.0.borrow();
+        let n = inner.data.len();
+        assert_eq!(n, targets.len(), "predictions and targets must have same length");
+        let loss: f32 = inner.data.iter().zip(targets).map(|(&x, &t)| {
+            x.max(0.0) - x * t + (1.0 + (-x.abs()).exp()).ln()
+        }).sum::<f32>() / n as f32;
+        Tensor::from_op(vec![loss], vec![1], Op::BceLoss(self.clone(), targets.to_vec()))
+    }
+
     // ---- Backward (reverse-mode autodiff) ----
+
+    fn tensor_id(&self) -> usize {
+        Rc::as_ptr(&self.0) as usize
+    }
+
+    /// Build topological order via post-order DFS.
+    fn build_topo(
+        &self,
+        order: &mut Vec<Tensor>,
+        visited: &mut std::collections::HashSet<usize>,
+    ) {
+        let id = self.tensor_id();
+        if !visited.insert(id) {
+            return;
+        }
+        let inputs = {
+            let op = self.0.borrow().op.clone();
+            match op {
+                Op::None => vec![],
+                Op::Add(a, b) | Op::Mul(a, b) | Op::MatMul(a, b)
+                | Op::AddBias(a, b) => vec![a, b],
+                Op::Relu(a) | Op::Sigmoid(a) | Op::Sum(a)
+                | Op::Scale(a, _) | Op::Select(a, _) | Op::BceLoss(a, _) => vec![a],
+                Op::Conv2d(a, b, c) => vec![a, b, c],
+                Op::MaxPool2d { input, .. } | Op::Flatten { input, .. } => vec![input],
+            }
+        };
+        for input in &inputs {
+            input.build_topo(order, visited);
+        }
+        order.push(self.clone());
+    }
 
     pub fn backward(&self) {
         let size = self.size();
-        // Seed gradient is 1.0 for the output tensor.
         self.0.borrow_mut().grad = Some(vec![1.0; size]);
-        self.backward_inner();
+
+        // Topological sort: process each node exactly once, from output to inputs.
+        let mut order: Vec<Tensor> = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        self.build_topo(&mut order, &mut visited);
+
+        for node in order.iter().rev() {
+            node.propagate_grad();
+        }
     }
 
-    fn backward_inner(&self) {
+    /// Propagate this node's gradient to its op inputs. Non-recursive.
+    fn propagate_grad(&self) {
         let (op, grad) = {
             let inner = self.0.borrow();
             let grad = match &inner.grad {
@@ -314,8 +377,6 @@ impl Tensor {
             Op::Add(ref a, ref b) => {
                 accumulate_grad(a, &grad);
                 accumulate_grad(b, &grad);
-                a.backward_inner();
-                b.backward_inner();
             }
             Op::Mul(ref a, ref b) => {
                 let a_data = a.data();
@@ -324,11 +385,8 @@ impl Tensor {
                 let grad_b: Vec<f32> = grad.iter().zip(&a_data).map(|(g, a)| g * a).collect();
                 accumulate_grad(a, &grad_a);
                 accumulate_grad(b, &grad_b);
-                a.backward_inner();
-                b.backward_inner();
             }
             Op::MatMul(ref a, ref b) => {
-                // C = A @ B  =>  dA = dC @ B^T,  dB = A^T @ dC
                 let a_shape = a.shape();
                 let b_shape = b.shape();
                 let (m, k) = (a_shape[0], a_shape[1]);
@@ -336,7 +394,6 @@ impl Tensor {
                 let a_data = a.data();
                 let b_data = b.data();
 
-                // dA = grad @ B^T  [M,N] x [N,K] -> [M,K]
                 let mut grad_a = vec![0.0f32; m * k];
                 for i in 0..m {
                     for j in 0..k {
@@ -348,7 +405,6 @@ impl Tensor {
                     }
                 }
 
-                // dB = A^T @ grad  [K,M] x [M,N] -> [K,N]
                 let mut grad_b = vec![0.0f32; k * n];
                 for i in 0..k {
                     for j in 0..n {
@@ -362,8 +418,6 @@ impl Tensor {
 
                 accumulate_grad(a, &grad_a);
                 accumulate_grad(b, &grad_b);
-                a.backward_inner();
-                b.backward_inner();
             }
             Op::Relu(ref input) => {
                 let input_data = input.data();
@@ -373,10 +427,8 @@ impl Tensor {
                     .map(|(g, &x)| if x > 0.0 { *g } else { 0.0 })
                     .collect();
                 accumulate_grad(input, &grad_input);
-                input.backward_inner();
             }
             Op::Sigmoid(ref input) => {
-                // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
                 let out_data = self.data();
                 let grad_input: Vec<f32> = grad
                     .iter()
@@ -384,23 +436,18 @@ impl Tensor {
                     .map(|(g, &s)| g * s * (1.0 - s))
                     .collect();
                 accumulate_grad(input, &grad_input);
-                input.backward_inner();
             }
             Op::Sum(ref input) => {
                 let n = input.size();
                 let grad_input = vec![grad[0]; n];
                 accumulate_grad(input, &grad_input);
-                input.backward_inner();
             }
             Op::Scale(ref input, s) => {
                 let grad_input: Vec<f32> = grad.iter().map(|g| g * s).collect();
                 accumulate_grad(input, &grad_input);
-                input.backward_inner();
             }
             Op::AddBias(ref input, ref bias) => {
-                // grad flows through to input unchanged
                 accumulate_grad(input, &grad);
-                // bias grad: sum over batch dimension
                 let cols = bias.shape()[1];
                 let rows = input.shape()[0];
                 let mut grad_bias = vec![0.0f32; cols];
@@ -410,8 +457,6 @@ impl Tensor {
                     }
                 }
                 accumulate_grad(bias, &grad_bias);
-                input.backward_inner();
-                bias.backward_inner();
             }
             Op::Conv2d(ref input, ref kernel, ref bias) => {
                 let in_shape = input.shape();
@@ -424,7 +469,6 @@ impl Tensor {
                 let in_data = input.data();
                 let k_data = kernel.data();
 
-                // grad_bias[oc] = sum over (n, oh, ow) of grad[n,oc,i,j]
                 let mut grad_bias = vec![0.0f32; co];
                 for b in 0..n {
                     for oc in 0..co {
@@ -436,8 +480,6 @@ impl Tensor {
                     }
                 }
 
-                // grad_kernel[oc,ic,ki,kj] = sum over (n,i,j) of
-                //   grad[n,oc,i,j] * input[n,ic,i+ki,j+kj]
                 let mut grad_kernel = vec![0.0f32; co * ci * kh * kw];
                 for b in 0..n {
                     for oc in 0..co {
@@ -458,9 +500,6 @@ impl Tensor {
                     }
                 }
 
-                // grad_input[n,ic,ih,iw] = sum over (oc,ki,kj) of
-                //   grad[n,oc,ih-ki,iw-kj] * kernel[oc,ic,ki,kj]
-                //   where ih-ki and iw-kj are valid output positions
                 let mut grad_input = vec![0.0f32; n * ci * h * w];
                 for b in 0..n {
                     for ic in 0..ci {
@@ -490,9 +529,6 @@ impl Tensor {
                 accumulate_grad(input, &grad_input);
                 accumulate_grad(kernel, &grad_kernel);
                 accumulate_grad(bias, &grad_bias);
-                input.backward_inner();
-                kernel.backward_inner();
-                bias.backward_inner();
             }
             Op::MaxPool2d { ref input, ref max_indices } => {
                 let in_size = input.size();
@@ -501,13 +537,26 @@ impl Tensor {
                     grad_input[in_idx] += grad[out_idx];
                 }
                 accumulate_grad(input, &grad_input);
-                input.backward_inner();
             }
             Op::Flatten { ref input, .. } => {
-                // Gradient has same flat data, just needs to be accumulated as-is
-                // since the underlying data layout is identical.
                 accumulate_grad(input, &grad);
-                input.backward_inner();
+            }
+            Op::Select(ref input, ref indices) => {
+                let in_size = input.size();
+                let mut grad_input = vec![0.0f32; in_size];
+                for (out_i, &in_i) in indices.iter().enumerate() {
+                    grad_input[in_i] += grad[out_i];
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::BceLoss(ref logits, ref targets) => {
+                let logit_data = logits.data();
+                let n = logit_data.len() as f32;
+                let grad_logits: Vec<f32> = logit_data.iter().zip(targets).map(|(&x, &t)| {
+                    let sig = 1.0 / (1.0 + (-x).exp());
+                    grad[0] * (sig - t) / n
+                }).collect();
+                accumulate_grad(logits, &grad_logits);
             }
         }
     }

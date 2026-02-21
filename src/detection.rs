@@ -217,7 +217,6 @@ pub fn yolo_loss(
     let lambda_noobj: f32 = 0.5;
 
     let shape = raw.shape();
-    let data = raw.data();
     let batch = shape[0];
     let num_anc = anchors.len();
     let attrs = 5 + num_classes;
@@ -228,7 +227,6 @@ pub fn yolo_loss(
     let idx = |b: usize, c: usize, h: usize, w: usize| -> usize {
         b * (shape[1] * grid_h * grid_w) + c * (grid_h * grid_w) + h * grid_w + w
     };
-    let sigmoid = |x: f32| -> f32 { 1.0 / (1.0 + (-x).exp()) };
 
     // --- Step 1: Assign each GT box to its best-matching (grid_cell, anchor). ---
     //
@@ -268,129 +266,117 @@ pub fn yolo_loss(
         }
     }
 
-    // --- Step 2: Build flat prediction/target vectors for each loss term. ---
+    // --- Step 2: Collect indices into raw tensor for each loss term. ---
     //
-    // We accumulate scalar loss components and build Tensor-based sums so the
-    // coordinate and objectness losses flow through autograd.
-    //
-    // Because the Tensor API requires equal-shaped operands for add/mul, we
-    // gather predictions into per-component flat tensors paired with target
-    // tensors. After computing the element-wise loss we sum.
+    // Instead of extracting f32 values (which breaks autograd), we collect
+    // flat indices into `raw` and use raw.select() to gather connected tensors.
 
-    let mut coord_pred_vals: Vec<f32> = Vec::new(); // (tx, ty, tw, th) raw predictions
-    let mut coord_target_vals: Vec<f32> = Vec::new();
-    let mut obj_pred_vals: Vec<f32> = Vec::new();   // objectness logits (responsible)
-    let mut noobj_pred_vals: Vec<f32> = Vec::new();  // objectness logits (not responsible)
-    let mut cls_pred_vals: Vec<f32> = Vec::new();    // class logits for responsible
-    let mut cls_target_vals: Vec<f32> = Vec::new();
+    let mut xy_indices: Vec<usize> = Vec::new();
+    let mut xy_targets: Vec<f32> = Vec::new();
+    let mut wh_indices: Vec<usize> = Vec::new();
+    let mut wh_targets: Vec<f32> = Vec::new();
+    let mut obj_indices: Vec<usize> = Vec::new();
+    let mut obj_targets: Vec<f32> = Vec::new();
+    let mut noobj_indices: Vec<usize> = Vec::new();
+    let mut noobj_targets: Vec<f32> = Vec::new();
+    let mut cls_indices: Vec<usize> = Vec::new();
+    let mut cls_targets: Vec<f32> = Vec::new();
 
     for b in 0..batch {
         for a in 0..num_anc {
             let chan_offset = a * attrs;
             for row in 0..grid_h {
                 for col in 0..grid_w {
-                    let tx_raw = data[idx(b, chan_offset + 0, row, col)];
-                    let ty_raw = data[idx(b, chan_offset + 1, row, col)];
-                    let tw_raw = data[idx(b, chan_offset + 2, row, col)];
-                    let th_raw = data[idx(b, chan_offset + 3, row, col)];
-                    let to_raw = data[idx(b, chan_offset + 4, row, col)];
+                    let tx_idx = idx(b, chan_offset + 0, row, col);
+                    let ty_idx = idx(b, chan_offset + 1, row, col);
+                    let tw_idx = idx(b, chan_offset + 2, row, col);
+                    let th_idx = idx(b, chan_offset + 3, row, col);
+                    let to_idx = idx(b, chan_offset + 4, row, col);
 
                     if let Some(gt) = responsible[b].get(&(row, col, a)) {
-                        // --- Responsible prediction: compute coord + obj + class loss ---
-
-                        // Coordinate targets: invert the decode equations.
-                        //   tx_target = sigmoid^{-1}(gt.cx / stride_w - col)
-                        //   ty_target = sigmoid^{-1}(gt.cy / stride_h - row)
-                        //   tw_target = ln(gt.w / (anchor_w * stride_w))
-                        //   th_target = ln(gt.h / (anchor_h * stride_h))
-                        //
-                        // However, the coord loss in YOLOv2 is MSE on the *decoded*
-                        // values (sigma(tx), sigma(ty), tw, th) vs targets, not on
-                        // the raw logits. So we push the sigmoid-applied tx/ty and
-                        // raw tw/th, and pair them with the target equivalents.
-
-                        let tx_dec = sigmoid(tx_raw);
-                        let ty_dec = sigmoid(ty_raw);
+                        // Coordinate: xy needs sigmoid, wh is raw.
                         let tx_tgt = (gt.cx / stride_w - col as f32).clamp(0.001, 0.999);
                         let ty_tgt = (gt.cy / stride_h - row as f32).clamp(0.001, 0.999);
+                        xy_indices.extend_from_slice(&[tx_idx, ty_idx]);
+                        xy_targets.extend_from_slice(&[tx_tgt, ty_tgt]);
 
                         let (aw, ah) = anchors[a];
                         let tw_tgt = (gt.w / (aw * stride_w)).max(1e-6).ln();
                         let th_tgt = (gt.h / (ah * stride_h)).max(1e-6).ln();
+                        wh_indices.extend_from_slice(&[tw_idx, th_idx]);
+                        wh_targets.extend_from_slice(&[tw_tgt, th_tgt]);
 
-                        coord_pred_vals.extend_from_slice(&[tx_dec, ty_dec, tw_raw, th_raw]);
-                        coord_target_vals.extend_from_slice(&[tx_tgt, ty_tgt, tw_tgt, th_tgt]);
-
-                        // Objectness target = 1 for responsible anchors.
-                        obj_pred_vals.push(to_raw);
+                        // Objectness: target = 1 for responsible anchors.
+                        obj_indices.push(to_idx);
+                        obj_targets.push(1.0);
 
                         // Classification: one-hot target.
                         for c in 0..num_classes {
-                            let logit = data[idx(b, chan_offset + 5 + c, row, col)];
-                            cls_pred_vals.push(logit);
-                            cls_target_vals.push(if c == gt.class_id { 1.0 } else { 0.0 });
+                            cls_indices.push(idx(b, chan_offset + 5 + c, row, col));
+                            cls_targets.push(if c == gt.class_id { 1.0 } else { 0.0 });
                         }
                     } else {
-                        // Not responsible: only contributes to noobj objectness loss.
-                        noobj_pred_vals.push(to_raw);
+                        // Not responsible: noobj objectness loss with target = 0.
+                        noobj_indices.push(to_idx);
+                        noobj_targets.push(0.0);
                     }
                 }
             }
         }
     }
 
-    // --- Step 3: Compute each loss term. ---
+    // --- Step 3: Compute each loss term through autograd. ---
 
-    // Binary cross-entropy: -[t * ln(sig(x)) + (1-t) * ln(1-sig(x))]
-    // We implement stable BCE on raw logits:
-    //   bce(x, t) = max(x, 0) - x*t + ln(1 + exp(-|x|))
-    let stable_bce = |logit: f32, target: f32| -> f32 {
-        logit.max(0.0) - logit * target + (1.0 + (-logit.abs()).exp()).ln()
-    };
-
-    // Helper: build coord MSE loss as a Tensor through the autograd graph.
-    // MSE = mean((pred - target)^2) where target is constant.
-    let coord_loss = if coord_pred_vals.is_empty() {
+    // Coordinate loss (xy): select -> sigmoid -> MSE
+    let xy_loss = if xy_indices.is_empty() {
         Tensor::new(vec![0.0], vec![1], false)
     } else {
-        let n = coord_pred_vals.len();
-        let pred = Tensor::new(coord_pred_vals.clone(), vec![n], false);
-        let tgt = Tensor::new(coord_target_vals.clone(), vec![n], false);
-        let diff = pred.add(&tgt.scale(-1.0));
-        let sq = diff.mul(&diff);
-        sq.sum().scale(1.0 / n as f32)
+        let n = xy_indices.len();
+        let xy_pred = raw.select(&xy_indices).sigmoid();
+        let xy_tgt = Tensor::new(xy_targets, vec![n], false);
+        let diff = xy_pred.add(&xy_tgt.scale(-1.0));
+        diff.mul(&diff).sum().scale(1.0 / n as f32)
     };
 
-    // Objectness loss (responsible): BCE with target=1.
-    let obj_loss_val: f32 = if obj_pred_vals.is_empty() {
-        0.0
+    // Coordinate loss (wh): select -> MSE (no sigmoid)
+    let wh_loss = if wh_indices.is_empty() {
+        Tensor::new(vec![0.0], vec![1], false)
     } else {
-        obj_pred_vals.iter().map(|&x| stable_bce(x, 1.0)).sum::<f32>()
-            / obj_pred_vals.len() as f32
+        let n = wh_indices.len();
+        let wh_pred = raw.select(&wh_indices);
+        let wh_tgt = Tensor::new(wh_targets, vec![n], false);
+        let diff = wh_pred.add(&wh_tgt.scale(-1.0));
+        diff.mul(&diff).sum().scale(1.0 / n as f32)
     };
 
-    // No-object loss: BCE with target=0.
-    let noobj_loss_val: f32 = if noobj_pred_vals.is_empty() {
-        0.0
+    let coord_loss = xy_loss.add(&wh_loss);
+
+    // Objectness loss (responsible): BCE with logits
+    let obj_loss = if obj_indices.is_empty() {
+        Tensor::new(vec![0.0], vec![1], false)
     } else {
-        noobj_pred_vals.iter().map(|&x| stable_bce(x, 0.0)).sum::<f32>()
-            / noobj_pred_vals.len() as f32
+        raw.select(&obj_indices).bce_with_logits_loss(&obj_targets)
     };
 
-    // Classification loss: BCE per class for responsible anchors.
-    let cls_loss_val: f32 = if cls_pred_vals.is_empty() {
-        0.0
+    // No-object loss: BCE with logits
+    let noobj_loss = if noobj_indices.is_empty() {
+        Tensor::new(vec![0.0], vec![1], false)
     } else {
-        cls_pred_vals.iter().zip(&cls_target_vals)
-            .map(|(&x, &t)| stable_bce(x, t))
-            .sum::<f32>()
-            / cls_pred_vals.len() as f32
+        raw.select(&noobj_indices).bce_with_logits_loss(&noobj_targets)
     };
 
-    // --- Step 4: Weighted sum. ---
-    let scalar_loss = obj_loss_val + lambda_noobj * noobj_loss_val + cls_loss_val;
+    // Classification loss: BCE with logits
+    let cls_loss = if cls_indices.is_empty() {
+        Tensor::new(vec![0.0], vec![1], false)
+    } else {
+        raw.select(&cls_indices).bce_with_logits_loss(&cls_targets)
+    };
+
+    // --- Step 4: Weighted sum — all terms are autograd Tensors. ---
     let total = coord_loss.scale(lambda_coord)
-        .add(&Tensor::new(vec![scalar_loss], vec![1], false));
+        .add(&obj_loss)
+        .add(&noobj_loss.scale(lambda_noobj))
+        .add(&cls_loss);
 
     total
 }
