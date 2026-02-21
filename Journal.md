@@ -1,6 +1,6 @@
 # Rustorch Performance Journal
 
-Model: YoloNet (54,344 params), 30 COCO images, batch_size=1, 20 epochs.
+Model: YoloNet (54,344 params), batch_size=1, 20 epochs.
 Hardware: Apple Silicon, macOS, Apple Accelerate BLAS.
 
 ## Baseline
@@ -69,6 +69,60 @@ Naive implementation: scalar loops for all ops, no BLAS, no parallelism.
 ### Inference
 
 No detections above 0.5 confidence threshold yet (expected — tiny model, few epochs, small dataset).
+
+## COCO val2017 full dataset run (2025-02-20)
+
+**Changes:**
+- Added `CocoDataset` loader (parses `instances_*.json` directly)
+- Auto-detects COCO val2017 images, falls back to small VOC dataset
+
+**Dataset:** COCO val2017 — 2,960 images containing car/person/dog (out of 5,000 total).
+
+| Metric | Value |
+|---|---|
+| Epoch time | ~51.5s |
+| Per-image time | ~17.4ms |
+| Total training (20 epochs) | ~17.2 min |
+| Final avg loss | 3.2757 |
+| Min loss | 0.9327 |
+
+### Per-epoch times (COCO val2017)
+
+| Epoch | Time (s) | Avg Loss | Min Loss |
+|---|---|---|---|
+| 0 | 51.02 | 3.7214 | 1.5693 |
+| 1 | 51.73 | 3.5086 | 1.2264 |
+| 2 | 51.39 | 3.4069 | 1.0845 |
+| 3 | 51.70 | 3.3545 | 1.0148 |
+| 4 | 51.98 | 3.3299 | 0.9898 |
+| 5 | 50.63 | 3.3180 | 0.9831 |
+| 6 | 51.94 | 3.3113 | 0.9662 |
+| 7 | 50.66 | 3.3067 | 0.9578 |
+| 8 | 52.15 | 3.2858 | 0.9537 |
+| 9 | 52.71 | 3.2839 | 0.9466 |
+| 10 | 51.12 | 3.2827 | 0.9423 |
+| 11 | 54.65 | 3.2817 | 0.9395 |
+| 12 | 52.94 | 3.2809 | 0.9375 |
+| 13 | 53.24 | 3.2801 | 0.9360 |
+| 14 | 52.00 | 3.2794 | 0.9350 |
+| 15 | 53.26 | 3.2787 | 0.9343 |
+| 16 | 53.54 | 3.2780 | 0.9339 |
+| 17 | 50.64 | 3.2772 | 0.9333 |
+| 18 | 50.41 | 3.2765 | 0.9330 |
+| 19 | 51.85 | 3.2757 | 0.9327 |
+
+### Inference
+
+Model now produces detections above 0.5 confidence (many false positives — expected with tiny 54k-param model). Loss decreased from 3.72 to 3.28, min per-sample loss reached 0.93.
+
+### Scaling analysis
+
+| Dataset | Images | Epoch time | Per-image |
+|---|---|---|---|
+| VOC small | 30 | 0.52s | 17.3ms |
+| COCO val2017 | 2,960 | 51.5s | 17.4ms |
+
+Per-image time is consistent (~17.4ms) regardless of dataset size, confirming no overhead from dataset scaling. Total time scales linearly with image count.
 
 ## GPU Assessment (2025-02-20)
 

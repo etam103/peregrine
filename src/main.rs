@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tensor::Tensor;
 use detection::{YoloNet, GroundTruth, GRID_H, GRID_W, INPUT_SIZE, NUM_ANCHORS};
-use dataset::{VocDataset, Dataset};
+use dataset::{VocDataset, CocoDataset, Dataset};
 use tensorboard_rs::summary_writer::SummaryWriter;
 
 const NUM_CLASSES: usize = 3;
@@ -150,17 +150,23 @@ fn targets_to_gt(targets: &[dataset::Target], img_size: usize) -> Vec<GroundTrut
 }
 
 fn main() {
-    let data_path = "data/coco_voc";
     let logdir = "runs/coco_training";
 
     println!("=== rustorch: Training YOLO on Real COCO Images ===");
     println!("Input: {}x{}x3, Grid: {}x{}, Anchors: {}", INPUT_SIZE, INPUT_SIZE, GRID_H, GRID_W, NUM_ANCHORS);
     println!("Classes: {:?}", CLASS_NAMES);
-    println!("Dataset: {}", data_path);
     println!("TensorBoard: tensorboard --logdir runs/\n");
 
-    // Load real COCO images in VOC format
-    let ds = VocDataset::load(data_path, INPUT_SIZE, &CLASS_NAMES);
+    // Try COCO val2017 first, fall back to small VOC dataset
+    let coco_json = "data/coco/annotations/instances_val2017.json";
+    let coco_images = "data/coco/val2017";
+    let ds: Box<dyn Dataset> = if std::path::Path::new(coco_images).is_dir() {
+        println!("Dataset: COCO val2017");
+        Box::new(CocoDataset::load(coco_json, coco_images, INPUT_SIZE, &CLASS_NAMES))
+    } else {
+        println!("Dataset: data/coco_voc (small)");
+        Box::new(VocDataset::load("data/coco_voc", INPUT_SIZE, &CLASS_NAMES))
+    };
     println!("Loaded {} images with {} classes\n", ds.len(), ds.num_classes());
 
     if ds.is_empty() {
@@ -210,24 +216,23 @@ fn main() {
             if loss_val < min_loss { min_loss = loss_val; }
             writer.add_scalar("loss/step", loss_val, global_step);
 
-            // Log first image of first batch each epoch with detection overlay
-            if batch_idx == 0 {
+            // Log detection overlay every N steps
+            let log_every = (num_batches / 10).max(1); // ~10 images per epoch
+            if batch_idx % log_every == 0 {
                 let single_img = &img_data[..pixels_per_img];
                 let input = Tensor::new(single_img.to_vec(), vec![1, 3, INPUT_SIZE, INPUT_SIZE], false);
                 let detections = net.detect_nms(&input, 0.5, 0.4);
 
                 let mut rgb = chw_to_rgb_bytes(single_img, INPUT_SIZE);
-                // Draw ground truth with class-colored boxes
                 for gt in &gt_per_image[0] {
                     let label = format!("GT:{}", class_name(gt.class_id).to_uppercase());
                     draw_labeled_box(&mut rgb, INPUT_SIZE, gt.cx, gt.cy, gt.w, gt.h, gt_color(gt.class_id), 2, &label);
                 }
-                // Draw top 5 predictions with class-colored boxes
                 for d in detections[0].iter().take(5) {
                     let label = format!("{}", class_name(d.class_id).to_uppercase());
                     draw_labeled_box(&mut rgb, INPUT_SIZE, d.cx, d.cy, d.w, d.h, pred_color(d.class_id), 2, &label);
                 }
-                writer.add_image("coco/detections", &rgb, &[3, INPUT_SIZE, INPUT_SIZE], epoch);
+                writer.add_image("coco/detections", &rgb, &[3, INPUT_SIZE, INPUT_SIZE], global_step);
             }
 
             loss.backward();

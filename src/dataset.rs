@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use image::imageops::FilterType;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -443,6 +444,149 @@ impl Dataset for CsvDataset {
                 }
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COCO JSON dataset
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CocoJson {
+    images: Vec<CocoImage>,
+    annotations: Vec<CocoAnnotation>,
+    categories: Vec<CocoCategory>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct CocoImage {
+    id: u64,
+    file_name: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Deserialize)]
+struct CocoAnnotation {
+    image_id: u64,
+    category_id: u64,
+    bbox: [f32; 4], // [x, y, width, height] in pixels
+}
+
+#[derive(Deserialize)]
+struct CocoCategory {
+    id: u64,
+    name: String,
+}
+
+/// Dataset loader for COCO JSON format (instances_*.json).
+pub struct CocoDataset {
+    samples: Vec<Sample>,
+    classes: Vec<String>,
+    image_size: usize,
+}
+
+impl CocoDataset {
+    /// Load a COCO dataset from a JSON annotation file and image directory.
+    ///
+    /// `json_path`: path to instances_*.json
+    /// `image_dir`: directory containing the image files
+    /// `class_names`: only keep annotations for these classes
+    pub fn load(json_path: &str, image_dir: &str, image_size: usize, class_names: &[&str]) -> Self {
+        let classes: Vec<String> = class_names.iter().map(|s| s.to_string()).collect();
+        let class_set: HashMap<&str, usize> = class_names
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| (name, i))
+            .collect();
+
+        let json_content = fs::read_to_string(json_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {}", json_path, e));
+        let coco: CocoJson = serde_json::from_str(&json_content)
+            .unwrap_or_else(|e| panic!("cannot parse {}: {}", json_path, e));
+
+        // Map COCO category_id -> our class_id (only for requested classes)
+        let cat_to_class: HashMap<u64, usize> = coco.categories.iter()
+            .filter_map(|cat| class_set.get(cat.name.as_str()).map(|&id| (cat.id, id)))
+            .collect();
+
+        // Map image_id -> image metadata
+        let image_map: HashMap<u64, &CocoImage> = coco.images.iter()
+            .map(|img| (img.id, img))
+            .collect();
+
+        // Group annotations by image_id
+        let mut anns_per_image: HashMap<u64, Vec<Annotation>> = HashMap::new();
+        for ann in &coco.annotations {
+            if let Some(&class_id) = cat_to_class.get(&ann.category_id) {
+                let [x, y, w, h] = ann.bbox;
+                anns_per_image.entry(ann.image_id).or_default().push(Annotation {
+                    class_id,
+                    xmin: x,
+                    ymin: y,
+                    xmax: x + w,
+                    ymax: y + h,
+                });
+            }
+        }
+
+        let image_dir = PathBuf::from(image_dir);
+        let mut samples: Vec<Sample> = anns_per_image.into_iter()
+            .filter_map(|(image_id, annotations)| {
+                let img = image_map.get(&image_id)?;
+                let image_path = image_dir.join(&img.file_name);
+                if !image_path.exists() {
+                    return None;
+                }
+                Some(Sample { image_path, annotations })
+            })
+            .collect();
+
+        samples.sort_by(|a, b| a.image_path.cmp(&b.image_path));
+
+        eprintln!(
+            "CocoDataset: loaded {} samples with {} classes from {}",
+            samples.len(), classes.len(), json_path,
+        );
+
+        CocoDataset { samples, classes, image_size }
+    }
+}
+
+impl Dataset for CocoDataset {
+    fn len(&self) -> usize { self.samples.len() }
+    fn image_size(&self) -> usize { self.image_size }
+    fn num_classes(&self) -> usize { self.classes.len() }
+    fn class_name(&self, id: usize) -> &str { &self.classes[id] }
+
+    fn load_image(&self, idx: usize) -> Vec<f32> {
+        load_and_preprocess(&self.samples[idx].image_path, self.image_size)
+    }
+
+    fn get_targets(&self, idx: usize) -> Vec<Target> {
+        let sample = &self.samples[idx];
+        let (orig_w, orig_h) = image::image_dimensions(&sample.image_path)
+            .unwrap_or_else(|e| {
+                panic!("cannot read dimensions of {}: {}", sample.image_path.display(), e)
+            });
+        let ow = orig_w as f32;
+        let oh = orig_h as f32;
+
+        sample.annotations.iter().map(|ann| {
+            let cx = ((ann.xmin + ann.xmax) / 2.0) / ow;
+            let cy = ((ann.ymin + ann.ymax) / 2.0) / oh;
+            let w = (ann.xmax - ann.xmin) / ow;
+            let h = (ann.ymax - ann.ymin) / oh;
+            Target {
+                batch_idx: 0,
+                class_id: ann.class_id,
+                cx: cx.clamp(0.0, 1.0),
+                cy: cy.clamp(0.0, 1.0),
+                w: w.clamp(0.0, 1.0),
+                h: h.clamp(0.0, 1.0),
+            }
+        }).collect()
     }
 }
 
