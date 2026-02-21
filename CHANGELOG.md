@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.0] - 2026-02-20
+
+### Performance
+- BLAS acceleration via Apple Accelerate framework (macOS) for conv2d (1x1 fast path) and matmul, both forward and backward
+- Rayon parallelism for element-wise ops (add, mul, relu, sigmoid, scale, sum, add_bias) and their backward passes, with 10k-element threshold
+- Clone elimination in backward pass: `std::mem::replace` to take op ownership instead of cloning, direct `RefCell` borrows instead of `.data()`/`.shape()` which cloned entire Vecs
+
+### Added
+- Per-epoch timing in training loop
+- Non-macOS fallback for all BLAS-accelerated paths
+
 ## [0.1.0] - 2026-02-18
 
 ### Added

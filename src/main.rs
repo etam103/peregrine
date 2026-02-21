@@ -3,6 +3,7 @@ mod detection;
 pub mod dataset;
 
 use std::collections::HashMap;
+use std::time::Instant;
 use tensor::Tensor;
 use detection::{YoloNet, GroundTruth, GRID_H, GRID_W, INPUT_SIZE, NUM_ANCHORS};
 use dataset::{VocDataset, Dataset};
@@ -179,6 +180,7 @@ fn main() {
     let mut global_step = 0;
 
     for epoch in 0..num_epochs {
+        let epoch_start = Instant::now();
         let lr = if epoch < 8 { 0.001 } else { 0.0005 };
         let mut epoch_loss = 0.0;
         let num_batches = ds.num_batches(batch_size);
@@ -249,8 +251,9 @@ fn main() {
         loss_map.insert("min".to_string(), min_loss);
         writer.add_scalars("loss/overview", &loss_map, epoch);
 
-        println!("epoch {:>2}  avg_loss = {:.4}  min = {:.4}  lr = {}  ({} batches)",
-            epoch, avg_loss, min_loss, lr, num_batches);
+        let epoch_secs = epoch_start.elapsed().as_secs_f32();
+        println!("epoch {:>2}  avg_loss = {:.4}  min = {:.4}  lr = {}  ({} batches, {:.2}s)",
+            epoch, avg_loss, min_loss, lr, num_batches, epoch_secs);
     }
 
     // --- Inference on a few real images ---

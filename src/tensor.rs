@@ -2,6 +2,53 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
+use rayon::prelude::*;
+
+const PAR_THRESHOLD: usize = 10_000;
+
+// --- Apple Accelerate BLAS FFI ---
+
+#[cfg(target_os = "macos")]
+const CBLAS_ROW_MAJOR: i32 = 101;
+#[cfg(target_os = "macos")]
+const CBLAS_NO_TRANS: i32 = 111;
+#[cfg(target_os = "macos")]
+const CBLAS_TRANS: i32 = 112;
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn cblas_sgemm(
+        order: i32, transA: i32, transB: i32,
+        M: i32, N: i32, K: i32,
+        alpha: f32, A: *const f32, lda: i32,
+        B: *const f32, ldb: i32,
+        beta: f32, C: *mut f32, ldc: i32,
+    );
+}
+
+/// Safe wrapper around cblas_sgemm. Computes C = alpha * op(A) * op(B) + beta * C.
+#[cfg(target_os = "macos")]
+fn sgemm(
+    trans_a: bool, trans_b: bool,
+    m: usize, n: usize, k: usize,
+    alpha: f32, a: &[f32], lda: usize,
+    b: &[f32], ldb: usize,
+    beta: f32, c: &mut [f32], ldc: usize,
+) {
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            if trans_a { CBLAS_TRANS } else { CBLAS_NO_TRANS },
+            if trans_b { CBLAS_TRANS } else { CBLAS_NO_TRANS },
+            m as i32, n as i32, k as i32,
+            alpha, a.as_ptr(), lda as i32,
+            b.as_ptr(), ldb as i32,
+            beta, c.as_mut_ptr(), ldc as i32,
+        );
+    }
+}
+
 /// The operation that produced a tensor, used for backward pass.
 #[derive(Clone)]
 pub enum Op {
@@ -123,7 +170,11 @@ impl Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
         assert_eq!(a.shape, b.shape, "shapes must match for add");
-        let data: Vec<f32> = a.data.iter().zip(&b.data).map(|(x, y)| x + y).collect();
+        let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
+            a.data.par_iter().zip(&b.data).map(|(x, y)| x + y).collect()
+        } else {
+            a.data.iter().zip(&b.data).map(|(x, y)| x + y).collect()
+        };
         Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
     }
 
@@ -131,7 +182,11 @@ impl Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
         assert_eq!(a.shape, b.shape, "shapes must match for mul");
-        let data: Vec<f32> = a.data.iter().zip(&b.data).map(|(x, y)| x * y).collect();
+        let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
+            a.data.par_iter().zip(&b.data).map(|(x, y)| x * y).collect()
+        } else {
+            a.data.iter().zip(&b.data).map(|(x, y)| x * y).collect()
+        };
         Tensor::from_op(data, a.shape.clone(), Op::Mul(self.clone(), other.clone()))
     }
 
@@ -145,13 +200,20 @@ impl Tensor {
         let (k2, n) = (b.shape[0], b.shape[1]);
         assert_eq!(k1, k2, "inner dimensions must match for matmul");
         let mut data = vec![0.0f32; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut sum = 0.0;
-                for p in 0..k1 {
-                    sum += a.data[i * k1 + p] * b.data[p * n + j];
+        #[cfg(target_os = "macos")]
+        {
+            sgemm(false, false, m, n, k1, 1.0, &a.data, k1, &b.data, n, 0.0, &mut data, n);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0;
+                    for p in 0..k1 {
+                        sum += a.data[i * k1 + p] * b.data[p * n + j];
+                    }
+                    data[i * n + j] = sum;
                 }
-                data[i * n + j] = sum;
             }
         }
         Tensor::from_op(data, vec![m, n], Op::MatMul(self.clone(), other.clone()))
@@ -159,25 +221,41 @@ impl Tensor {
 
     pub fn relu(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = inner.data.iter().map(|&x| x.max(0.0)).collect();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x.max(0.0)).collect()
+        } else {
+            inner.data.iter().map(|&x| x.max(0.0)).collect()
+        };
         Tensor::from_op(data, inner.shape.clone(), Op::Relu(self.clone()))
     }
 
     pub fn sigmoid(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = inner.data.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect()
+        } else {
+            inner.data.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect()
+        };
         Tensor::from_op(data, inner.shape.clone(), Op::Sigmoid(self.clone()))
     }
 
     pub fn sum(&self) -> Tensor {
         let inner = self.0.borrow();
-        let s: f32 = inner.data.iter().sum();
+        let s: f32 = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().sum()
+        } else {
+            inner.data.iter().sum()
+        };
         Tensor::from_op(vec![s], vec![1], Op::Sum(self.clone()))
     }
 
     pub fn scale(&self, s: f32) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = inner.data.iter().map(|&x| x * s).collect();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x * s).collect()
+        } else {
+            inner.data.iter().map(|&x| x * s).collect()
+        };
         Tensor::from_op(data, inner.shape.clone(), Op::Scale(self.clone(), s))
     }
 
@@ -190,11 +268,20 @@ impl Tensor {
         assert_eq!(b.shape[0], 1);
         assert_eq!(a.shape[1], b.shape[1]);
         let cols = a.shape[1];
-        let data: Vec<f32> = a.data
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| x + b.data[i % cols])
-            .collect();
+        let a_slice: &[f32] = &a.data;
+        let b_slice: &[f32] = &b.data;
+        let data: Vec<f32> = if a_slice.len() >= PAR_THRESHOLD {
+            (0..a_slice.len())
+                .into_par_iter()
+                .map(|i| a_slice[i] + b_slice[i % cols])
+                .collect()
+        } else {
+            a_slice
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| x + b_slice[i % cols])
+                .collect()
+        };
         Tensor::from_op(data, a.shape.clone(), Op::AddBias(self.clone(), bias.clone()))
     }
 
@@ -212,6 +299,51 @@ impl Tensor {
         let oh = h - kh + 1;
         let ow = w - kw + 1;
         let out_shape = vec![n, co, oh, ow];
+
+        #[cfg(target_os = "macos")]
+        if kh == 1 && kw == 1 {
+            let spatial = h * w;
+            let mut data = vec![0.0f32; n * co * spatial];
+            for b in 0..n {
+                sgemm(
+                    false, false,
+                    co, spatial, ci,
+                    1.0,
+                    &ker.data, ci,
+                    &inp.data[b * ci * spatial..], spatial,
+                    0.0,
+                    &mut data[b * co * spatial..], spatial,
+                );
+            }
+            let bias_vals: Vec<f32> = bi.data.clone();
+            if oh * ow >= PAR_THRESHOLD {
+                data.par_chunks_mut(spatial)
+                    .enumerate()
+                    .for_each(|(idx, chunk)| {
+                        let oc = idx % co;
+                        let bias_val = bias_vals[oc];
+                        for v in chunk.iter_mut() {
+                            *v += bias_val;
+                        }
+                    });
+            } else {
+                for b in 0..n {
+                    for oc in 0..co {
+                        let offset = b * co * spatial + oc * spatial;
+                        let bias_val = bias_vals[oc];
+                        for v in &mut data[offset..offset + spatial] {
+                            *v += bias_val;
+                        }
+                    }
+                }
+            }
+            return Tensor::from_op(
+                data,
+                out_shape,
+                Op::Conv2d(self.clone(), kernel.clone(), bias.clone()),
+            );
+        }
+
         let mut data = vec![0.0f32; n * co * oh * ow];
         for b in 0..n {
             for oc in 0..co {
@@ -364,77 +496,116 @@ impl Tensor {
     /// Propagate this node's gradient to its op inputs. Non-recursive.
     fn propagate_grad(&self) {
         let (op, grad) = {
-            let inner = self.0.borrow();
-            let grad = match &inner.grad {
-                Some(g) => g.clone(),
+            let mut inner = self.0.borrow_mut();
+            if matches!(inner.op, Op::None) {
+                return; // leaf node — preserve grad for sgd_step
+            }
+            let grad = match inner.grad.take() {
+                Some(g) => g,
                 None => return,
             };
-            (inner.op.clone(), grad)
+            (std::mem::replace(&mut inner.op, Op::None), grad)
         };
 
         match op {
-            Op::None => {}
+            Op::None => unreachable!(),
             Op::Add(ref a, ref b) => {
                 accumulate_grad(a, &grad);
                 accumulate_grad(b, &grad);
             }
             Op::Mul(ref a, ref b) => {
-                let a_data = a.data();
-                let b_data = b.data();
-                let grad_a: Vec<f32> = grad.iter().zip(&b_data).map(|(g, b)| g * b).collect();
-                let grad_b: Vec<f32> = grad.iter().zip(&a_data).map(|(g, a)| g * a).collect();
+                let a_inner = a.0.borrow();
+                let b_inner = b.0.borrow();
+                let (grad_a, grad_b) = if grad.len() >= PAR_THRESHOLD {
+                    let ga: Vec<f32> = grad.par_iter().zip(b_inner.data.par_iter()).map(|(g, bv)| g * bv).collect();
+                    let gb: Vec<f32> = grad.par_iter().zip(a_inner.data.par_iter()).map(|(g, av)| g * av).collect();
+                    (ga, gb)
+                } else {
+                    let ga: Vec<f32> = grad.iter().zip(&b_inner.data).map(|(g, bv)| g * bv).collect();
+                    let gb: Vec<f32> = grad.iter().zip(&a_inner.data).map(|(g, av)| g * av).collect();
+                    (ga, gb)
+                };
+                drop(a_inner);
+                drop(b_inner);
                 accumulate_grad(a, &grad_a);
                 accumulate_grad(b, &grad_b);
             }
             Op::MatMul(ref a, ref b) => {
-                let a_shape = a.shape();
-                let b_shape = b.shape();
-                let (m, k) = (a_shape[0], a_shape[1]);
-                let n = b_shape[1];
-                let a_data = a.data();
-                let b_data = b.data();
+                let a_inner = a.0.borrow();
+                let b_inner = b.0.borrow();
+                let (m, k) = (a_inner.shape[0], a_inner.shape[1]);
+                let n = b_inner.shape[1];
 
-                let mut grad_a = vec![0.0f32; m * k];
-                for i in 0..m {
-                    for j in 0..k {
-                        let mut sum = 0.0;
-                        for p in 0..n {
-                            sum += grad[i * n + p] * b_data[j * n + p];
+                #[cfg(target_os = "macos")]
+                let (grad_a, grad_b) = {
+                    let mut ga = vec![0.0f32; m * k];
+                    sgemm(false, true, m, k, n, 1.0, &grad, n, &b_inner.data, n, 0.0, &mut ga, k);
+                    let mut gb = vec![0.0f32; k * n];
+                    sgemm(true, false, k, n, m, 1.0, &a_inner.data, k, &grad, n, 0.0, &mut gb, n);
+                    (ga, gb)
+                };
+
+                #[cfg(not(target_os = "macos"))]
+                let (grad_a, grad_b) = {
+                    let mut ga = vec![0.0f32; m * k];
+                    for i in 0..m {
+                        for j in 0..k {
+                            let mut sum = 0.0;
+                            for p in 0..n {
+                                sum += grad[i * n + p] * b_inner.data[j * n + p];
+                            }
+                            ga[i * k + j] = sum;
                         }
-                        grad_a[i * k + j] = sum;
                     }
-                }
-
-                let mut grad_b = vec![0.0f32; k * n];
-                for i in 0..k {
-                    for j in 0..n {
-                        let mut sum = 0.0;
-                        for p in 0..m {
-                            sum += a_data[p * k + i] * grad[p * n + j];
+                    let mut gb = vec![0.0f32; k * n];
+                    for i in 0..k {
+                        for j in 0..n {
+                            let mut sum = 0.0;
+                            for p in 0..m {
+                                sum += a_inner.data[p * k + i] * grad[p * n + j];
+                            }
+                            gb[i * n + j] = sum;
                         }
-                        grad_b[i * n + j] = sum;
                     }
-                }
+                    (ga, gb)
+                };
 
+                drop(a_inner);
+                drop(b_inner);
                 accumulate_grad(a, &grad_a);
                 accumulate_grad(b, &grad_b);
             }
             Op::Relu(ref input) => {
-                let input_data = input.data();
-                let grad_input: Vec<f32> = grad
-                    .iter()
-                    .zip(&input_data)
-                    .map(|(g, &x)| if x > 0.0 { *g } else { 0.0 })
-                    .collect();
+                let in_inner = input.0.borrow();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter()
+                        .zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| if x > 0.0 { *g } else { 0.0 })
+                        .collect()
+                } else {
+                    grad.iter()
+                        .zip(&in_inner.data)
+                        .map(|(g, &x)| if x > 0.0 { *g } else { 0.0 })
+                        .collect()
+                };
+                drop(in_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Sigmoid(ref input) => {
-                let out_data = self.data();
-                let grad_input: Vec<f32> = grad
-                    .iter()
-                    .zip(&out_data)
-                    .map(|(g, &s)| g * s * (1.0 - s))
-                    .collect();
+                let self_inner = self.0.borrow();
+                let out_data = &self_inner.data;
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter()
+                        .zip(out_data.par_iter())
+                        .map(|(g, &s)| g * s * (1.0 - s))
+                        .collect()
+                } else {
+                    grad.iter()
+                        .zip(out_data)
+                        .map(|(g, &s)| g * s * (1.0 - s))
+                        .collect()
+                };
+                drop(self_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Sum(ref input) => {
@@ -443,31 +614,37 @@ impl Tensor {
                 accumulate_grad(input, &grad_input);
             }
             Op::Scale(ref input, s) => {
-                let grad_input: Vec<f32> = grad.iter().map(|g| g * s).collect();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().map(|g| g * s).collect()
+                } else {
+                    grad.iter().map(|g| g * s).collect()
+                };
                 accumulate_grad(input, &grad_input);
             }
             Op::AddBias(ref input, ref bias) => {
-                accumulate_grad(input, &grad);
-                let cols = bias.shape()[1];
-                let rows = input.shape()[0];
+                let bias_inner = bias.0.borrow();
+                let cols = bias_inner.shape[1];
+                let rows = input.0.borrow().shape[0];
+                drop(bias_inner);
                 let mut grad_bias = vec![0.0f32; cols];
                 for r in 0..rows {
                     for c in 0..cols {
                         grad_bias[c] += grad[r * cols + c];
                     }
                 }
+                accumulate_grad(input, &grad);
                 accumulate_grad(bias, &grad_bias);
             }
             Op::Conv2d(ref input, ref kernel, ref bias) => {
-                let in_shape = input.shape();
-                let k_shape = kernel.shape();
-                let (n, ci, h, w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
-                let (co, _, kh, kw) = (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
+                let in_inner = input.0.borrow();
+                let k_inner = kernel.0.borrow();
+                let (n, ci, h, w) = (in_inner.shape[0], in_inner.shape[1], in_inner.shape[2], in_inner.shape[3]);
+                let (co, _, kh, kw) = (k_inner.shape[0], k_inner.shape[1], k_inner.shape[2], k_inner.shape[3]);
                 let oh = h - kh + 1;
                 let ow = w - kw + 1;
                 let out_shape = vec![n, co, oh, ow];
-                let in_data = input.data();
-                let k_data = kernel.data();
+                let in_shape = &in_inner.shape;
+                let k_shape = &k_inner.shape;
 
                 let mut grad_bias = vec![0.0f32; co];
                 for b in 0..n {
@@ -480,55 +657,92 @@ impl Tensor {
                     }
                 }
 
-                let mut grad_kernel = vec![0.0f32; co * ci * kh * kw];
-                for b in 0..n {
-                    for oc in 0..co {
-                        for ic in 0..ci {
-                            for ki in 0..kh {
-                                for kj in 0..kw {
-                                    let mut s = 0.0;
-                                    for i in 0..oh {
-                                        for j in 0..ow {
-                                            s += grad[idx4(b, oc, i, j, &out_shape)]
-                                                * in_data[idx4(b, ic, i + ki, j + kj, &in_shape)];
+                #[cfg(target_os = "macos")]
+                let use_blas_1x1 = kh == 1 && kw == 1;
+                #[cfg(not(target_os = "macos"))]
+                let use_blas_1x1 = false;
+
+                if use_blas_1x1 {
+                    #[cfg(target_os = "macos")]
+                    {
+                        let hw = oh * ow;
+                        let mut grad_kernel = vec![0.0f32; co * ci];
+                        for b in 0..n {
+                            sgemm(
+                                false, true, co, ci, hw,
+                                1.0, &grad[b * co * hw..], hw,
+                                &in_inner.data[b * ci * hw..], hw,
+                                1.0, &mut grad_kernel, ci,
+                            );
+                        }
+                        let mut grad_input = vec![0.0f32; n * ci * h * w];
+                        for b in 0..n {
+                            sgemm(
+                                true, false, ci, hw, co,
+                                1.0, &k_inner.data, ci,
+                                &grad[b * co * hw..], hw,
+                                0.0, &mut grad_input[b * ci * hw..], hw,
+                            );
+                        }
+                        drop(in_inner);
+                        drop(k_inner);
+                        accumulate_grad(input, &grad_input);
+                        accumulate_grad(kernel, &grad_kernel);
+                        accumulate_grad(bias, &grad_bias);
+                    }
+                } else {
+                    let mut grad_kernel = vec![0.0f32; co * ci * kh * kw];
+                    for b in 0..n {
+                        for oc in 0..co {
+                            for ic in 0..ci {
+                                for ki in 0..kh {
+                                    for kj in 0..kw {
+                                        let mut s = 0.0;
+                                        for i in 0..oh {
+                                            for j in 0..ow {
+                                                s += grad[idx4(b, oc, i, j, &out_shape)]
+                                                    * in_inner.data[idx4(b, ic, i + ki, j + kj, in_shape)];
+                                            }
                                         }
+                                        grad_kernel[idx4(oc, ic, ki, kj, k_shape)] += s;
                                     }
-                                    grad_kernel[idx4(oc, ic, ki, kj, &k_shape)] += s;
                                 }
                             }
                         }
                     }
-                }
 
-                let mut grad_input = vec![0.0f32; n * ci * h * w];
-                for b in 0..n {
-                    for ic in 0..ci {
-                        for ih in 0..h {
-                            for iw in 0..w {
-                                let mut s = 0.0;
-                                for oc in 0..co {
-                                    for ki in 0..kh {
-                                        for kj in 0..kw {
-                                            let oi = ih as isize - ki as isize;
-                                            let oj = iw as isize - kj as isize;
-                                            if oi >= 0 && oi < oh as isize
-                                                && oj >= 0 && oj < ow as isize
-                                            {
-                                                s += grad[idx4(b, oc, oi as usize, oj as usize, &out_shape)]
-                                                    * k_data[idx4(oc, ic, ki, kj, &k_shape)];
+                    let mut grad_input = vec![0.0f32; n * ci * h * w];
+                    for b in 0..n {
+                        for ic in 0..ci {
+                            for ih in 0..h {
+                                for iw in 0..w {
+                                    let mut s = 0.0;
+                                    for oc in 0..co {
+                                        for ki in 0..kh {
+                                            for kj in 0..kw {
+                                                let oi = ih as isize - ki as isize;
+                                                let oj = iw as isize - kj as isize;
+                                                if oi >= 0 && oi < oh as isize
+                                                    && oj >= 0 && oj < ow as isize
+                                                {
+                                                    s += grad[idx4(b, oc, oi as usize, oj as usize, &out_shape)]
+                                                        * k_inner.data[idx4(oc, ic, ki, kj, k_shape)];
+                                                }
                                             }
                                         }
                                     }
+                                    grad_input[idx4(b, ic, ih, iw, in_shape)] += s;
                                 }
-                                grad_input[idx4(b, ic, ih, iw, &in_shape)] += s;
                             }
                         }
                     }
-                }
 
-                accumulate_grad(input, &grad_input);
-                accumulate_grad(kernel, &grad_kernel);
-                accumulate_grad(bias, &grad_bias);
+                    drop(in_inner);
+                    drop(k_inner);
+                    accumulate_grad(input, &grad_input);
+                    accumulate_grad(kernel, &grad_kernel);
+                    accumulate_grad(bias, &grad_bias);
+                }
             }
             Op::MaxPool2d { ref input, ref max_indices } => {
                 let in_size = input.size();
@@ -550,12 +764,20 @@ impl Tensor {
                 accumulate_grad(input, &grad_input);
             }
             Op::BceLoss(ref logits, ref targets) => {
-                let logit_data = logits.data();
-                let n = logit_data.len() as f32;
-                let grad_logits: Vec<f32> = logit_data.iter().zip(targets).map(|(&x, &t)| {
-                    let sig = 1.0 / (1.0 + (-x).exp());
-                    grad[0] * (sig - t) / n
-                }).collect();
+                let logit_inner = logits.0.borrow();
+                let len = logit_inner.data.len() as f32;
+                let grad_logits: Vec<f32> = if logit_inner.data.len() >= PAR_THRESHOLD {
+                    logit_inner.data.par_iter().zip(targets.par_iter()).map(|(&x, &t)| {
+                        let sig = 1.0 / (1.0 + (-x).exp());
+                        grad[0] * (sig - t) / len
+                    }).collect()
+                } else {
+                    logit_inner.data.iter().zip(targets).map(|(&x, &t)| {
+                        let sig = 1.0 / (1.0 + (-x).exp());
+                        grad[0] * (sig - t) / len
+                    }).collect()
+                };
+                drop(logit_inner);
                 accumulate_grad(logits, &grad_logits);
             }
         }
