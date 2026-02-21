@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0] - 2026-02-20
+
+### Changed
+- Restructured as `peregrine` library crate. Tensor and nn modules are now a reusable library; RT-DETR moved to examples.
+- Dropped dead YOLO code from detection.rs
+- Moved image/serde/tensorboard deps to dev-dependencies (only needed by examples)
+
 ## [0.3.0] - 2026-02-20
 
 ### Added

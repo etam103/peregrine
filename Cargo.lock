@@ -712,6 +712,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
+name = "peregrine"
+version = "0.4.0"
+dependencies = [
+ "image 0.25.9",
+ "quick-xml",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tensorboard-rs",
+]
+
+[[package]]
 name = "png"
 version = "0.16.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -931,18 +943,6 @@ name = "rgb"
 version = "0.8.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c6a884d2998352bb4daf0183589aec883f16a6da1f4dde84d8e2e9a5409a1ce"
-
-[[package]]
-name = "rustorch"
-version = "0.1.0"
-dependencies = [
- "image 0.25.9",
- "quick-xml",
- "rayon",
- "serde",
- "serde_json",
- "tensorboard-rs",
-]
 
 [[package]]
 name = "rustversion"

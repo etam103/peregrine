@@ -1,11 +1,10 @@
-mod tensor;
-mod detection;
-pub mod dataset;
+mod model;
+mod dataset;
 
 use std::collections::HashMap;
 use std::time::Instant;
-use tensor::Tensor;
-use detection::{RtDetrNet, RtDetrTarget, rt_detr_loss, rt_detr_decode, rt_detr_nms, INPUT_SIZE};
+use peregrine::tensor::Tensor;
+use model::{RtDetrNet, RtDetrTarget, rt_detr_loss, rt_detr_decode, rt_detr_nms, INPUT_SIZE};
 use dataset::{VocDataset, CocoDataset, Dataset};
 use tensorboard_rs::summary_writer::SummaryWriter;
 
@@ -14,7 +13,6 @@ const CLASS_NAMES: [&str; NUM_CLASSES] = ["car", "person", "dog"];
 
 fn class_name(cls: usize) -> &'static str { CLASS_NAMES[cls] }
 
-/// Convert CHW f32 [0,1] image to RGB u8 bytes for TensorBoard.
 fn chw_to_rgb_bytes(chw: &[f32], sz: usize) -> Vec<u8> {
     let mut rgb = vec![0u8; 3 * sz * sz];
     for y in 0..sz {
@@ -29,24 +27,22 @@ fn chw_to_rgb_bytes(chw: &[f32], sz: usize) -> Vec<u8> {
     rgb
 }
 
-/// Color per class: car=red, person=green, dog=blue.
 fn gt_color(class_id: usize) -> [u8; 3] {
     match class_id {
-        0 => [255, 60, 60],   // car = red
-        1 => [60, 255, 60],   // person = green
-        _ => [80, 120, 255],  // dog = blue
+        0 => [255, 60, 60],
+        1 => [60, 255, 60],
+        _ => [80, 120, 255],
     }
 }
 
 fn pred_color(class_id: usize) -> [u8; 3] {
     match class_id {
-        0 => [255, 150, 150], // car = light red
-        1 => [150, 255, 150], // person = light green
-        _ => [150, 180, 255], // dog = light blue
+        0 => [255, 150, 150],
+        1 => [150, 255, 150],
+        _ => [150, 180, 255],
     }
 }
 
-// 5x3 bitmap font for A-Z and 0-9. Each char is 5 rows of 3 columns.
 fn char_bitmap(c: char) -> [u8; 5] {
     match c.to_ascii_uppercase() {
         'A' => [0b010, 0b101, 0b111, 0b101, 0b101],
@@ -63,7 +59,6 @@ fn char_bitmap(c: char) -> [u8; 5] {
     }
 }
 
-/// Draw a small text label at (x, y) on the RGB buffer.
 fn draw_label(rgb: &mut [u8], sz: usize, x: usize, y: usize, text: &str, color: [u8; 3], scale: usize) {
     let mut cx = x;
     for ch in text.chars() {
@@ -86,18 +81,16 @@ fn draw_label(rgb: &mut [u8], sz: usize, x: usize, y: usize, text: &str, color: 
                 }
             }
         }
-        cx += 4 * scale; // char width + 1px gap
+        cx += 4 * scale;
     }
 }
 
-/// Draw a labeled bounding box on an RGB buffer.
 fn draw_labeled_box(rgb: &mut [u8], sz: usize, cx: f32, cy: f32, w: f32, h: f32,
                     color: [u8; 3], thickness: usize, label: &str) {
     let x0 = ((cx - w / 2.0).max(0.0)) as usize;
     let y0 = ((cy - h / 2.0).max(0.0)) as usize;
     let x1 = ((cx + w / 2.0).min(sz as f32 - 1.0)) as usize;
     let y1 = ((cy + h / 2.0).min(sz as f32 - 1.0)) as usize;
-    // Draw box outline
     for t in 0..thickness {
         let y0t = if y0 >= t { y0 - t } else { 0 };
         let y1t = (y1 + t).min(sz - 1);
@@ -116,8 +109,7 @@ fn draw_labeled_box(rgb: &mut [u8], sz: usize, cx: f32, cy: f32, w: f32, h: f32,
             }
         }
     }
-    // Draw filled background for label
-    let label_h = 5 * 2 + 2; // 5 rows * scale=2 + padding
+    let label_h = 5 * 2 + 2;
     let label_w = label.len() * 4 * 2 + 2;
     let ly = if y0 >= label_h + 2 { y0 - label_h - 2 } else { y1 + 2 };
     for dy in 0..label_h {
@@ -134,7 +126,6 @@ fn draw_labeled_box(rgb: &mut [u8], sz: usize, cx: f32, cy: f32, w: f32, h: f32,
             }
         }
     }
-    // Draw text
     draw_label(rgb, sz, x0 + 1, ly + 1, label, [255, 255, 255], 2);
 }
 
@@ -148,12 +139,11 @@ fn targets_to_rt(targets: &[dataset::Target]) -> Vec<RtDetrTarget> {
 fn main() {
     let logdir = "runs/coco_training";
 
-    println!("=== rustorch: Training RT-DETR on Real COCO Images ===");
+    println!("=== peregrine: Training RT-DETR on Real COCO Images ===");
     println!("Input: {}x{}x3, Queries: 20, Embed: 64, Encoder seq: 3x32x32=3072", INPUT_SIZE, INPUT_SIZE);
     println!("Classes: {:?}", CLASS_NAMES);
     println!("TensorBoard: tensorboard --logdir runs/\n");
 
-    // Try COCO val2017 first, fall back to small VOC dataset
     let coco_json = "data/coco/annotations/instances_val2017.json";
     let coco_images = "data/coco/val2017";
     let ds: Box<dyn Dataset> = if std::path::Path::new(coco_images).is_dir() {
@@ -176,7 +166,7 @@ fn main() {
     let total_params: usize = params.iter().map(|p| p.size()).sum();
     println!("Network: {} parameter tensors, {} total weights\n", params.len(), total_params);
 
-    let batch_size = 1; // one image at a time for memory/speed
+    let batch_size = 1;
     let num_epochs = 20;
     let mut min_loss = f32::MAX;
     let mut global_step = 0;
@@ -230,7 +220,6 @@ fn main() {
 
             loss.backward();
 
-            // Gradient clipping: compute global norm, scale if > max_norm
             let max_grad_norm: f32 = 1.0;
             let grad_norm_sq: f32 = params.iter().map(|p| {
                 p.grad().map_or(0.0, |g| g.iter().map(|v| v * v).sum::<f32>())
