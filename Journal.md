@@ -127,3 +127,46 @@ Per-image time is consistent (~17.4ms) regardless of dataset size, confirming no
 ## GPU Assessment (2025-02-20)
 
 **Recommendation: Don't add Metal GPU support.** At 54k params and these matrix sizes, GPU kernel launch + CPU-GPU data transfer overhead exceeds the computation itself. Apple Accelerate on CPU is already optimal at this scale. GPU becomes worthwhile at millions of parameters with large batch sizes.
+
+## RT-DETR: Transformer-based detection (2026-02-20)
+
+Replaced the YOLO anchor-based detector with RT-DETR, a transformer-based end-to-end object detector. Architecture: ResNet backbone → multi-scale 1x1 channel projections → transformer encoder (self-attention) → transformer decoder (cross-attention with learned object queries) → classification + bbox heads. Training uses Hungarian matching + set-based loss (BCE classification + L1 bbox regression).
+
+**Model:** RT-DETR (11.2M params), embed_dim=64, 4 heads, 1 encoder + 1 decoder layer, 20 queries.
+
+### Problem: memory explosion
+
+With INPUT_SIZE=416, the backbone produces large spatial maps (s2: 208x208, s3: 104x104, s4: 52x52) concatenated into a 56,784-token sequence. Self-attention is O(n^2), requiring a [56784, 56784] attention matrix per head — 12.9 GB per head, 51.6 GB for 4 heads. Exceeds 64 GB RAM.
+
+### Fix: reduce input + pool features
+
+1. **INPUT_SIZE 416 → 256** — backbone spatial dims become s2: 128x128, s3: 64x64, s4: 32x32
+2. **Pool projected features to 32x32** before the encoder — `max_pool2d` brings all scales to the same resolution. Sequence: 3 × 32×32 = 3,072 tokens
+3. **Eliminated double forward pass** — reuse training outputs for detection overlay logging
+
+| Component | Before | After |
+|---|---|---|
+| Encoder sequence | 56,784 tokens | 3,072 tokens |
+| Attention (4 heads) | ~52 GB | ~150 MB |
+| Peak RSS | OOM | 630 MB |
+
+### Problem: NaN loss after 6 steps
+
+Initial loss was 36,280 and exploded to NaN by step 6. Root cause: `randn` used a fixed `std=0.1` for all weight tensors regardless of layer dimensions. For deep backbone conv layers with large fan_in (e.g., [512, 512, 3, 3] → fan_in=4608), `std=0.1` is ~7x too large vs proper Xavier (`sqrt(1/4608)=0.015`). This caused activations to grow through the backbone, producing encoder outputs with std≈50, which propagated through cross-attention to class logits with std≈25 — giving a massive initial loss whose gradients exploded through 6+ transformer/backbone layers.
+
+### Fix: Xavier init + gradient clipping
+
+1. **Xavier fan-in initialization**: `std = sqrt(1/fan_in)`, computed per-tensor from shape (2D linear: fan_in=shape[1], 4D conv: fan_in=shape[1]*kH*kW)
+2. **Global gradient clipping**: compute gradient norm across all parameters, scale effective LR if norm > 1.0
+
+### Results (COCO val2017, 2960 images)
+
+| Metric | Before fixes | After fixes |
+|---|---|---|
+| Initial loss | 36,280 → NaN | 1.60 |
+| Epoch 0 avg loss | N/A (crashed) | 1.2680 |
+| Epoch 0 min loss | N/A | 0.2053 |
+| Epoch 0 time | N/A | 1165s (~19.4 min) |
+| Peak RSS | OOM (>52 GB) | 630 MB |
+
+Loss decreasing across epochs confirms the model is learning. Epoch 1 showed lower early losses (~0.18) compared to epoch 0's start (~1.6).

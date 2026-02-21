@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0] - 2026-02-20
+
+### Added
+- RT-DETR (Real-Time DEtection TRansformer) architecture: multi-head attention, transformer encoder/decoder, ResNet backbone, learned object queries
+- Hungarian matching and set-based loss for end-to-end detection training
+- RT-DETR decode and NMS for inference
+- Global gradient clipping (max norm = 1.0) to prevent training divergence
+
+### Changed
+- Xavier fan-in weight initialization (`std = sqrt(1/fan_in)`) instead of fixed `std = 0.1` — fixes NaN loss from activation/gradient explosion in deep networks
+- Reduced `INPUT_SIZE` from 416 to 256 for RT-DETR, cutting backbone computation ~4x
+- Multi-scale feature pooling to common 32x32 before transformer encoder (3,072 tokens vs 56,784), reducing attention memory from ~52 GB to ~150 MB
+- Eliminated redundant forward pass during training logging — reuse training outputs for detection overlay
+
 ## [0.2.0] - 2026-02-20
 
 ### Performance

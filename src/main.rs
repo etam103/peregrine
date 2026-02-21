@@ -5,7 +5,7 @@ pub mod dataset;
 use std::collections::HashMap;
 use std::time::Instant;
 use tensor::Tensor;
-use detection::{YoloNet, GroundTruth, GRID_H, GRID_W, INPUT_SIZE, NUM_ANCHORS};
+use detection::{RtDetrNet, RtDetrTarget, rt_detr_loss, rt_detr_decode, rt_detr_nms, INPUT_SIZE};
 use dataset::{VocDataset, CocoDataset, Dataset};
 use tensorboard_rs::summary_writer::SummaryWriter;
 
@@ -138,13 +138,9 @@ fn draw_labeled_box(rgb: &mut [u8], sz: usize, cx: f32, cy: f32, w: f32, h: f32,
     draw_label(rgb, sz, x0 + 1, ly + 1, label, [255, 255, 255], 2);
 }
 
-/// Convert dataset Target to GroundTruth in pixel coordinates.
-fn targets_to_gt(targets: &[dataset::Target], img_size: usize) -> Vec<GroundTruth> {
-    targets.iter().map(|t| GroundTruth {
-        cx: t.cx * img_size as f32,
-        cy: t.cy * img_size as f32,
-        w: t.w * img_size as f32,
-        h: t.h * img_size as f32,
+fn targets_to_rt(targets: &[dataset::Target]) -> Vec<RtDetrTarget> {
+    targets.iter().map(|t| RtDetrTarget {
+        cx: t.cx, cy: t.cy, w: t.w, h: t.h,
         class_id: t.class_id,
     }).collect()
 }
@@ -152,8 +148,8 @@ fn targets_to_gt(targets: &[dataset::Target], img_size: usize) -> Vec<GroundTrut
 fn main() {
     let logdir = "runs/coco_training";
 
-    println!("=== rustorch: Training YOLO on Real COCO Images ===");
-    println!("Input: {}x{}x3, Grid: {}x{}, Anchors: {}", INPUT_SIZE, INPUT_SIZE, GRID_H, GRID_W, NUM_ANCHORS);
+    println!("=== rustorch: Training RT-DETR on Real COCO Images ===");
+    println!("Input: {}x{}x3, Queries: 20, Embed: 64, Encoder seq: 3x32x32=3072", INPUT_SIZE, INPUT_SIZE);
     println!("Classes: {:?}", CLASS_NAMES);
     println!("TensorBoard: tensorboard --logdir runs/\n");
 
@@ -175,7 +171,7 @@ fn main() {
     }
 
     let mut writer = SummaryWriter::new(logdir);
-    let net = YoloNet::new(NUM_CLASSES);
+    let net = RtDetrNet::new(NUM_CLASSES, 64, 4, 1, 1, 20);
     let params = net.params();
     let total_params: usize = params.iter().map(|p| p.size()).sum();
     println!("Network: {} parameter tensors, {} total weights\n", params.len(), total_params);
@@ -187,7 +183,7 @@ fn main() {
 
     for epoch in 0..num_epochs {
         let epoch_start = Instant::now();
-        let lr = if epoch < 8 { 0.001 } else { 0.0005 };
+        let lr = if epoch < 10 { 0.0001 } else { 0.00005 };
         let mut epoch_loss = 0.0;
         let num_batches = ds.num_batches(batch_size);
 
@@ -196,48 +192,58 @@ fn main() {
             let actual_batch = (ds.len() - batch_idx * batch_size).min(batch_size);
             let pixels_per_img = 3 * INPUT_SIZE * INPUT_SIZE;
 
-            // Convert targets to per-image GroundTruth vectors
-            let mut gt_per_image: Vec<Vec<GroundTruth>> = vec![Vec::new(); actual_batch];
+            let mut rt_targets: Vec<Vec<RtDetrTarget>> = vec![Vec::new(); actual_batch];
             for t in &batch_targets {
-                gt_per_image[t.batch_idx].push(GroundTruth {
-                    cx: t.cx * INPUT_SIZE as f32,
-                    cy: t.cy * INPUT_SIZE as f32,
-                    w: t.w * INPUT_SIZE as f32,
-                    h: t.h * INPUT_SIZE as f32,
+                rt_targets[t.batch_idx].push(RtDetrTarget {
+                    cx: t.cx, cy: t.cy, w: t.w, h: t.h,
                     class_id: t.class_id,
                 });
             }
 
             let images = Tensor::new(img_data.clone(), vec![actual_batch, 3, INPUT_SIZE, INPUT_SIZE], false);
-            let loss = net.loss(&images, &gt_per_image);
+            let (class_logits, bbox_preds) = net.forward(&images);
+            let loss = rt_detr_loss(&class_logits, &bbox_preds, &rt_targets, net.num_queries, NUM_CLASSES);
             let loss_val = loss.data()[0];
             epoch_loss += loss_val;
 
             if loss_val < min_loss { min_loss = loss_val; }
             writer.add_scalar("loss/step", loss_val, global_step);
 
-            // Log detection overlay every N steps
-            let log_every = (num_batches / 10).max(1); // ~10 images per epoch
+            let log_every = (num_batches / 10).max(1);
             if batch_idx % log_every == 0 {
                 let single_img = &img_data[..pixels_per_img];
-                let input = Tensor::new(single_img.to_vec(), vec![1, 3, INPUT_SIZE, INPUT_SIZE], false);
-                let detections = net.detect_nms(&input, 0.5, 0.4);
+                let decoded = rt_detr_decode(&class_logits, &bbox_preds, net.num_queries, INPUT_SIZE);
+                let dets = rt_detr_nms(&decoded[0], 0.3, 0.4);
 
                 let mut rgb = chw_to_rgb_bytes(single_img, INPUT_SIZE);
-                for gt in &gt_per_image[0] {
+                let scale = INPUT_SIZE as f32;
+                for gt in &rt_targets[0] {
                     let label = format!("GT:{}", class_name(gt.class_id).to_uppercase());
-                    draw_labeled_box(&mut rgb, INPUT_SIZE, gt.cx, gt.cy, gt.w, gt.h, gt_color(gt.class_id), 2, &label);
+                    draw_labeled_box(&mut rgb, INPUT_SIZE, gt.cx * scale, gt.cy * scale, gt.w * scale, gt.h * scale, gt_color(gt.class_id), 2, &label);
                 }
-                for d in detections[0].iter().take(5) {
+                for d in dets.iter().take(5) {
                     let label = format!("{}", class_name(d.class_id).to_uppercase());
                     draw_labeled_box(&mut rgb, INPUT_SIZE, d.cx, d.cy, d.w, d.h, pred_color(d.class_id), 2, &label);
                 }
-                writer.add_image("coco/detections", &rgb, &[3, INPUT_SIZE, INPUT_SIZE], global_step);
+                writer.add_image("rtdetr/detections", &rgb, &[3, INPUT_SIZE, INPUT_SIZE], global_step);
             }
 
             loss.backward();
+
+            // Gradient clipping: compute global norm, scale if > max_norm
+            let max_grad_norm: f32 = 1.0;
+            let grad_norm_sq: f32 = params.iter().map(|p| {
+                p.grad().map_or(0.0, |g| g.iter().map(|v| v * v).sum::<f32>())
+            }).sum();
+            let grad_norm = grad_norm_sq.sqrt();
+            let effective_lr = if grad_norm > max_grad_norm {
+                lr * max_grad_norm / grad_norm
+            } else {
+                lr
+            };
+
             for p in &params {
-                p.sgd_step(lr);
+                p.sgd_step(effective_lr);
             }
             global_step += 1;
 
@@ -261,43 +267,44 @@ fn main() {
             epoch, avg_loss, min_loss, lr, num_batches, epoch_secs);
     }
 
-    // --- Inference on a few real images ---
     println!("\n--- Inference on real COCO images ---\n");
     let num_test = ds.len().min(5);
+    let scale = INPUT_SIZE as f32;
     for i in 0..num_test {
         let img_data = ds.load_image(i);
         let gt_targets = ds.get_targets(i);
-        let gt = targets_to_gt(&gt_targets, INPUT_SIZE);
+        let gt = targets_to_rt(&gt_targets);
 
         let input = Tensor::new(img_data.clone(), vec![1, 3, INPUT_SIZE, INPUT_SIZE], false);
-        let detections = net.detect_nms(&input, 0.5, 0.4);
-        let dets = &detections[0];
+        let (cls, bbs) = net.forward(&input);
+        let decoded = rt_detr_decode(&cls, &bbs, net.num_queries, INPUT_SIZE);
+        let dets = rt_detr_nms(&decoded[0], 0.3, 0.4);
 
-        // Log to TensorBoard
         let mut rgb = chw_to_rgb_bytes(&img_data, INPUT_SIZE);
         for g in &gt {
             let label = format!("GT:{}", class_name(g.class_id).to_uppercase());
-            draw_labeled_box(&mut rgb, INPUT_SIZE, g.cx, g.cy, g.w, g.h, gt_color(g.class_id), 2, &label);
+            draw_labeled_box(&mut rgb, INPUT_SIZE, g.cx * scale, g.cy * scale, g.w * scale, g.h * scale, gt_color(g.class_id), 2, &label);
         }
         for d in dets.iter().take(5) {
             let label = format!("{}", class_name(d.class_id).to_uppercase());
             draw_labeled_box(&mut rgb, INPUT_SIZE, d.cx, d.cy, d.w, d.h, pred_color(d.class_id), 2, &label);
         }
-        let tag = format!("coco/inference_{}", i);
+        let tag = format!("rtdetr/inference_{}", i);
         writer.add_image(&tag, &rgb, &[3, INPUT_SIZE, INPUT_SIZE], 0);
 
         println!("Image {}:", i + 1);
         println!("  Ground truth: {} objects", gt.len());
         for g in &gt {
-            println!("    {:<6} ({:.0}, {:.0}, {:.0}, {:.0})", class_name(g.class_id), g.cx, g.cy, g.w, g.h);
+            println!("    {:<6} ({:.0}, {:.0}, {:.0}, {:.0})",
+                class_name(g.class_id), g.cx * scale, g.cy * scale, g.w * scale, g.h * scale);
         }
         if dets.is_empty() {
             println!("  Predictions: none above threshold");
         } else {
             println!("  Predictions: {} detections", dets.len());
             for d in dets.iter().take(5) {
-                println!("    {:<6} ({:.0}, {:.0}, {:.0}, {:.0})  conf={:.3}",
-                    class_name(d.class_id), d.cx, d.cy, d.w, d.h, d.confidence);
+                println!("    {:<6} ({:.0}, {:.0}, {:.0}, {:.0})  score={:.3}",
+                    class_name(d.class_id), d.cx, d.cy, d.w, d.h, d.score);
             }
         }
         println!();
