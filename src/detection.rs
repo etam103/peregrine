@@ -457,9 +457,9 @@ impl ConvBlock {
         }
     }
 
-    /// Forward: Conv2d -> ReLU -> 2x2 MaxPool.
+    /// Forward: fused Conv2d + ReLU + 2x2 MaxPool.
     fn forward(&self, x: &Tensor) -> Tensor {
-        x.conv2d(&self.weight, &self.bias).relu().max_pool2d()
+        x.conv2d_relu_pool(&self.weight, &self.bias)
     }
 
     fn params(&self) -> Vec<&Tensor> {

@@ -62,6 +62,13 @@ pub enum Op {
     Scale(Tensor, f32),
     AddBias(Tensor, Tensor), // [batch, features] + [1, features] broadcast
     Conv2d(Tensor, Tensor, Tensor), // input, kernel, bias
+    Conv2dReluPool {
+        input: Tensor,
+        kernel: Tensor,
+        bias: Tensor,
+        pre_relu_data: Vec<f32>, // conv output before relu, for relu backward
+        max_indices: Vec<usize>, // flat index into conv output for pool backward
+    },
     MaxPool2d {
         input: Tensor,
         max_indices: Vec<usize>, // flat index into input for each output element
@@ -378,34 +385,221 @@ impl Tensor {
         assert!(h % 2 == 0 && w % 2 == 0, "H and W must be divisible by 2");
         let oh = h / 2;
         let ow = w / 2;
-        let out_shape = vec![n, c, oh, ow];
-        let out_size = n * c * oh * ow;
+        let plane_out = oh * ow;
+        let out_size = n * c * plane_out;
         let mut data = vec![0.0f32; out_size];
         let mut max_indices = vec![0usize; out_size];
-        for b in 0..n {
-            for ch in 0..c {
+
+        let in_data = &inp.data;
+        let in_plane = h * w;
+
+        if out_size >= PAR_THRESHOLD {
+            data.par_chunks_mut(plane_out)
+                .zip(max_indices.par_chunks_mut(plane_out))
+                .enumerate()
+                .for_each(|(bc, (out_chunk, idx_chunk))| {
+                    let in_base = bc * in_plane;
+                    for i in 0..oh {
+                        for j in 0..ow {
+                            let mut best_val = f32::NEG_INFINITY;
+                            let mut best_idx = 0;
+                            for di in 0..2 {
+                                let fi = in_base + (i * 2 + di) * w + j * 2;
+                                if in_data[fi] > best_val {
+                                    best_val = in_data[fi];
+                                    best_idx = fi;
+                                }
+                                if in_data[fi + 1] > best_val {
+                                    best_val = in_data[fi + 1];
+                                    best_idx = fi + 1;
+                                }
+                            }
+                            let oi = i * ow + j;
+                            out_chunk[oi] = best_val;
+                            idx_chunk[oi] = best_idx;
+                        }
+                    }
+                });
+        } else {
+            for bc in 0..(n * c) {
+                let in_base = bc * in_plane;
+                let out_base = bc * plane_out;
                 for i in 0..oh {
                     for j in 0..ow {
                         let mut best_val = f32::NEG_INFINITY;
                         let mut best_idx = 0;
                         for di in 0..2 {
-                            for dj in 0..2 {
-                                let fi = idx4(b, ch, i * 2 + di, j * 2 + dj, &inp.shape);
-                                if inp.data[fi] > best_val {
-                                    best_val = inp.data[fi];
-                                    best_idx = fi;
-                                }
+                            let fi = in_base + (i * 2 + di) * w + j * 2;
+                            if in_data[fi] > best_val {
+                                best_val = in_data[fi];
+                                best_idx = fi;
+                            }
+                            if in_data[fi + 1] > best_val {
+                                best_val = in_data[fi + 1];
+                                best_idx = fi + 1;
                             }
                         }
-                        let oi = idx4(b, ch, i, j, &out_shape);
+                        let oi = out_base + i * ow + j;
                         data[oi] = best_val;
                         max_indices[oi] = best_idx;
                     }
                 }
             }
         }
+
+        let out_shape = vec![n, c, oh, ow];
         Tensor::from_op(data, out_shape, Op::MaxPool2d {
             input: self.clone(),
+            max_indices,
+        })
+    }
+
+    /// Fused conv2d (1x1, BLAS) + ReLU + 2x2 max pool in a single pass.
+    /// Eliminates 2 intermediate allocations and 2 extra data passes per block.
+    pub fn conv2d_relu_pool(&self, kernel: &Tensor, bias: &Tensor) -> Tensor {
+        let inp = self.0.borrow();
+        let ker = kernel.0.borrow();
+        let bi = bias.0.borrow();
+        assert_eq!(inp.shape.len(), 4);
+        assert_eq!(ker.shape.len(), 4);
+        let (n, ci, h, w) = (inp.shape[0], inp.shape[1], inp.shape[2], inp.shape[3]);
+        let (co, ci_k, kh, kw) = (ker.shape[0], ker.shape[1], ker.shape[2], ker.shape[3]);
+        assert_eq!(ci, ci_k);
+        assert_eq!(kh, 1);
+        assert_eq!(kw, 1);
+        assert_eq!(bi.shape, vec![co]);
+        assert!(h % 2 == 0 && w % 2 == 0, "H and W must be divisible by 2");
+
+        let spatial = h * w;
+        let oh = h / 2;
+        let ow = w / 2;
+        let plane_out = oh * ow;
+
+        // Step 1: sgemm + bias -> conv output (stored as pre_relu_data for backward)
+        let mut conv_out = vec![0.0f32; n * co * spatial];
+        #[cfg(target_os = "macos")]
+        for b in 0..n {
+            sgemm(
+                false, false,
+                co, spatial, ci,
+                1.0,
+                &ker.data, ci,
+                &inp.data[b * ci * spatial..], spatial,
+                0.0,
+                &mut conv_out[b * co * spatial..], spatial,
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            for b in 0..n {
+                for oc in 0..co {
+                    for s in 0..spatial {
+                        let mut sum = 0.0;
+                        for ic in 0..ci {
+                            sum += ker.data[oc * ci + ic] * inp.data[b * ci * spatial + ic * spatial + s];
+                        }
+                        conv_out[b * co * spatial + oc * spatial + s] = sum;
+                    }
+                }
+            }
+        }
+
+        let bias_vals = &bi.data;
+        // Add bias
+        if spatial >= PAR_THRESHOLD {
+            conv_out.par_chunks_mut(spatial)
+                .enumerate()
+                .for_each(|(idx, chunk)| {
+                    let oc = idx % co;
+                    let bv = bias_vals[oc];
+                    for v in chunk.iter_mut() {
+                        *v += bv;
+                    }
+                });
+        } else {
+            for bc in 0..(n * co) {
+                let oc = bc % co;
+                let bv = bias_vals[oc];
+                let offset = bc * spatial;
+                for v in &mut conv_out[offset..offset + spatial] {
+                    *v += bv;
+                }
+            }
+        }
+
+        drop(inp);
+        drop(ker);
+        drop(bi);
+
+        // Step 2: Fused relu + maxpool over (batch, channel) planes
+        let out_size = n * co * plane_out;
+        let mut data = vec![0.0f32; out_size];
+        let mut max_indices = vec![0usize; out_size];
+
+        if out_size >= PAR_THRESHOLD {
+            data.par_chunks_mut(plane_out)
+                .zip(max_indices.par_chunks_mut(plane_out))
+                .enumerate()
+                .for_each(|(bc, (out_chunk, idx_chunk))| {
+                    let in_base = bc * spatial;
+                    for i in 0..oh {
+                        for j in 0..ow {
+                            let mut best_val = f32::NEG_INFINITY;
+                            let mut best_idx = 0;
+                            for di in 0..2 {
+                                let fi = in_base + (i * 2 + di) * w + j * 2;
+                                let v0 = conv_out[fi].max(0.0);
+                                if v0 > best_val {
+                                    best_val = v0;
+                                    best_idx = fi;
+                                }
+                                let v1 = conv_out[fi + 1].max(0.0);
+                                if v1 > best_val {
+                                    best_val = v1;
+                                    best_idx = fi + 1;
+                                }
+                            }
+                            let oi = i * ow + j;
+                            out_chunk[oi] = best_val;
+                            idx_chunk[oi] = best_idx;
+                        }
+                    }
+                });
+        } else {
+            for bc in 0..(n * co) {
+                let in_base = bc * spatial;
+                let out_base = bc * plane_out;
+                for i in 0..oh {
+                    for j in 0..ow {
+                        let mut best_val = f32::NEG_INFINITY;
+                        let mut best_idx = 0;
+                        for di in 0..2 {
+                            let fi = in_base + (i * 2 + di) * w + j * 2;
+                            let v0 = conv_out[fi].max(0.0);
+                            if v0 > best_val {
+                                best_val = v0;
+                                best_idx = fi;
+                            }
+                            let v1 = conv_out[fi + 1].max(0.0);
+                            if v1 > best_val {
+                                best_val = v1;
+                                best_idx = fi + 1;
+                            }
+                        }
+                        let oi = out_base + i * ow + j;
+                        data[oi] = best_val;
+                        max_indices[oi] = best_idx;
+                    }
+                }
+            }
+        }
+
+        let out_shape = vec![n, co, oh, ow];
+        Tensor::from_op(data, out_shape, Op::Conv2dReluPool {
+            input: self.clone(),
+            kernel: kernel.clone(),
+            bias: bias.clone(),
+            pre_relu_data: conv_out,
             max_indices,
         })
     }
@@ -470,6 +664,7 @@ impl Tensor {
                 Op::Relu(a) | Op::Sigmoid(a) | Op::Sum(a)
                 | Op::Scale(a, _) | Op::Select(a, _) | Op::BceLoss(a, _) => vec![a],
                 Op::Conv2d(a, b, c) => vec![a, b, c],
+                Op::Conv2dReluPool { input, kernel, bias, .. } => vec![input, kernel, bias],
                 Op::MaxPool2d { input, .. } | Op::Flatten { input, .. } => vec![input],
             }
         };
@@ -744,11 +939,162 @@ impl Tensor {
                     accumulate_grad(bias, &grad_bias);
                 }
             }
+            Op::Conv2dReluPool { ref input, ref kernel, ref bias, ref pre_relu_data, ref max_indices } => {
+                let in_inner = input.0.borrow();
+                let k_inner = kernel.0.borrow();
+                let (n, ci, h, w) = (in_inner.shape[0], in_inner.shape[1], in_inner.shape[2], in_inner.shape[3]);
+                let co = k_inner.shape[0];
+                let hw = h * w; // conv spatial dims = input spatial dims for 1x1
+                let oh = h / 2;
+                let ow = w / 2;
+                let pool_out_size = n * co * oh * ow;
+                let conv_size = n * co * hw;
+
+                // 1. Pool backward: scatter grad through max_indices
+                let mut grad_conv_relu = vec![0.0f32; conv_size];
+                for oi in 0..pool_out_size {
+                    grad_conv_relu[max_indices[oi]] += grad[oi];
+                }
+
+                // 2. ReLU backward: mask by pre_relu_data > 0
+                if conv_size >= PAR_THRESHOLD {
+                    grad_conv_relu.par_iter_mut()
+                        .zip(pre_relu_data.par_iter())
+                        .for_each(|(g, &x)| {
+                            if x <= 0.0 {
+                                *g = 0.0;
+                            }
+                        });
+                } else {
+                    for i in 0..conv_size {
+                        if pre_relu_data[i] <= 0.0 {
+                            grad_conv_relu[i] = 0.0;
+                        }
+                    }
+                }
+                let grad_conv = grad_conv_relu;
+
+                // 3. Conv backward (1x1 BLAS path)
+                let mut grad_bias = vec![0.0f32; co];
+                if co * hw >= PAR_THRESHOLD {
+                    let chunk_grads: Vec<f32> = grad_conv.par_chunks(hw)
+                        .enumerate()
+                        .fold(
+                            || vec![0.0f32; co],
+                            |mut acc, (idx, chunk)| {
+                                let oc = idx % co;
+                                let s: f32 = chunk.iter().sum();
+                                acc[oc] += s;
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || vec![0.0f32; co],
+                            |mut a, b| {
+                                for i in 0..co {
+                                    a[i] += b[i];
+                                }
+                                a
+                            },
+                        );
+                    grad_bias = chunk_grads;
+                } else {
+                    for b in 0..n {
+                        for oc in 0..co {
+                            let offset = b * co * hw + oc * hw;
+                            for s in 0..hw {
+                                grad_bias[oc] += grad_conv[offset + s];
+                            }
+                        }
+                    }
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    let mut grad_kernel = vec![0.0f32; co * ci];
+                    for b in 0..n {
+                        sgemm(
+                            false, true, co, ci, hw,
+                            1.0, &grad_conv[b * co * hw..], hw,
+                            &in_inner.data[b * ci * hw..], hw,
+                            1.0, &mut grad_kernel, ci,
+                        );
+                    }
+                    let mut grad_input = vec![0.0f32; n * ci * h * w];
+                    for b in 0..n {
+                        sgemm(
+                            true, false, ci, hw, co,
+                            1.0, &k_inner.data, ci,
+                            &grad_conv[b * co * hw..], hw,
+                            0.0, &mut grad_input[b * ci * hw..], hw,
+                        );
+                    }
+                    drop(in_inner);
+                    drop(k_inner);
+                    accumulate_grad(input, &grad_input);
+                    accumulate_grad(kernel, &grad_kernel);
+                    accumulate_grad(bias, &grad_bias);
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let mut grad_kernel = vec![0.0f32; co * ci];
+                    for b in 0..n {
+                        for oc in 0..co {
+                            for ic in 0..ci {
+                                let mut s = 0.0;
+                                for p in 0..hw {
+                                    s += grad_conv[b * co * hw + oc * hw + p]
+                                        * in_inner.data[b * ci * hw + ic * hw + p];
+                                }
+                                grad_kernel[oc * ci + ic] += s;
+                            }
+                        }
+                    }
+                    let mut grad_input = vec![0.0f32; n * ci * h * w];
+                    for b in 0..n {
+                        for ic in 0..ci {
+                            for p in 0..hw {
+                                let mut s = 0.0;
+                                for oc in 0..co {
+                                    s += k_inner.data[oc * ci + ic]
+                                        * grad_conv[b * co * hw + oc * hw + p];
+                                }
+                                grad_input[b * ci * hw + ic * hw + p] = s;
+                            }
+                        }
+                    }
+                    drop(in_inner);
+                    drop(k_inner);
+                    accumulate_grad(input, &grad_input);
+                    accumulate_grad(kernel, &grad_kernel);
+                    accumulate_grad(bias, &grad_bias);
+                }
+            }
             Op::MaxPool2d { ref input, ref max_indices } => {
-                let in_size = input.size();
+                let in_inner = input.0.borrow();
+                let (h, w) = (in_inner.shape[2], in_inner.shape[3]);
+                let in_size = in_inner.data.len();
+                let in_plane = h * w;
+                let plane_out = (h / 2) * (w / 2);
+                drop(in_inner);
+
                 let mut grad_input = vec![0.0f32; in_size];
-                for (out_idx, &in_idx) in max_indices.iter().enumerate() {
-                    grad_input[in_idx] += grad[out_idx];
+
+                if in_size >= PAR_THRESHOLD {
+                    grad_input.par_chunks_mut(in_plane)
+                        .enumerate()
+                        .for_each(|(bc, gi_chunk)| {
+                            let out_base = bc * plane_out;
+                            for oi in 0..plane_out {
+                                let in_idx = max_indices[out_base + oi];
+                                gi_chunk[in_idx - bc * in_plane] += grad[out_base + oi];
+                            }
+                        });
+                } else {
+                    for (out_idx, &in_idx) in max_indices.iter().enumerate() {
+                        grad_input[in_idx] += grad[out_idx];
+                    }
                 }
                 accumulate_grad(input, &grad_input);
             }
@@ -802,8 +1148,15 @@ fn accumulate_grad(tensor: &Tensor, grad: &[f32]) {
     }
     match inner.grad {
         Some(ref mut existing) => {
-            for (e, g) in existing.iter_mut().zip(grad) {
-                *e += g;
+            if existing.len() >= PAR_THRESHOLD {
+                let slice: &mut [f32] = existing.as_mut_slice();
+                slice.par_iter_mut().zip(grad.par_iter()).for_each(|(e, g)| {
+                    *e += g;
+                });
+            } else {
+                for (e, g) in existing.iter_mut().zip(grad) {
+                    *e += g;
+                }
             }
         }
         None => {
