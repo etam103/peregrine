@@ -1,12 +1,12 @@
 mod model;
 mod dataset;
+mod wandb;
 
-use std::collections::HashMap;
 use std::time::Instant;
 use peregrine::tensor::Tensor;
+use peregrine::debug::{model_summary, training_health};
 use model::{RtDetrNet, RtDetrTarget, rt_detr_loss, rt_detr_decode, rt_detr_nms, INPUT_SIZE};
 use dataset::{VocDataset, CocoDataset, Dataset};
-use tensorboard_rs::summary_writer::SummaryWriter;
 
 const NUM_CLASSES: usize = 3;
 const CLASS_NAMES: [&str; NUM_CLASSES] = ["car", "person", "dog"];
@@ -137,12 +137,10 @@ fn targets_to_rt(targets: &[dataset::Target]) -> Vec<RtDetrTarget> {
 }
 
 fn main() {
-    let logdir = "runs/coco_training";
-
     println!("=== peregrine: Training RT-DETR on Real COCO Images ===");
     println!("Input: {}x{}x3, Queries: 20, Embed: 64, Encoder seq: 3x32x32=3072", INPUT_SIZE, INPUT_SIZE);
     println!("Classes: {:?}", CLASS_NAMES);
-    println!("TensorBoard: tensorboard --logdir runs/\n");
+    println!();
 
     let coco_json = "data/coco/annotations/instances_val2017.json";
     let coco_images = "data/coco/val2017";
@@ -160,11 +158,12 @@ fn main() {
         return;
     }
 
-    let mut writer = SummaryWriter::new(logdir);
+    let mut wandb_run = wandb::WandbRun::init("peregrine");
     let net = RtDetrNet::new(NUM_CLASSES, 64, 4, 1, 1, 20);
     let params = net.params();
     let total_params: usize = params.iter().map(|p| p.size()).sum();
     println!("Network: {} parameter tensors, {} total weights\n", params.len(), total_params);
+    println!("{}", model_summary(&net.named_params()));
 
     let batch_size = 1;
     let num_epochs = 20;
@@ -197,7 +196,7 @@ fn main() {
             epoch_loss += loss_val;
 
             if loss_val < min_loss { min_loss = loss_val; }
-            writer.add_scalar("loss/step", loss_val, global_step);
+            wandb_run.log_scalar("loss/step", loss_val, global_step);
 
             let log_every = (num_batches / 10).max(1);
             if batch_idx % log_every == 0 {
@@ -215,7 +214,7 @@ fn main() {
                     let label = format!("{}", class_name(d.class_id).to_uppercase());
                     draw_labeled_box(&mut rgb, INPUT_SIZE, d.cx, d.cy, d.w, d.h, pred_color(d.class_id), 2, &label);
                 }
-                writer.add_image("rtdetr/detections", &rgb, &[3, INPUT_SIZE, INPUT_SIZE], global_step);
+                wandb_run.log_image("rtdetr/detections", &rgb, INPUT_SIZE, INPUT_SIZE, global_step);
             }
 
             loss.backward();
@@ -231,10 +230,24 @@ fn main() {
                 lr
             };
 
+            global_step += 1;
+
+            wandb_run.log_metrics(global_step, &[
+                ("training/grad_norm", grad_norm),
+                ("training/effective_lr", effective_lr as f32),
+            ]);
+
+            if global_step % 50 == 0 {
+                let report = training_health(&net.named_params());
+                let health_metrics = report.to_metrics();
+                let health_owned: Vec<(&str, f32)> = health_metrics.iter().copied().collect();
+                wandb_run.log_metrics(global_step, &health_owned);
+                println!("\n{}", report.display());
+            }
+
             for p in &params {
                 p.sgd_step(effective_lr);
             }
-            global_step += 1;
 
             if batch_idx % 5 == 0 {
                 print!("  epoch {:>2} [{:>3}/{}]  loss = {:.4}\r", epoch, batch_idx + 1, num_batches, loss_val);
@@ -242,14 +255,12 @@ fn main() {
         }
 
         let avg_loss = epoch_loss / num_batches as f32;
-        writer.add_scalar("loss/epoch_avg", avg_loss, epoch);
-        writer.add_scalar("loss/min", min_loss, epoch);
-        writer.add_scalar("hyperparams/lr", lr as f32, epoch);
-
-        let mut loss_map = HashMap::new();
-        loss_map.insert("avg".to_string(), avg_loss);
-        loss_map.insert("min".to_string(), min_loss);
-        writer.add_scalars("loss/overview", &loss_map, epoch);
+        wandb_run.log_metrics(global_step, &[
+            ("epoch", epoch as f32),
+            ("loss/epoch_avg", avg_loss),
+            ("loss/min", min_loss),
+            ("hyperparams/lr", lr as f32),
+        ]);
 
         let epoch_secs = epoch_start.elapsed().as_secs_f32();
         println!("epoch {:>2}  avg_loss = {:.4}  min = {:.4}  lr = {}  ({} batches, {:.2}s)",
@@ -279,7 +290,7 @@ fn main() {
             draw_labeled_box(&mut rgb, INPUT_SIZE, d.cx, d.cy, d.w, d.h, pred_color(d.class_id), 2, &label);
         }
         let tag = format!("rtdetr/inference_{}", i);
-        writer.add_image(&tag, &rgb, &[3, INPUT_SIZE, INPUT_SIZE], 0);
+        wandb_run.log_image(&tag, &rgb, INPUT_SIZE, INPUT_SIZE, global_step + i);
 
         println!("Image {}:", i + 1);
         println!("  Ground truth: {} objects", gt.len());
@@ -299,7 +310,5 @@ fn main() {
         println!();
     }
 
-    writer.flush();
-    println!("TensorBoard logs written to {}/", logdir);
-    println!("Run: tensorboard --logdir runs/");
+    wandb_run.finish();
 }

@@ -60,6 +60,22 @@ impl ResidualBlock {
         }
         p
     }
+
+    fn named_params(&self, prefix: &str) -> Vec<(String, &Tensor)> {
+        let mut p = vec![
+            (format!("{}.conv1_w", prefix), &self.conv1_w),
+            (format!("{}.conv1_b", prefix), &self.conv1_b),
+            (format!("{}.conv2_w", prefix), &self.conv2_w),
+            (format!("{}.conv2_b", prefix), &self.conv2_b),
+        ];
+        if let Some(w) = &self.skip_w {
+            p.push((format!("{}.skip_w", prefix), w));
+        }
+        if let Some(b) = &self.skip_b {
+            p.push((format!("{}.skip_b", prefix), b));
+        }
+        p
+    }
 }
 
 fn crop_to_match(src: &Tensor, target: &Tensor) -> Tensor {
@@ -160,6 +176,23 @@ impl ResNetBackbone {
         }
         p
     }
+
+    fn named_params(&self, prefix: &str) -> Vec<(String, &Tensor)> {
+        let mut p = vec![
+            (format!("{}.stem_w", prefix), &self.stem_w),
+            (format!("{}.stem_b", prefix), &self.stem_b),
+        ];
+        for (i, block) in self.stage2_blocks.iter().enumerate() {
+            p.extend(block.named_params(&format!("{}.stage2.{}", prefix, i)));
+        }
+        for (i, block) in self.stage3_blocks.iter().enumerate() {
+            p.extend(block.named_params(&format!("{}.stage3.{}", prefix, i)));
+        }
+        for (i, block) in self.stage4_blocks.iter().enumerate() {
+            p.extend(block.named_params(&format!("{}.stage4.{}", prefix, i)));
+        }
+        p
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +218,13 @@ impl ChannelProjection {
 
     fn params(&self) -> Vec<&Tensor> {
         vec![&self.weight, &self.bias]
+    }
+
+    fn named_params(&self, prefix: &str) -> Vec<(String, &Tensor)> {
+        vec![
+            (format!("{}.weight", prefix), &self.weight),
+            (format!("{}.bias", prefix), &self.bias),
+        ]
     }
 }
 
@@ -311,6 +351,27 @@ impl RtDetrNet {
             p.extend(layer.params());
         }
         p.extend([&self.cls_w, &self.cls_b, &self.bbox_w, &self.bbox_b]);
+        p
+    }
+
+    pub fn named_params(&self) -> Vec<(String, &Tensor)> {
+        let mut p = self.backbone.named_params("backbone");
+        p.extend(self.proj_s2.named_params("proj_s2"));
+        p.extend(self.proj_s3.named_params("proj_s3"));
+        p.extend(self.proj_s4.named_params("proj_s4"));
+        for (i, layer) in self.encoder_layers.iter().enumerate() {
+            p.extend(layer.named_params(&format!("encoder.{}", i)));
+        }
+        p.push(("object_queries".to_string(), &self.object_queries));
+        for (i, layer) in self.decoder_layers.iter().enumerate() {
+            p.extend(layer.named_params(&format!("decoder.{}", i)));
+        }
+        p.extend([
+            ("cls_w".to_string(), &self.cls_w),
+            ("cls_b".to_string(), &self.cls_b),
+            ("bbox_w".to_string(), &self.bbox_w),
+            ("bbox_b".to_string(), &self.bbox_b),
+        ]);
         p
     }
 }

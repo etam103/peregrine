@@ -104,6 +104,19 @@ impl MultiHeadAttention {
             &self.bq, &self.bk, &self.bv, &self.bo,
         ]
     }
+
+    pub fn named_params(&self, prefix: &str) -> Vec<(String, &Tensor)> {
+        vec![
+            (format!("{}.wq", prefix), &self.wq),
+            (format!("{}.wk", prefix), &self.wk),
+            (format!("{}.wv", prefix), &self.wv),
+            (format!("{}.wo", prefix), &self.wo),
+            (format!("{}.bq", prefix), &self.bq),
+            (format!("{}.bk", prefix), &self.bk),
+            (format!("{}.bv", prefix), &self.bv),
+            (format!("{}.bo", prefix), &self.bo),
+        ]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +172,21 @@ impl TransformerEncoderLayer {
             &self.ln2_gamma, &self.ln2_beta,
             &self.ffn_w1, &self.ffn_b1,
             &self.ffn_w2, &self.ffn_b2,
+        ]);
+        p
+    }
+
+    pub fn named_params(&self, prefix: &str) -> Vec<(String, &Tensor)> {
+        let mut p = self.mha.named_params(&format!("{}.mha", prefix));
+        p.extend([
+            (format!("{}.ln1_gamma", prefix), &self.ln1_gamma),
+            (format!("{}.ln1_beta", prefix), &self.ln1_beta),
+            (format!("{}.ln2_gamma", prefix), &self.ln2_gamma),
+            (format!("{}.ln2_beta", prefix), &self.ln2_beta),
+            (format!("{}.ffn_w1", prefix), &self.ffn_w1),
+            (format!("{}.ffn_b1", prefix), &self.ffn_b1),
+            (format!("{}.ffn_w2", prefix), &self.ffn_w2),
+            (format!("{}.ffn_b2", prefix), &self.ffn_b2),
         ]);
         p
     }
@@ -233,6 +261,24 @@ impl TransformerDecoderLayer {
             &self.ln3_gamma, &self.ln3_beta,
             &self.ffn_w1, &self.ffn_b1,
             &self.ffn_w2, &self.ffn_b2,
+        ]);
+        p
+    }
+
+    pub fn named_params(&self, prefix: &str) -> Vec<(String, &Tensor)> {
+        let mut p = self.self_attn.named_params(&format!("{}.self_attn", prefix));
+        p.extend(self.cross_attn.named_params(&format!("{}.cross_attn", prefix)));
+        p.extend([
+            (format!("{}.ln1_gamma", prefix), &self.ln1_gamma),
+            (format!("{}.ln1_beta", prefix), &self.ln1_beta),
+            (format!("{}.ln2_gamma", prefix), &self.ln2_gamma),
+            (format!("{}.ln2_beta", prefix), &self.ln2_beta),
+            (format!("{}.ln3_gamma", prefix), &self.ln3_gamma),
+            (format!("{}.ln3_beta", prefix), &self.ln3_beta),
+            (format!("{}.ffn_w1", prefix), &self.ffn_w1),
+            (format!("{}.ffn_b1", prefix), &self.ffn_b1),
+            (format!("{}.ffn_w2", prefix), &self.ffn_w2),
+            (format!("{}.ffn_b2", prefix), &self.ffn_b2),
         ]);
         p
     }
