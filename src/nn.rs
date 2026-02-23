@@ -83,8 +83,8 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
     let (batch, num_classes) = (shape[0], shape[1]);
     assert_eq!(targets.len(), batch);
 
-    // Log-softmax (numerically stable)
-    let log_probs = logits.softmax(-1).log();
+    // Log-softmax (numerically stable — avoids log(0) = -inf)
+    let log_probs = logits.log_softmax(-1);
 
     // NLL: -log_prob[i, target[i]] averaged over batch
     let mut indices = Vec::with_capacity(batch);

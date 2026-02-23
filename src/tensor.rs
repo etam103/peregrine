@@ -134,6 +134,11 @@ pub enum Op {
         mean: Vec<f32>,
         inv_std: Vec<f32>,
     },
+    LogSoftmax {
+        input: Tensor,
+        output_data: Vec<f32>,
+        dim: usize,
+    },
 }
 
 /// Compute flat index for a 4D tensor with shape [N, C, H, W].
@@ -1024,6 +1029,53 @@ impl Tensor {
         )
     }
 
+    /// Numerically stable log-softmax: log(softmax(x)) = x - max - log(sum(exp(x - max)))
+    pub fn log_softmax(&self, dim: isize) -> Tensor {
+        let inner = self.0.borrow();
+        let ndim = inner.shape.len();
+        let dim = if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize };
+        assert!(dim < ndim, "log_softmax dim out of range");
+
+        let outer: usize = inner.shape[..dim].iter().product();
+        let dim_size = inner.shape[dim];
+        let inner_size: usize = inner.shape[dim + 1..].iter().product();
+
+        let mut data = vec![0.0f32; inner.data.len()];
+
+        for o in 0..outer {
+            for i in 0..inner_size {
+                let base = o * dim_size * inner_size + i;
+                // Find max for numerical stability
+                let mut max_val = f32::NEG_INFINITY;
+                for d in 0..dim_size {
+                    let idx = base + d * inner_size;
+                    if inner.data[idx] > max_val {
+                        max_val = inner.data[idx];
+                    }
+                }
+                // Compute log(sum(exp(x - max)))
+                let mut sum_exp = 0.0f32;
+                for d in 0..dim_size {
+                    let idx = base + d * inner_size;
+                    sum_exp += (inner.data[idx] - max_val).exp();
+                }
+                let log_sum_exp = sum_exp.ln();
+                // log_softmax = x - max - log_sum_exp
+                for d in 0..dim_size {
+                    let idx = base + d * inner_size;
+                    data[idx] = inner.data[idx] - max_val - log_sum_exp;
+                }
+            }
+        }
+
+        let output_data = data.clone();
+        Tensor::from_op(
+            data,
+            inner.shape.clone(),
+            Op::LogSoftmax { input: self.clone(), output_data, dim },
+        )
+    }
+
     pub fn layer_norm(&self, gamma: &Tensor, beta: &Tensor, normalized_shape: usize) -> Tensor {
         let inner = self.0.borrow();
         let g = gamma.0.borrow();
@@ -1423,7 +1475,7 @@ impl Tensor {
                 | Op::Squeeze { input, .. } | Op::Unsqueeze { input, .. }
                 | Op::Reshape { input, .. } | Op::Transpose { input, .. }
                 | Op::Gelu(input) => vec![input],
-                Op::Softmax { input, .. } => vec![input],
+                Op::Softmax { input, .. } | Op::LogSoftmax { input, .. } => vec![input],
                 Op::LayerNorm { input, gamma, beta, .. }
                 | Op::BatchNorm { input, gamma, beta, .. } => vec![input, gamma, beta],
                 Op::Concat { inputs, .. } => inputs,
@@ -1965,6 +2017,33 @@ impl Tensor {
                         for d in 0..dim_size {
                             let idx = base + d * inner_size;
                             grad_input[idx] = output_data[idx] * (grad[idx] - dot);
+                        }
+                    }
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::LogSoftmax { ref input, ref output_data, dim } => {
+                let in_shape = input.shape();
+                let outer: usize = in_shape[..dim].iter().product();
+                let dim_size = in_shape[dim];
+                let inner_size: usize = in_shape[dim + 1..].iter().product();
+
+                let mut grad_input = vec![0.0f32; grad.len()];
+
+                // d(log_softmax)/dx_i = delta_ij - softmax_j
+                // grad_input[i] = grad[i] - softmax[i] * sum(grad)
+                for o in 0..outer {
+                    for i in 0..inner_size {
+                        let base = o * dim_size * inner_size + i;
+                        let mut sum_grad = 0.0f32;
+                        for d in 0..dim_size {
+                            let idx = base + d * inner_size;
+                            sum_grad += grad[idx];
+                        }
+                        for d in 0..dim_size {
+                            let idx = base + d * inner_size;
+                            // softmax = exp(log_softmax)
+                            grad_input[idx] = grad[idx] - output_data[idx].exp() * sum_grad;
                         }
                     }
                 }

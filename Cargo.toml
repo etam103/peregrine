@@ -16,3 +16,7 @@ ureq = { version = "2", features = ["json"] }
 [[example]]
 name = "rt_detr"
 path = "examples/rt_detr/main.rs"
+
+[[example]]
+name = "mnist"
+path = "examples/mnist/main.rs"
