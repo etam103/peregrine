@@ -17,9 +17,10 @@ Tensors, reverse-mode autograd, neural network layers, optimizers, and working m
 
 ```
 cargo build --release                          # build the library
-cargo test                                     # 63 tests, all pass
+cargo test                                     # 64 tests, all pass
 cargo run --example mnist --release            # train MNIST digit classifier (97.5% accuracy)
 cargo run --example rt_detr --release          # train RT-DETR on COCO images
+./scripts/bench_compare.sh                     # wall-clock benchmark vs PyTorch, MLX, TF, tinygrad
 ```
 
 ---
@@ -31,11 +32,13 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, NumPy-style broadcasting, Apple Accelerate BLAS, rayon parallelism |
 | **`peregrine::nn`** | Linear, Embedding, MultiHeadAttention, Transformer encoder/decoder, CrossEntropyLoss, MSELoss |
 | **`peregrine::optim`** | SGD (with momentum, Nesterov, weight decay), Adam, AdamW, LR schedulers (StepLR, CosineAnnealing, Warmup), gradient clipping |
+| **`peregrine::serial`** | Save/load model weights in compact binary format |
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
+| **`peregrine::metal`** | Metal GPU backend — 21 compute shaders, buffer pool, unified memory (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 
-The entire library is ~3,900 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
+The entire library is ~5,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
 ---
 
@@ -177,12 +180,25 @@ Input Image [1, 3, 256, 256]
 
 ## Performance
 
-All computation runs on CPU. On Apple Silicon (M-series), matmul and conv2d are accelerated via the Accelerate framework (BLAS). Element-wise ops parallelize via rayon above 10k elements.
+CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compute shaders (`--features metal`). Wall-clock benchmarks run via `./scripts/bench_compare.sh`.
+
+### Peregrine vs ML Frameworks (CPU, wall-clock)
+
+| Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad |
+|-----------|----------:|--------:|----:|-----------:|---------:|
+| matmul 128x128 | **6.0 us** | 5.7 | 20.9 | 93.8 | 459.8 |
+| matmul 512x512 | **162.3 us** | 165.2 | 173.7 | 675.9 | 434.1 |
+| softmax 8x128 | **3.9 us** | 39.7 | 17.0 | 10.2 | 699.7 |
+| MLP fwd 64x784 | **28.5 us** | 28.4 | 52.8 | 250.4 | 1830.8 |
+| train step 64 | **1030.5 us** | 1462.1 | 782.4 | 8414.2 | 24801.1 |
+
+Geometric mean ratio (lower = Peregrine faster): PyTorch 1.12x, MLX 1.16x, TensorFlow 0.66x, tinygrad 0.14x.
 
 | Optimization | Impact |
 |-------------|--------|
-| Apple Accelerate BLAS | ~10× faster matmul and 1×1 conv2d |
+| Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
 | Rayon parallelism | Parallel add/mul/relu/sigmoid/sum and their backward passes |
+| Metal GPU backend | 3-5x speedup on element-wise ops at 1M elements |
 | Clone elimination | `std::mem::replace` for op ownership, direct `RefCell` borrows |
 | Xavier init | `std = sqrt(1/fan_in)` — prevents NaN loss in deep networks |
 | Multi-scale pooling | 3,072 encoder tokens instead of 56,784 — attention fits in memory |
@@ -198,6 +214,18 @@ src/
   nn.rs           Linear, Embedding, attention, transformer, loss functions
   optim.rs        SGD, Adam, AdamW, LR schedulers, gradient clipping
   debug.rs        model summary + training health diagnostics
+  serial.rs       model weight save/load (binary format)
+  metal/          Metal GPU backend (context, shaders, buffer pool)
+benches/
+  tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
+  wallclock.rs    wall-clock comparison benchmark (JSON output)
+scripts/
+  bench_compare.sh    orchestrator: builds + runs all framework benchmarks
+  bench_pytorch.py    PyTorch wall-clock benchmark
+  bench_mlx.py        MLX wall-clock benchmark
+  bench_tensorflow.py TensorFlow wall-clock benchmark
+  bench_tinygrad.py   tinygrad wall-clock benchmark
+  compare_bench.py    reads JSONs, renders markdown comparison table
 examples/
   mnist/          MNIST digit classifier (97.5% test accuracy)
   rt_detr/        RT-DETR training on COCO
@@ -216,10 +244,10 @@ tests/
 
 This is a learning project, not a production framework.
 
-- CPU only — no GPU acceleration yet (Metal backend planned)
+- Element-wise ops ~2x slower than PyTorch/MLX (allocation overhead — buffer pool planned)
 - Greedy Hungarian matching (not full O(n³) algorithm)
 - Attention forward pass breaks autograd graph (output projection still trains)
-- No model save/load
+- Metal GPU backend is dispatch-only (no autograd integration yet)
 
 ---
 

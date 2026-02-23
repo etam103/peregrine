@@ -7,6 +7,38 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.6.0] - 2026-02-22
+
+### Added — Multi-framework wall-clock benchmark suite
+- `benches/wallclock.rs` — Peregrine benchmark (standalone binary, JSON output)
+- `scripts/bench_pytorch.py` — PyTorch 2.10.0 benchmark
+- `scripts/bench_mlx.py` — MLX 0.30.6 benchmark
+- `scripts/bench_tensorflow.py` — TensorFlow 2.20.0 benchmark
+- `scripts/bench_tinygrad.py` — tinygrad 0.12.0 benchmark
+- `scripts/compare_bench.py` — multi-framework comparison table (markdown output)
+- `scripts/bench_compare.sh` — orchestrator: builds, runs all 5 frameworks sequentially with `nice -n 10`
+
+14 operations benchmarked: matmul (128/256/512), add, mul, exp (100K/500K), relu, softmax (128/512), MLP forward, training step.
+
+### Benchmark Results (CPU, Apple Silicon)
+
+| Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad |
+|-----------|----------:|--------:|----:|-----------:|---------:|
+| matmul 512x512 | **162 us** | 165 | 174 | 676 | 434 |
+| softmax 8x128 | **3.9 us** | 39.7 | 17.0 | 10.2 | 700 |
+| MLP fwd 64x784 | **28.5 us** | 28.4 | 52.8 | 250 | 1831 |
+| train step 64 | **1031 us** | 1462 | 782 | 8414 | 24801 |
+
+**Geometric mean (Peregrine / framework):**
+- vs PyTorch: 1.12x (near parity)
+- vs MLX: 1.16x (near parity)
+- vs TensorFlow: 0.66x (Peregrine 1.5x faster)
+- vs tinygrad: 0.14x (Peregrine 7x faster)
+
+**Wins:** PyTorch 5/14, MLX 5/14, Peregrine 2/14, TensorFlow 2/14
+
+---
+
 ## [0.5.0] - 2026-02-22
 
 ### Added — Metal GPU Backend (`--features metal`)

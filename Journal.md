@@ -1,4 +1,4 @@
-# Rustorch Performance Journal
+# Peregrine Performance Journal
 
 Model: YoloNet (54,344 params), batch_size=1, 20 epochs.
 Hardware: Apple Silicon, macOS, Apple Accelerate BLAS.
@@ -170,3 +170,59 @@ Initial loss was 36,280 and exploded to NaN by step 6. Root cause: `randn` used 
 | Peak RSS | OOM (>52 GB) | 630 MB |
 
 Loss decreasing across epochs confirms the model is learning. Epoch 1 showed lower early losses (~0.18) compared to epoch 0's start (~1.6).
+
+## Multi-framework wall-clock benchmarks (2026-02-22)
+
+Built a complete benchmarking suite to compare Peregrine against PyTorch 2.10.0, MLX 0.30.6, TensorFlow 2.20.0, and tinygrad 0.12.0. All benchmarks run on CPU with `nice -n 10` to keep resource usage under 80%.
+
+14 operations benchmarked across all 5 frameworks: matmul (128/256/512), elementwise add/mul/exp (100K/500K), relu (100K), softmax (8x128/8x512), MLP forward pass, and full training step (fwd + backward + Adam).
+
+Methodology: 5 warmup iterations discarded, 50 timed iterations (20 for heavy ops), median reported in microseconds.
+
+### Results
+
+| Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | Best |
+|-----------|----------:|--------:|----:|-----------:|---------:|------|
+| matmul 128x128 | 6.0 | 5.7 | 20.9 | 93.8 | 459.8 | PyTorch |
+| matmul 256x256 | 32.2 | 30.7 | 47.6 | 194.0 | 435.8 | PyTorch |
+| matmul 512x512 | **162.3** | 165.2 | 173.7 | 675.9 | 434.1 | Peregrine |
+| add 100k | 121.3 | 46.6 | **31.3** | 53.1 | 193.7 | MLX |
+| add 500k | 159.8 | **73.7** | 81.1 | 86.3 | 194.7 | PyTorch |
+| mul 100k | 116.8 | 43.9 | **29.3** | 44.7 | 199.8 | MLX |
+| mul 500k | 124.5 | **65.9** | 85.3 | 76.3 | 190.8 | PyTorch |
+| exp 100k | 133.2 | 71.7 | **60.4** | 66.8 | 228.4 | MLX |
+| exp 500k | 254.3 | 161.1 | 226.2 | **107.5** | 230.9 | TensorFlow |
+| relu 100k | 87.4 | 44.9 | **28.8** | 39.3 | 347.1 | MLX |
+| softmax 8x128 | **3.9** | 39.7 | 17.0 | 10.2 | 699.7 | Peregrine |
+| softmax 8x512 | 15.3 | 40.1 | 19.1 | **12.9** | 628.6 | TensorFlow |
+| MLP fwd 64x784 | 28.5 | **28.4** | 52.8 | 250.4 | 1830.8 | PyTorch |
+| train step 64 | 1030.5 | 1462.1 | **782.4** | 8414.2 | 24801.1 | MLX |
+
+**Geometric mean (Peregrine / framework):**
+- vs PyTorch: **1.12x** (Peregrine slightly slower)
+- vs MLX: **1.16x** (Peregrine slightly slower)
+- vs TensorFlow: **0.66x** (Peregrine 1.5x faster)
+- vs tinygrad: **0.14x** (Peregrine 7x faster)
+
+**Wins by framework:** PyTorch 5/14, MLX 5/14, Peregrine 2/14, TensorFlow 2/14
+
+### Analysis
+
+**Where Peregrine wins:**
+- Softmax 8x128: 3.9 us — 10x faster than PyTorch (39.7 us), 4x faster than MLX (17 us). Our fused log-sum-exp implementation avoids framework dispatch overhead.
+- Matmul 512x512: 162.3 us — edged out PyTorch (165.2) and MLX (173.7). Direct Accelerate/sgemm dispatch with minimal wrapper overhead.
+- MLP forward: 28.5 us — tied with PyTorch, 2x faster than MLX. Matmul advantage carries through.
+- Training step: 1031 us — 1.4x faster than PyTorch (1462), but 1.3x slower than MLX (782).
+
+**Where Peregrine loses:**
+- Elementwise ops are 2-4x slower than both PyTorch and MLX at 100K elements.
+- Root cause: allocation overhead. Every op allocates a fresh `Vec<f32>`. At 100K elements (400KB), malloc+memset cost is a significant fraction of total time. PyTorch and MLX both use memory pool allocators.
+- Secondary: PyTorch and MLX use hand-tuned NEON SIMD intrinsics. Peregrine relies on rustc autovectorization.
+
+### Next steps
+
+Created two milestones in Linear:
+1. **Close Elementwise & Matmul Performance Gap vs PyTorch** — buffer pool, NEON intrinsics, Rayon tuning
+2. **Beat MLX on CPU Wall-Clock Performance** — same fundamentals, plus training step optimization
+
+Target: geometric mean < 0.85x vs both PyTorch and MLX.
