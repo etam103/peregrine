@@ -1,6 +1,110 @@
 use crate::tensor::Tensor;
 
 // ---------------------------------------------------------------------------
+// Linear (fully connected) layer: y = xW^T + b
+// ---------------------------------------------------------------------------
+
+pub struct Linear {
+    pub weight: Tensor, // [out_features, in_features]
+    pub bias: Tensor,   // [1, out_features]
+}
+
+impl Linear {
+    pub fn new(in_features: usize, out_features: usize) -> Self {
+        Linear {
+            weight: Tensor::randn(&[in_features, out_features], true),
+            bias: Tensor::zeros(&[1, out_features], true),
+        }
+    }
+
+    /// x: [batch, in_features] -> [batch, out_features]
+    pub fn forward(&self, x: &Tensor) -> Tensor {
+        x.matmul(&self.weight).add_bias(&self.bias)
+    }
+
+    pub fn params(&self) -> Vec<&Tensor> {
+        vec![&self.weight, &self.bias]
+    }
+
+    pub fn named_params(&self, prefix: &str) -> Vec<(String, &Tensor)> {
+        vec![
+            (format!("{}.weight", prefix), &self.weight),
+            (format!("{}.bias", prefix), &self.bias),
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Embedding: lookup table for token embeddings
+// ---------------------------------------------------------------------------
+
+pub struct Embedding {
+    pub weight: Tensor, // [num_embeddings, embedding_dim]
+    num_embeddings: usize,
+    embedding_dim: usize,
+}
+
+impl Embedding {
+    pub fn new(num_embeddings: usize, embedding_dim: usize) -> Self {
+        Embedding {
+            weight: Tensor::randn(&[num_embeddings, embedding_dim], true),
+            num_embeddings,
+            embedding_dim,
+        }
+    }
+
+    /// indices: flat list of token indices -> [len, embedding_dim]
+    pub fn forward(&self, indices: &[usize]) -> Tensor {
+        let w = self.weight.data();
+        let mut data = Vec::with_capacity(indices.len() * self.embedding_dim);
+        for &idx in indices {
+            assert!(idx < self.num_embeddings, "embedding index out of range");
+            let offset = idx * self.embedding_dim;
+            data.extend_from_slice(&w[offset..offset + self.embedding_dim]);
+        }
+        // Return as a non-grad tensor (embedding backward is handled via select)
+        Tensor::new(data, vec![indices.len(), self.embedding_dim], false)
+    }
+
+    pub fn params(&self) -> Vec<&Tensor> {
+        vec![&self.weight]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CrossEntropyLoss: log_softmax + NLL (numerically stable)
+// ---------------------------------------------------------------------------
+
+/// CrossEntropyLoss: takes logits [batch, num_classes] and target class indices.
+/// Returns scalar loss.
+pub fn cross_entropy_loss(logits: &Tensor, targets: &[usize]) -> Tensor {
+    let shape = logits.shape();
+    assert_eq!(shape.len(), 2);
+    let (batch, num_classes) = (shape[0], shape[1]);
+    assert_eq!(targets.len(), batch);
+
+    // Log-softmax (numerically stable)
+    let log_probs = logits.softmax(-1).log();
+
+    // NLL: -log_prob[i, target[i]] averaged over batch
+    let mut indices = Vec::with_capacity(batch);
+    for (i, &t) in targets.iter().enumerate() {
+        indices.push(i * num_classes + t);
+    }
+    let selected = log_probs.select(&indices);
+    selected.mean().neg()
+}
+
+// ---------------------------------------------------------------------------
+// MSELoss
+// ---------------------------------------------------------------------------
+
+/// Mean squared error: mean((pred - target)^2)
+pub fn mse_loss(pred: &Tensor, target: &Tensor) -> Tensor {
+    pred.sub(target).pow(2.0).mean()
+}
+
+// ---------------------------------------------------------------------------
 // MultiHeadAttention
 // ---------------------------------------------------------------------------
 
