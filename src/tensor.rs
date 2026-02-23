@@ -337,16 +337,16 @@ fn col2im(
     grad_input
 }
 
-struct TensorInner {
-    data: Vec<f32>,
-    shape: Vec<usize>,
-    grad: Option<Vec<f32>>,
-    op: Op,
-    requires_grad: bool,
+pub(crate) struct TensorInner {
+    pub(crate) data: Vec<f32>,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) grad: Option<Vec<f32>>,
+    pub(crate) op: Op,
+    pub(crate) requires_grad: bool,
 }
 
 #[derive(Clone)]
-pub struct Tensor(Rc<RefCell<TensorInner>>);
+pub struct Tensor(pub(crate) Rc<RefCell<TensorInner>>);
 
 impl Tensor {
     pub fn new(data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Self {
@@ -2283,6 +2283,31 @@ impl Tensor {
             }
         }
         inner.op = Op::None;
+    }
+
+    /// Reset gradient to None and detach from computation graph.
+    pub fn zero_grad(&self) {
+        let mut inner = self.0.borrow_mut();
+        inner.grad = None;
+        inner.op = Op::None;
+    }
+
+    /// Borrow the gradient slice (None if no gradient accumulated).
+    pub fn grad_data(&self) -> Option<Vec<f32>> {
+        self.0.borrow().grad.clone()
+    }
+
+    /// Apply an in-place update to the parameter data. Resets op to None (detach).
+    pub fn update_data(&self, f: impl Fn(&mut [f32], &[f32])) {
+        let mut inner = self.0.borrow_mut();
+        if let Some(g) = inner.grad.clone() {
+            f(&mut inner.data, &g);
+        }
+        inner.op = Op::None;
+    }
+
+    pub fn requires_grad(&self) -> bool {
+        self.0.borrow().requires_grad
     }
 }
 
