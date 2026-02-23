@@ -112,6 +112,15 @@ pub enum Op {
     Sin(Tensor),
     Cos(Tensor),
     Tanh(Tensor),
+    Mean(Tensor),
+    Squeeze {
+        input: Tensor,
+        original_shape: Vec<usize>,
+    },
+    Unsqueeze {
+        input: Tensor,
+        original_shape: Vec<usize>,
+    },
     Concat {
         inputs: Vec<Tensor>,
         split_sizes: Vec<usize>,
@@ -224,6 +233,43 @@ impl Tensor {
     pub fn zeros(shape: &[usize], requires_grad: bool) -> Self {
         let size: usize = shape.iter().product();
         Self::new(vec![0.0; size], shape.to_vec(), requires_grad)
+    }
+
+    pub fn ones(shape: &[usize], requires_grad: bool) -> Self {
+        let size: usize = shape.iter().product();
+        Self::new(vec![1.0; size], shape.to_vec(), requires_grad)
+    }
+
+    pub fn full(shape: &[usize], value: f32, requires_grad: bool) -> Self {
+        let size: usize = shape.iter().product();
+        Self::new(vec![value; size], shape.to_vec(), requires_grad)
+    }
+
+    /// Create a 1D tensor with values [0, 1, ..., n-1].
+    pub fn arange(n: usize, requires_grad: bool) -> Self {
+        let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        Self::new(data, vec![n], requires_grad)
+    }
+
+    /// Create a 1D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
+    pub fn linspace(start: f32, end: f32, steps: usize, requires_grad: bool) -> Self {
+        let data: Vec<f32> = if steps <= 1 {
+            vec![start]
+        } else {
+            (0..steps)
+                .map(|i| start + (end - start) * i as f32 / (steps - 1) as f32)
+                .collect()
+        };
+        Self::new(data, vec![steps], requires_grad)
+    }
+
+    /// Create an n x n identity matrix.
+    pub fn eye(n: usize, requires_grad: bool) -> Self {
+        let mut data = vec![0.0f32; n * n];
+        for i in 0..n {
+            data[i * n + i] = 1.0;
+        }
+        Self::new(data, vec![n, n], requires_grad)
     }
 
     pub fn randn(shape: &[usize], requires_grad: bool) -> Self {
@@ -1016,6 +1062,85 @@ impl Tensor {
         Tensor::from_op(data, inner.shape.clone(), Op::Tanh(self.clone()))
     }
 
+    /// Scalar mean of all elements (differentiable).
+    pub fn mean(&self) -> Tensor {
+        let inner = self.0.borrow();
+        let n = inner.data.len();
+        let s: f32 = if n >= PAR_THRESHOLD {
+            inner.data.par_iter().sum()
+        } else {
+            inner.data.iter().sum()
+        };
+        Tensor::from_op(vec![s / n as f32], vec![1], Op::Mean(self.clone()))
+    }
+
+    /// Remove dimensions of size 1. If `dim` is None, removes all size-1 dims.
+    pub fn squeeze(&self, dim: Option<usize>) -> Tensor {
+        let inner = self.0.borrow();
+        let original_shape = inner.shape.clone();
+        let new_shape: Vec<usize> = match dim {
+            Some(d) => {
+                assert!(d < original_shape.len(), "squeeze dim out of range");
+                assert_eq!(original_shape[d], 1, "can only squeeze dims of size 1");
+                original_shape.iter().enumerate()
+                    .filter(|&(i, _)| i != d)
+                    .map(|(_, &s)| s)
+                    .collect()
+            }
+            None => original_shape.iter().copied().filter(|&s| s != 1).collect(),
+        };
+        let new_shape = if new_shape.is_empty() { vec![1] } else { new_shape };
+        Tensor::from_op(
+            inner.data.clone(),
+            new_shape,
+            Op::Squeeze { input: self.clone(), original_shape },
+        )
+    }
+
+    /// Insert a dimension of size 1 at position `dim`.
+    pub fn unsqueeze(&self, dim: usize) -> Tensor {
+        let inner = self.0.borrow();
+        let original_shape = inner.shape.clone();
+        assert!(dim <= original_shape.len(), "unsqueeze dim out of range");
+        let mut new_shape = original_shape.clone();
+        new_shape.insert(dim, 1);
+        Tensor::from_op(
+            inner.data.clone(),
+            new_shape,
+            Op::Unsqueeze { input: self.clone(), original_shape },
+        )
+    }
+
+    /// Returns the maximum value as a scalar (not differentiable).
+    pub fn max(&self) -> f32 {
+        let inner = self.0.borrow();
+        inner.data.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    }
+
+    /// Returns the minimum value as a scalar (not differentiable).
+    pub fn min(&self) -> f32 {
+        let inner = self.0.borrow();
+        inner.data.iter().copied().fold(f32::INFINITY, f32::min)
+    }
+
+    /// Returns the index of the maximum value in the flat data.
+    pub fn argmax(&self) -> usize {
+        let inner = self.0.borrow();
+        inner.data.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    }
+
+    /// Returns the index of the minimum value in the flat data.
+    pub fn argmin(&self) -> usize {
+        let inner = self.0.borrow();
+        inner.data.iter().enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap()
+    }
+
     pub fn concat(tensors: &[&Tensor], dim: usize) -> Tensor {
         assert!(!tensors.is_empty(), "concat requires at least one tensor");
         let first_shape = tensors[0].shape();
@@ -1144,10 +1269,11 @@ impl Tensor {
                 | Op::Scale(a, _) | Op::Select(a, _) | Op::BceLoss(a, _)
                 | Op::Neg(a) | Op::Exp(a) | Op::Log(a) | Op::Sqrt(a)
                 | Op::Abs(a) | Op::Pow(a, _) | Op::Sin(a) | Op::Cos(a)
-                | Op::Tanh(a) => vec![a],
+                | Op::Tanh(a) | Op::Mean(a) => vec![a],
                 Op::Conv2d(a, b, c) => vec![a, b, c],
                 Op::Conv2dReluPool { input, kernel, bias, .. } => vec![input, kernel, bias],
                 Op::MaxPool2d { input, .. } | Op::Flatten { input, .. }
+                | Op::Squeeze { input, .. } | Op::Unsqueeze { input, .. }
                 | Op::Reshape { input, .. } | Op::Transpose { input, .. }
                 | Op::Gelu(input) => vec![input],
                 Op::Softmax { input, .. } => vec![input],
@@ -1853,6 +1979,14 @@ impl Tensor {
                 drop(self_inner);
                 accumulate_grad(input, &grad_input);
             }
+            Op::Mean(ref input) => {
+                let n = input.size();
+                let grad_input = vec![grad[0] / n as f32; n];
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Squeeze { ref input, .. } | Op::Unsqueeze { ref input, .. } => {
+                accumulate_grad(input, &grad);
+            }
             Op::Gelu(ref input) => {
                 let in_inner = input.0.borrow();
                 let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
@@ -2292,6 +2426,62 @@ mod tests {
                 name, analytical, numerical, diff
             );
         }
+    }
+
+    #[test]
+    fn test_creation_ops() {
+        let o = Tensor::ones(&[2, 3], false);
+        assert_eq!(o.shape(), vec![2, 3]);
+        assert_eq!(o.data(), vec![1.0; 6]);
+
+        let f = Tensor::full(&[2, 2], 7.0, false);
+        assert_eq!(f.data(), vec![7.0; 4]);
+
+        let a = Tensor::arange(5, false);
+        assert_eq!(a.data(), vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+
+        let l = Tensor::linspace(0.0, 1.0, 5, false);
+        assert_eq!(l.data(), vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+
+        let e = Tensor::eye(3, false);
+        assert_eq!(e.data(), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_mean() {
+        let x = Tensor::new(vec![2.0, 4.0, 6.0, 8.0], vec![2, 2], true);
+        let m = x.mean();
+        assert_eq!(m.data(), vec![5.0]);
+        m.backward();
+        // grad = 1/n for each element
+        assert_eq!(x.grad().unwrap(), vec![0.25, 0.25, 0.25, 0.25]);
+    }
+
+    #[test]
+    fn test_squeeze_unsqueeze() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0], vec![1, 3, 1], true);
+        let squeezed = x.squeeze(None);
+        assert_eq!(squeezed.shape(), vec![3]);
+
+        let y = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], true);
+        let unsqueezed = y.unsqueeze(0);
+        assert_eq!(unsqueezed.shape(), vec![1, 3]);
+        let unsqueezed2 = y.unsqueeze(1);
+        assert_eq!(unsqueezed2.shape(), vec![3, 1]);
+
+        // Backward through squeeze
+        let loss = squeezed.sum();
+        loss.backward();
+        assert_eq!(x.grad().unwrap(), vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_max_min_argmax_argmin() {
+        let x = Tensor::new(vec![3.0, 1.0, 4.0, 1.0, 5.0, 9.0], vec![6], false);
+        assert_eq!(x.max(), 9.0);
+        assert_eq!(x.min(), 1.0);
+        assert_eq!(x.argmax(), 5);
+        assert_eq!(x.argmin(), 1);
     }
 
     #[test]
