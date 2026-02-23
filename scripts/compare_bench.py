@@ -19,6 +19,7 @@ FRAMEWORKS = [
     ("mlx", "mlx.json", "MLX"),
     ("tensorflow", "tensorflow.json", "TensorFlow"),
     ("tinygrad", "tinygrad.json", "tinygrad"),
+    ("jax", "jax.json", "JAX"),
 ]
 
 

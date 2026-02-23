@@ -1,3 +1,4 @@
+pub mod cpu_pool;
 pub mod tensor;
 pub mod nn;
 pub mod debug;

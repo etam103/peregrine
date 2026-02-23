@@ -19,37 +19,42 @@ echo "=== Peregrine vs ML Frameworks — Wall-Clock Benchmark ==="
 echo ""
 
 # --- Build Peregrine in release mode ---
-echo "[1/7] Building Peregrine (release)..."
+echo "[1/8] Building Peregrine (release)..."
 cargo build --release --bench wallclock 2>&1 | tail -1
 echo ""
 
 # --- Run PyTorch benchmark ---
-echo "[2/7] Running PyTorch benchmark..."
+echo "[2/8] Running PyTorch benchmark..."
 nice -n 10 .venv/bin/python scripts/bench_pytorch.py
 echo ""
 
 # --- Run MLX benchmark ---
-echo "[3/7] Running MLX benchmark..."
+echo "[3/8] Running MLX benchmark..."
 nice -n 10 .venv/bin/python scripts/bench_mlx.py
 echo ""
 
 # --- Run TensorFlow benchmark ---
-echo "[4/7] Running TensorFlow benchmark..."
+echo "[4/8] Running TensorFlow benchmark..."
 nice -n 10 .venv/bin/python scripts/bench_tensorflow.py
 echo ""
 
 # --- Run tinygrad benchmark ---
-echo "[5/7] Running tinygrad benchmark..."
+echo "[5/8] Running tinygrad benchmark..."
 nice -n 10 .venv/bin/python scripts/bench_tinygrad.py
 echo ""
 
+# --- Run JAX benchmark ---
+echo "[6/8] Running JAX benchmark..."
+nice -n 10 .venv/bin/python scripts/bench_jax.py
+echo ""
+
 # --- Run Peregrine benchmark ---
-echo "[6/7] Running Peregrine benchmark..."
+echo "[7/8] Running Peregrine benchmark..."
 nice -n 10 cargo bench --bench wallclock 2>&1
 echo ""
 
 # --- Compare results ---
-echo "[7/7] Comparing results..."
+echo "[8/8] Comparing results..."
 echo ""
 .venv/bin/python scripts/compare_bench.py
 echo ""

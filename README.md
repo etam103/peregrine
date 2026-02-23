@@ -17,10 +17,10 @@ Tensors, reverse-mode autograd, neural network layers, optimizers, and working m
 
 ```
 cargo build --release                          # build the library
-cargo test                                     # 64 tests, all pass
+cargo test                                     # 67 tests, all pass
 cargo run --example mnist --release            # train MNIST digit classifier (97.5% accuracy)
 cargo run --example rt_detr --release          # train RT-DETR on COCO images
-./scripts/bench_compare.sh                     # wall-clock benchmark vs PyTorch, MLX, TF, tinygrad
+./scripts/bench_compare.sh                     # wall-clock benchmark vs PyTorch, MLX, TF, tinygrad, JAX
 ```
 
 ---
@@ -184,24 +184,24 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 ### Peregrine vs ML Frameworks (CPU, wall-clock, all times in microseconds)
 
-| Operation | Peregrine (us) | PyTorch (us) | MLX (us) | TensorFlow (us) | tinygrad (us) |
-|-----------|---------------:|-------------:|---------:|----------------:|--------------:|
-| matmul 128x128 | **6.0** | 5.7 | 20.9 | 93.8 | 459.8 |
-| matmul 512x512 | **162.3** | 165.2 | 173.7 | 675.9 | 434.1 |
-| softmax 8x128 | **3.9** | 39.7 | 17.0 | 10.2 | 699.7 |
-| MLP fwd 64x784 | **28.5** | 28.4 | 52.8 | 250.4 | 1830.8 |
-| train step 64 | **1030.5** | 1462.1 | 782.4 | 8414.2 | 24801.1 |
+| Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
+|-----------|----------:|--------:|----:|-----------:|---------:|----:|
+| matmul 128x128 | **5.8** | 6.0 | 23.6 | 79.6 | 438.6 | 82.8 |
+| matmul 512x512 | **159.1** | 179.6 | 180.6 | 637.7 | 434.9 | 710.6 |
+| relu 100k | **41.0** | 41.2 | 31.2 | 35.7 | 348.8 | 114.7 |
+| softmax 8x128 | **3.9** | 39.0 | 19.1 | 10.5 | 658.0 | 34.3 |
+| train step 64 | **1135.7** | 1378.0 | 835.5 | 8639.8 | 25573.0 | 6718.2 |
 
-Geometric mean ratio (lower = Peregrine faster): PyTorch 1.12x, MLX 1.16x, TensorFlow 0.66x, tinygrad 0.14x.
+Geometric mean ratio (lower = Peregrine faster): PyTorch 1.01x, MLX 0.97x, TensorFlow 0.61x, tinygrad 0.12x, JAX 0.49x.
 
 | Optimization | Impact |
 |-------------|--------|
+| CPU buffer pool | Thread-local size-bucketed pool — eliminates malloc on elementwise ops |
+| SIMD auto-vectorization | `target-cpu=apple-m1` enables full NEON/ASIMD instruction set |
+| Rayon threshold tuning | Dual thresholds (500K cheap / 100K expensive) — avoids spawn overhead |
+| Adam/SGD borrow fix | Borrow gradients in-place instead of cloning entire Vec |
 | Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
-| Rayon parallelism | Parallel add/mul/relu/sigmoid/sum and their backward passes |
 | Metal GPU backend | 3-5x speedup on element-wise ops at 1M elements |
-| Clone elimination | `std::mem::replace` for op ownership, direct `RefCell` borrows |
-| Xavier init | `std = sqrt(1/fan_in)` — prevents NaN loss in deep networks |
-| Multi-scale pooling | 3,072 encoder tokens instead of 56,784 — attention fits in memory |
 
 ---
 
@@ -210,6 +210,7 @@ Geometric mean ratio (lower = Peregrine faster): PyTorch 1.12x, MLX 1.16x, Tenso
 ```
 src/
   lib.rs          public API surface
+  cpu_pool.rs     thread-local buffer pool for allocation reuse
   tensor.rs       tensor, autograd engine, ops, broadcasting (~2,400 lines)
   nn.rs           Linear, Embedding, attention, transformer, loss functions
   optim.rs        SGD, Adam, AdamW, LR schedulers, gradient clipping
@@ -225,6 +226,7 @@ scripts/
   bench_mlx.py        MLX wall-clock benchmark
   bench_tensorflow.py TensorFlow wall-clock benchmark
   bench_tinygrad.py   tinygrad wall-clock benchmark
+  bench_jax.py        JAX wall-clock benchmark
   compare_bench.py    reads JSONs, renders markdown comparison table
 examples/
   mnist/          MNIST digit classifier (97.5% test accuracy)
@@ -244,7 +246,6 @@ tests/
 
 This is a learning project, not a production framework.
 
-- Element-wise ops ~2x slower than PyTorch/MLX (allocation overhead — buffer pool planned)
 - Greedy Hungarian matching (not full O(n³) algorithm)
 - Attention forward pass breaks autograd graph (output projection still trains)
 - Metal GPU backend is dispatch-only (no autograd integration yet)

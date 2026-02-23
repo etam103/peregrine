@@ -4,7 +4,13 @@ use std::rc::Rc;
 
 use rayon::prelude::*;
 
-const PAR_THRESHOLD: usize = 10_000;
+use crate::cpu_pool::{pool_get, pool_recycle};
+
+/// Rayon threshold for cheap ops (add, mul, sub, div, relu, neg, abs, scale, add_bias).
+/// At sizes below this, single-threaded SIMD + warm cache is faster than Rayon spawn overhead.
+const PAR_THRESHOLD_CHEAP: usize = 500_000;
+/// Rayon threshold for expensive ops (exp, log, sqrt, sigmoid, gelu, tanh, sin, cos, pow).
+const PAR_THRESHOLD_EXPENSIVE: usize = 100_000;
 
 // --- Apple Accelerate BLAS FFI ---
 
@@ -350,6 +356,22 @@ pub(crate) struct TensorInner {
     pub(crate) requires_grad: bool,
 }
 
+impl Drop for TensorInner {
+    fn drop(&mut self) {
+        // Recycle data and grad buffers back to the pool.
+        // Safe because Drop only fires when the last Rc ref is gone.
+        let data = std::mem::take(&mut self.data);
+        if data.capacity() > 0 {
+            pool_recycle(data);
+        }
+        if let Some(grad) = self.grad.take() {
+            if grad.capacity() > 0 {
+                pool_recycle(grad);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Tensor(pub(crate) Rc<RefCell<TensorInner>>);
 
@@ -474,12 +496,15 @@ impl Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
         if a.shape == b.shape {
-            let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
-                a.data.par_iter().zip(&b.data).map(|(x, y)| x + y).collect()
+            let len = a.data.len();
+            if len >= PAR_THRESHOLD_CHEAP {
+                let data: Vec<f32> = a.data.par_iter().zip(&b.data).map(|(x, y)| x + y).collect();
+                Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
             } else {
-                a.data.iter().zip(&b.data).map(|(x, y)| x + y).collect()
-            };
-            Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
+                let mut data = pool_get(len);
+                for i in 0..len { data[i] = a.data[i] + b.data[i]; }
+                Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
+            }
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x + y);
             Tensor::from_op(data, out_shape, Op::Add(self.clone(), other.clone()))
@@ -490,12 +515,15 @@ impl Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
         if a.shape == b.shape {
-            let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
-                a.data.par_iter().zip(&b.data).map(|(x, y)| x * y).collect()
+            let len = a.data.len();
+            if len >= PAR_THRESHOLD_CHEAP {
+                let data: Vec<f32> = a.data.par_iter().zip(&b.data).map(|(x, y)| x * y).collect();
+                Tensor::from_op(data, a.shape.clone(), Op::Mul(self.clone(), other.clone()))
             } else {
-                a.data.iter().zip(&b.data).map(|(x, y)| x * y).collect()
-            };
-            Tensor::from_op(data, a.shape.clone(), Op::Mul(self.clone(), other.clone()))
+                let mut data = pool_get(len);
+                for i in 0..len { data[i] = a.data[i] * b.data[i]; }
+                Tensor::from_op(data, a.shape.clone(), Op::Mul(self.clone(), other.clone()))
+            }
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x * y);
             Tensor::from_op(data, out_shape, Op::Mul(self.clone(), other.clone()))
@@ -533,27 +561,33 @@ impl Tensor {
 
     pub fn relu(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x.max(0.0)).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.max(0.0)).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Relu(self.clone()))
         } else {
-            inner.data.iter().map(|&x| x.max(0.0)).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Relu(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].max(0.0); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Relu(self.clone()))
+        }
     }
 
     pub fn sigmoid(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Sigmoid(self.clone()))
         } else {
-            inner.data.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Sigmoid(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = 1.0 / (1.0 + (-inner.data[i]).exp()); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Sigmoid(self.clone()))
+        }
     }
 
     pub fn sum(&self) -> Tensor {
         let inner = self.0.borrow();
-        let s: f32 = if inner.data.len() >= PAR_THRESHOLD {
+        let s: f32 = if inner.data.len() >= PAR_THRESHOLD_CHEAP {
             inner.data.par_iter().sum()
         } else {
             inner.data.iter().sum()
@@ -563,12 +597,15 @@ impl Tensor {
 
     pub fn scale(&self, s: f32) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x * s).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x * s).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Scale(self.clone(), s))
         } else {
-            inner.data.iter().map(|&x| x * s).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Scale(self.clone(), s))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i] * s; }
+            Tensor::from_op(data, inner.shape.clone(), Op::Scale(self.clone(), s))
+        }
     }
 
     /// Broadcast add: self is [batch, features], bias is [1, features]
@@ -580,21 +617,20 @@ impl Tensor {
         assert_eq!(b.shape[0], 1);
         assert_eq!(a.shape[1], b.shape[1]);
         let cols = a.shape[1];
-        let a_slice: &[f32] = &a.data;
-        let b_slice: &[f32] = &b.data;
-        let data: Vec<f32> = if a_slice.len() >= PAR_THRESHOLD {
-            (0..a_slice.len())
+        let len = a.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let a_slice: &[f32] = &a.data;
+            let b_slice: &[f32] = &b.data;
+            let data: Vec<f32> = (0..len)
                 .into_par_iter()
                 .map(|i| a_slice[i] + b_slice[i % cols])
-                .collect()
+                .collect();
+            Tensor::from_op(data, a.shape.clone(), Op::AddBias(self.clone(), bias.clone()))
         } else {
-            a_slice
-                .iter()
-                .enumerate()
-                .map(|(i, &x)| x + b_slice[i % cols])
-                .collect()
-        };
-        Tensor::from_op(data, a.shape.clone(), Op::AddBias(self.clone(), bias.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = a.data[i] + b.data[i % cols]; }
+            Tensor::from_op(data, a.shape.clone(), Op::AddBias(self.clone(), bias.clone()))
+        }
     }
 
     /// 2D convolution with same-padding: self=[N,Ci,H,W], kernel=[Co,Ci,kH,kW], bias=[Co].
@@ -696,7 +732,7 @@ impl Tensor {
         let in_data = &inp.data;
         let in_plane = h * w;
 
-        if out_size >= PAR_THRESHOLD {
+        if out_size >= PAR_THRESHOLD_CHEAP {
             data.par_chunks_mut(plane_out)
                 .zip(max_indices.par_chunks_mut(plane_out))
                 .enumerate()
@@ -1123,31 +1159,38 @@ impl Tensor {
 
     pub fn gelu(&self) -> Tensor {
         let inner = self.0.borrow();
+        let len = inner.data.len();
         let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| {
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| {
                 let inner_val = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
                 0.5 * x * (1.0 + inner_val.tanh())
-            }).collect()
+            }).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Gelu(self.clone()))
         } else {
-            inner.data.iter().map(|&x| {
+            let mut data = pool_get(len);
+            for i in 0..len {
+                let x = inner.data[i];
                 let inner_val = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-                0.5 * x * (1.0 + inner_val.tanh())
-            }).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Gelu(self.clone()))
+                data[i] = 0.5 * x * (1.0 + inner_val.tanh());
+            }
+            Tensor::from_op(data, inner.shape.clone(), Op::Gelu(self.clone()))
+        }
     }
 
     pub fn sub(&self, other: &Tensor) -> Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
         if a.shape == b.shape {
-            let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
-                a.data.par_iter().zip(&b.data).map(|(x, y)| x - y).collect()
+            let len = a.data.len();
+            if len >= PAR_THRESHOLD_CHEAP {
+                let data: Vec<f32> = a.data.par_iter().zip(&b.data).map(|(x, y)| x - y).collect();
+                Tensor::from_op(data, a.shape.clone(), Op::Sub(self.clone(), other.clone()))
             } else {
-                a.data.iter().zip(&b.data).map(|(x, y)| x - y).collect()
-            };
-            Tensor::from_op(data, a.shape.clone(), Op::Sub(self.clone(), other.clone()))
+                let mut data = pool_get(len);
+                for i in 0..len { data[i] = a.data[i] - b.data[i]; }
+                Tensor::from_op(data, a.shape.clone(), Op::Sub(self.clone(), other.clone()))
+            }
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x - y);
             Tensor::from_op(data, out_shape, Op::Sub(self.clone(), other.clone()))
@@ -1158,12 +1201,15 @@ impl Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
         if a.shape == b.shape {
-            let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
-                a.data.par_iter().zip(&b.data).map(|(x, y)| x / y).collect()
+            let len = a.data.len();
+            if len >= PAR_THRESHOLD_CHEAP {
+                let data: Vec<f32> = a.data.par_iter().zip(&b.data).map(|(x, y)| x / y).collect();
+                Tensor::from_op(data, a.shape.clone(), Op::Div(self.clone(), other.clone()))
             } else {
-                a.data.iter().zip(&b.data).map(|(x, y)| x / y).collect()
-            };
-            Tensor::from_op(data, a.shape.clone(), Op::Div(self.clone(), other.clone()))
+                let mut data = pool_get(len);
+                for i in 0..len { data[i] = a.data[i] / b.data[i]; }
+                Tensor::from_op(data, a.shape.clone(), Op::Div(self.clone(), other.clone()))
+            }
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x / y);
             Tensor::from_op(data, out_shape, Op::Div(self.clone(), other.clone()))
@@ -1172,100 +1218,127 @@ impl Tensor {
 
     pub fn neg(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| -x).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| -x).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Neg(self.clone()))
         } else {
-            inner.data.iter().map(|&x| -x).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Neg(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = -inner.data[i]; }
+            Tensor::from_op(data, inner.shape.clone(), Op::Neg(self.clone()))
+        }
     }
 
     pub fn exp(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x.exp()).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.exp()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         } else {
-            inner.data.iter().map(|&x| x.exp()).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].exp(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
+        }
     }
 
     pub fn log(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x.ln()).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.ln()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Log(self.clone()))
         } else {
-            inner.data.iter().map(|&x| x.ln()).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Log(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].ln(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Log(self.clone()))
+        }
     }
 
     pub fn sqrt(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x.sqrt()).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.sqrt()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Sqrt(self.clone()))
         } else {
-            inner.data.iter().map(|&x| x.sqrt()).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Sqrt(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].sqrt(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Sqrt(self.clone()))
+        }
     }
 
     pub fn abs(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x.abs()).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.abs()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Abs(self.clone()))
         } else {
-            inner.data.iter().map(|&x| x.abs()).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Abs(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].abs(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Abs(self.clone()))
+        }
     }
 
     /// Raise each element to a scalar power: x^p
     pub fn pow(&self, p: f32) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x.powf(p)).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.powf(p)).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Pow(self.clone(), p))
         } else {
-            inner.data.iter().map(|&x| x.powf(p)).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Pow(self.clone(), p))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].powf(p); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Pow(self.clone(), p))
+        }
     }
 
     pub fn sin(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x.sin()).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.sin()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Sin(self.clone()))
         } else {
-            inner.data.iter().map(|&x| x.sin()).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Sin(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].sin(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Sin(self.clone()))
+        }
     }
 
     pub fn cos(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x.cos()).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.cos()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Cos(self.clone()))
         } else {
-            inner.data.iter().map(|&x| x.cos()).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Cos(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].cos(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Cos(self.clone()))
+        }
     }
 
     pub fn tanh(&self) -> Tensor {
         let inner = self.0.borrow();
-        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
-            inner.data.par_iter().map(|&x| x.tanh()).collect()
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.tanh()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Tanh(self.clone()))
         } else {
-            inner.data.iter().map(|&x| x.tanh()).collect()
-        };
-        Tensor::from_op(data, inner.shape.clone(), Op::Tanh(self.clone()))
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].tanh(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Tanh(self.clone()))
+        }
     }
 
     /// Scalar mean of all elements (differentiable).
     pub fn mean(&self) -> Tensor {
         let inner = self.0.borrow();
         let n = inner.data.len();
-        let s: f32 = if n >= PAR_THRESHOLD {
+        let s: f32 = if n >= PAR_THRESHOLD_CHEAP {
             inner.data.par_iter().sum()
         } else {
             inner.data.iter().sum()
@@ -1533,13 +1606,18 @@ impl Tensor {
                 let a_inner = a.0.borrow();
                 let b_inner = b.0.borrow();
                 if a_inner.shape == b_inner.shape {
-                    let (grad_a, grad_b) = if grad.len() >= PAR_THRESHOLD {
+                    let len = grad.len();
+                    let (grad_a, grad_b) = if len >= PAR_THRESHOLD_CHEAP {
                         let ga: Vec<f32> = grad.par_iter().zip(b_inner.data.par_iter()).map(|(g, bv)| g * bv).collect();
                         let gb: Vec<f32> = grad.par_iter().zip(a_inner.data.par_iter()).map(|(g, av)| g * av).collect();
                         (ga, gb)
                     } else {
-                        let ga: Vec<f32> = grad.iter().zip(&b_inner.data).map(|(g, bv)| g * bv).collect();
-                        let gb: Vec<f32> = grad.iter().zip(&a_inner.data).map(|(g, av)| g * av).collect();
+                        let mut ga = pool_get(len);
+                        let mut gb = pool_get(len);
+                        for i in 0..len {
+                            ga[i] = grad[i] * b_inner.data[i];
+                            gb[i] = grad[i] * a_inner.data[i];
+                        }
                         (ga, gb)
                     };
                     drop(a_inner);
@@ -1607,16 +1685,18 @@ impl Tensor {
             }
             Op::Relu(ref input) => {
                 let in_inner = input.0.borrow();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
                     grad.par_iter()
                         .zip(in_inner.data.par_iter())
                         .map(|(g, &x)| if x > 0.0 { *g } else { 0.0 })
                         .collect()
                 } else {
-                    grad.iter()
-                        .zip(&in_inner.data)
-                        .map(|(g, &x)| if x > 0.0 { *g } else { 0.0 })
-                        .collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        gi[i] = if in_inner.data[i] > 0.0 { grad[i] } else { 0.0 };
+                    }
+                    gi
                 };
                 drop(in_inner);
                 accumulate_grad(input, &grad_input);
@@ -1624,16 +1704,16 @@ impl Tensor {
             Op::Sigmoid(ref input) => {
                 let self_inner = self.0.borrow();
                 let out_data = &self_inner.data;
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
                     grad.par_iter()
                         .zip(out_data.par_iter())
                         .map(|(g, &s)| g * s * (1.0 - s))
                         .collect()
                 } else {
-                    grad.iter()
-                        .zip(out_data)
-                        .map(|(g, &s)| g * s * (1.0 - s))
-                        .collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] * out_data[i] * (1.0 - out_data[i]); }
+                    gi
                 };
                 drop(self_inner);
                 accumulate_grad(input, &grad_input);
@@ -1644,10 +1724,13 @@ impl Tensor {
                 accumulate_grad(input, &grad_input);
             }
             Op::Scale(ref input, s) => {
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
                     grad.par_iter().map(|g| g * s).collect()
                 } else {
-                    grad.iter().map(|g| g * s).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] * s; }
+                    gi
                 };
                 accumulate_grad(input, &grad_input);
             }
@@ -1914,7 +1997,7 @@ impl Tensor {
 
                 let mut grad_input = vec![0.0f32; in_size];
 
-                if in_size >= PAR_THRESHOLD {
+                if in_size >= PAR_THRESHOLD_CHEAP {
                     grad_input.par_chunks_mut(in_plane)
                         .enumerate()
                         .for_each(|(bc, gi_chunk)| {
@@ -1945,16 +2028,19 @@ impl Tensor {
             Op::BceLoss(ref logits, ref targets) => {
                 let logit_inner = logits.0.borrow();
                 let len = logit_inner.data.len() as f32;
-                let grad_logits: Vec<f32> = if logit_inner.data.len() >= PAR_THRESHOLD {
+                let n = logit_inner.data.len();
+                let grad_logits = if n >= PAR_THRESHOLD_EXPENSIVE {
                     logit_inner.data.par_iter().zip(targets.par_iter()).map(|(&x, &t)| {
                         let sig = 1.0 / (1.0 + (-x).exp());
                         grad[0] * (sig - t) / len
                     }).collect()
                 } else {
-                    logit_inner.data.iter().zip(targets).map(|(&x, &t)| {
-                        let sig = 1.0 / (1.0 + (-x).exp());
-                        grad[0] * (sig - t) / len
-                    }).collect()
+                    let mut gi = pool_get(n);
+                    for i in 0..n {
+                        let sig = 1.0 / (1.0 + (-logit_inner.data[i]).exp());
+                        gi[i] = grad[0] * (sig - targets[i]) / len;
+                    }
+                    gi
                 };
                 drop(logit_inner);
                 accumulate_grad(logits, &grad_logits);
@@ -2096,10 +2182,13 @@ impl Tensor {
             Op::Sub(ref a, ref b) => {
                 let a_shape = a.shape();
                 let b_shape = b.shape();
-                let neg_grad: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let neg_grad = if len >= PAR_THRESHOLD_CHEAP {
                     grad.par_iter().map(|g| -g).collect()
                 } else {
-                    grad.iter().map(|g| -g).collect()
+                    let mut ng = pool_get(len);
+                    for i in 0..len { ng[i] = -grad[i]; }
+                    ng
                 };
                 if a_shape == b_shape {
                     accumulate_grad(a, &grad);
@@ -2114,17 +2203,20 @@ impl Tensor {
                 let a_inner = a.0.borrow();
                 let b_inner = b.0.borrow();
                 if a_inner.shape == b_inner.shape {
-                    let (grad_a, grad_b) = if grad.len() >= PAR_THRESHOLD {
+                    let len = grad.len();
+                    let (grad_a, grad_b) = if len >= PAR_THRESHOLD_CHEAP {
                         let ga: Vec<f32> = grad.par_iter().zip(b_inner.data.par_iter())
                             .map(|(g, bv)| g / bv).collect();
                         let gb: Vec<f32> = grad.par_iter().zip(a_inner.data.par_iter().zip(b_inner.data.par_iter()))
                             .map(|(g, (av, bv))| -g * av / (bv * bv)).collect();
                         (ga, gb)
                     } else {
-                        let ga: Vec<f32> = grad.iter().zip(&b_inner.data)
-                            .map(|(g, bv)| g / bv).collect();
-                        let gb: Vec<f32> = grad.iter().zip(a_inner.data.iter().zip(&b_inner.data))
-                            .map(|(g, (av, bv))| -g * av / (bv * bv)).collect();
+                        let mut ga = pool_get(len);
+                        let mut gb = pool_get(len);
+                        for i in 0..len {
+                            ga[i] = grad[i] / b_inner.data[i];
+                            gb[i] = -grad[i] * a_inner.data[i] / (b_inner.data[i] * b_inner.data[i]);
+                        }
                         (ga, gb)
                     };
                     drop(a_inner);
@@ -2147,105 +2239,129 @@ impl Tensor {
                 }
             }
             Op::Neg(ref input) => {
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
                     grad.par_iter().map(|g| -g).collect()
                 } else {
-                    grad.iter().map(|g| -g).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = -grad[i]; }
+                    gi
                 };
                 accumulate_grad(input, &grad_input);
             }
             Op::Exp(ref input) => {
                 let self_inner = self.0.borrow();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
                     grad.par_iter().zip(self_inner.data.par_iter())
                         .map(|(g, &y)| g * y).collect()
                 } else {
-                    grad.iter().zip(&self_inner.data)
-                        .map(|(g, &y)| g * y).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] * self_inner.data[i]; }
+                    gi
                 };
                 drop(self_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Log(ref input) => {
                 let in_inner = input.0.borrow();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
                     grad.par_iter().zip(in_inner.data.par_iter())
                         .map(|(g, &x)| g / x).collect()
                 } else {
-                    grad.iter().zip(&in_inner.data)
-                        .map(|(g, &x)| g / x).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] / in_inner.data[i]; }
+                    gi
                 };
                 drop(in_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Sqrt(ref input) => {
                 let self_inner = self.0.borrow();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
                     grad.par_iter().zip(self_inner.data.par_iter())
                         .map(|(g, &y)| g / (2.0 * y)).collect()
                 } else {
-                    grad.iter().zip(&self_inner.data)
-                        .map(|(g, &y)| g / (2.0 * y)).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] / (2.0 * self_inner.data[i]); }
+                    gi
                 };
                 drop(self_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Abs(ref input) => {
                 let in_inner = input.0.borrow();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
                     grad.par_iter().zip(in_inner.data.par_iter())
                         .map(|(g, &x)| if x >= 0.0 { *g } else { -g }).collect()
                 } else {
-                    grad.iter().zip(&in_inner.data)
-                        .map(|(g, &x)| if x >= 0.0 { *g } else { -g }).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        gi[i] = if in_inner.data[i] >= 0.0 { grad[i] } else { -grad[i] };
+                    }
+                    gi
                 };
                 drop(in_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Pow(ref input, p) => {
                 let in_inner = input.0.borrow();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
                     grad.par_iter().zip(in_inner.data.par_iter())
                         .map(|(g, &x)| g * p * x.powf(p - 1.0)).collect()
                 } else {
-                    grad.iter().zip(&in_inner.data)
-                        .map(|(g, &x)| g * p * x.powf(p - 1.0)).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] * p * in_inner.data[i].powf(p - 1.0); }
+                    gi
                 };
                 drop(in_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Sin(ref input) => {
                 let in_inner = input.0.borrow();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
                     grad.par_iter().zip(in_inner.data.par_iter())
                         .map(|(g, &x)| g * x.cos()).collect()
                 } else {
-                    grad.iter().zip(&in_inner.data)
-                        .map(|(g, &x)| g * x.cos()).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] * in_inner.data[i].cos(); }
+                    gi
                 };
                 drop(in_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Cos(ref input) => {
                 let in_inner = input.0.borrow();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
                     grad.par_iter().zip(in_inner.data.par_iter())
                         .map(|(g, &x)| -g * x.sin()).collect()
                 } else {
-                    grad.iter().zip(&in_inner.data)
-                        .map(|(g, &x)| -g * x.sin()).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = -grad[i] * in_inner.data[i].sin(); }
+                    gi
                 };
                 drop(in_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Tanh(ref input) => {
                 let self_inner = self.0.borrow();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
                     grad.par_iter().zip(self_inner.data.par_iter())
                         .map(|(g, &y)| g * (1.0 - y * y)).collect()
                 } else {
-                    grad.iter().zip(&self_inner.data)
-                        .map(|(g, &y)| g * (1.0 - y * y)).collect()
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let y = self_inner.data[i];
+                        gi[i] = grad[i] * (1.0 - y * y);
+                    }
+                    gi
                 };
                 drop(self_inner);
                 accumulate_grad(input, &grad_input);
@@ -2260,8 +2376,9 @@ impl Tensor {
             }
             Op::Gelu(ref input) => {
                 let in_inner = input.0.borrow();
+                let len = grad.len();
                 let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
                     grad.par_iter().zip(in_inner.data.par_iter()).map(|(&g, &x)| {
                         let x3 = x * x * x;
                         let inner_val = sqrt_2_over_pi * (x + 0.044715 * x3);
@@ -2271,14 +2388,17 @@ impl Tensor {
                         g * (0.5 * (1.0 + tanh_val) + 0.5 * x * sech2 * d_inner)
                     }).collect()
                 } else {
-                    grad.iter().zip(in_inner.data.iter()).map(|(&g, &x)| {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
                         let x3 = x * x * x;
                         let inner_val = sqrt_2_over_pi * (x + 0.044715 * x3);
                         let tanh_val = inner_val.tanh();
                         let sech2 = 1.0 - tanh_val * tanh_val;
                         let d_inner = sqrt_2_over_pi * (1.0 + 3.0 * 0.044715 * x * x);
-                        g * (0.5 * (1.0 + tanh_val) + 0.5 * x * sech2 * d_inner)
-                    }).collect()
+                        gi[i] = grad[i] * (0.5 * (1.0 + tanh_val) + 0.5 * x * sech2 * d_inner);
+                    }
+                    gi
                 };
                 drop(in_inner);
                 accumulate_grad(input, &grad_input);
@@ -2367,7 +2487,9 @@ impl Tensor {
     /// Reset gradient to None and detach from computation graph.
     pub fn zero_grad(&self) {
         let mut inner = self.0.borrow_mut();
-        inner.grad = None;
+        if let Some(grad) = inner.grad.take() {
+            pool_recycle(grad);
+        }
         inner.op = Op::None;
     }
 
@@ -2403,19 +2525,22 @@ fn accumulate_grad(tensor: &Tensor, grad: &[f32]) {
     }
     match inner.grad {
         Some(ref mut existing) => {
-            if existing.len() >= PAR_THRESHOLD {
+            let len = existing.len();
+            if len >= PAR_THRESHOLD_CHEAP {
                 let slice: &mut [f32] = existing.as_mut_slice();
                 slice.par_iter_mut().zip(grad.par_iter()).for_each(|(e, g)| {
                     *e += g;
                 });
             } else {
-                for (e, g) in existing.iter_mut().zip(grad) {
-                    *e += g;
+                for i in 0..len {
+                    existing[i] += grad[i];
                 }
             }
         }
         None => {
-            inner.grad = Some(grad.to_vec());
+            let mut buf = pool_get(grad.len());
+            buf.copy_from_slice(grad);
+            inner.grad = Some(buf);
         }
     }
 }

@@ -7,6 +7,54 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.7.0] - 2026-02-22
+
+### Added — CPU performance optimizations (close gap vs PyTorch & MLX)
+
+**CPU buffer pool** (`src/cpu_pool.rs`)
+- Thread-local, size-bucketed `HashMap<usize, Vec<Vec<f32>>>` with power-of-2 keys
+- `pool_get(len)` / `pool_recycle(buf)` — eliminates malloc on every forward & backward op
+- `Drop` impl on `TensorInner` auto-recycles `data` and `grad` buffers
+- Converted ~20 forward ops and ~15 backward ops from `.collect()` to pool-allocated loops
+
+**SIMD auto-vectorization** (`.cargo/config.toml`)
+- `target-cpu=apple-m1` enables full NEON/ASIMD instruction set
+- Simple loops like `data[i] = a[i] + b[i]` now emit vectorized `fadd v0.4s`
+
+**Rayon threshold tuning**
+- Dual thresholds: `PAR_THRESHOLD_CHEAP = 500_000` (add, mul, relu, etc.), `PAR_THRESHOLD_EXPENSIVE = 100_000` (exp, log, sqrt, etc.)
+- Avoids ~15us Rayon spawn overhead on ops that complete in <10us single-threaded
+
+**Adam/SGD gradient borrow fix** (`src/optim.rs`)
+- Borrow `grad` and `data` fields in-place via split `&mut` instead of cloning entire gradient Vec
+
+**JAX benchmark** (`scripts/bench_jax.py`)
+- Added JAX 0.9.0.1 to the 6-framework comparison suite
+
+### Benchmark Results (CPU, Apple Silicon, all times in microseconds)
+
+Before → After (Peregrine medians):
+
+| Operation | Before (us) | After (us) | Speedup |
+|-----------|------------:|-----------:|--------:|
+| relu 100k | 87.4 | 41.0 | 2.13x |
+| add 100k | 121.3 | 73.2 | 1.66x |
+| mul 100k | 116.8 | 73.8 | 1.58x |
+| mul 500k | 124.5 | 109.3 | 1.14x |
+| add 500k | 159.8 | 118.9 | 1.34x |
+| train step | 1030.5 | 1135.7 | 0.91x |
+
+**Geometric mean (Peregrine / framework):**
+- vs PyTorch: 1.12x → **1.01x** (parity)
+- vs MLX: 1.16x → **0.97x** (Peregrine now faster)
+- vs TensorFlow: 0.66x → **0.61x**
+- vs tinygrad: 0.14x → **0.12x**
+- vs JAX: **0.49x** (Peregrine 2x faster)
+
+**Wins:** MLX 5/14, Peregrine 3/14, PyTorch 3/14, TensorFlow 2/14, JAX 1/14
+
+---
+
 ## [0.6.0] - 2026-02-22
 
 ### Added — Multi-framework wall-clock benchmark suite

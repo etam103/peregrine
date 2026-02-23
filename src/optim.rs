@@ -82,17 +82,19 @@ impl Sgd {
 
     pub fn step(&mut self) {
         for (i, p) in self.params.iter().enumerate() {
-            let grad = match p.grad_data() {
+            let vel = &mut self.velocity[i];
+            let mut inner = p.0.borrow_mut();
+            let inner_ref = &mut *inner;
+            let grad = match &inner_ref.grad {
                 Some(g) => g,
                 None => continue,
             };
-            let vel = &mut self.velocity[i];
-            let mut inner = p.0.borrow_mut();
+            let data = &mut inner_ref.data;
 
-            for j in 0..inner.data.len() {
+            for j in 0..data.len() {
                 let mut g = grad[j];
                 if self.weight_decay != 0.0 {
-                    g += self.weight_decay * inner.data[j];
+                    g += self.weight_decay * data[j];
                 }
                 if self.momentum != 0.0 {
                     vel[j] = self.momentum * vel[j] + g;
@@ -102,9 +104,9 @@ impl Sgd {
                         g = vel[j];
                     }
                 }
-                inner.data[j] -= self.lr * g;
+                data[j] -= self.lr * g;
             }
-            inner.op = crate::tensor::Op::None;
+            inner_ref.op = crate::tensor::Op::None;
         }
     }
 
@@ -176,20 +178,22 @@ impl Adam {
         let bc2 = 1.0 - self.beta2.powi(self.t as i32);
 
         for (i, p) in self.params.iter().enumerate() {
-            let grad = match p.grad_data() {
-                Some(g) => g,
-                None => continue,
-            };
             let m = &mut self.m[i];
             let v = &mut self.v[i];
             let mut inner = p.0.borrow_mut();
+            let inner_ref = &mut *inner;
+            let grad = match &inner_ref.grad {
+                Some(g) => g,
+                None => continue,
+            };
+            let data = &mut inner_ref.data;
 
-            for j in 0..inner.data.len() {
+            for j in 0..data.len() {
                 let mut g = grad[j];
 
                 // L2 regularization (classic Adam)
                 if self.weight_decay != 0.0 && !self.decoupled_wd {
-                    g += self.weight_decay * inner.data[j];
+                    g += self.weight_decay * data[j];
                 }
 
                 // Update biased first & second moment estimates
@@ -202,12 +206,12 @@ impl Adam {
 
                 // Decoupled weight decay (AdamW)
                 if self.decoupled_wd && self.weight_decay != 0.0 {
-                    inner.data[j] -= self.lr * self.weight_decay * inner.data[j];
+                    data[j] -= self.lr * self.weight_decay * data[j];
                 }
 
-                inner.data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
             }
-            inner.op = crate::tensor::Op::None;
+            inner_ref.op = crate::tensor::Op::None;
         }
     }
 
