@@ -277,4 +277,148 @@ kernel void softmax_f32(
         row_out[i] /= total;
     }
 }
+// ---------------------------------------------------------------------------
+// Parallel reduction: max
+// ---------------------------------------------------------------------------
+
+kernel void max_f32(
+    device const float* input       [[buffer(0)]],
+    device float* partial_out       [[buffer(1)]],
+    constant uint& count            [[buffer(2)]],
+    uint tid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    threadgroup float shared[256];
+
+    float val = (tid < count) ? input[tid] : -INFINITY;
+    shared[lid] = val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            shared[lid] = max(shared[lid], shared[lid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) {
+        partial_out[gid] = shared[0];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel reduction: min
+// ---------------------------------------------------------------------------
+
+kernel void min_f32(
+    device const float* input       [[buffer(0)]],
+    device float* partial_out       [[buffer(1)]],
+    constant uint& count            [[buffer(2)]],
+    uint tid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    threadgroup float shared[256];
+
+    float val = (tid < count) ? input[tid] : INFINITY;
+    shared[lid] = val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            shared[lid] = min(shared[lid], shared[lid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) {
+        partial_out[gid] = shared[0];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transpose: out[j, i] = in[i, j] for [rows, cols] matrix
+// ---------------------------------------------------------------------------
+
+struct TransposeParams {
+    uint rows;
+    uint cols;
+};
+
+kernel void transpose_f32(
+    device const float* input   [[buffer(0)]],
+    device float* output        [[buffer(1)]],
+    constant TransposeParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= p.rows || col >= p.cols) return;
+    output[col * p.rows + row] = input[row * p.cols + col];
+}
+
+// ---------------------------------------------------------------------------
+// LayerNorm: y = gamma * (x - mean) / sqrt(var + eps) + beta
+// One threadgroup per instance (row). Fused mean/var/normalize.
+// ---------------------------------------------------------------------------
+
+struct LayerNormParams {
+    uint batch;
+    uint dim;
+    float eps;
+};
+
+kernel void layernorm_f32(
+    device const float* input   [[buffer(0)]],
+    device const float* gamma   [[buffer(1)]],
+    device const float* beta    [[buffer(2)]],
+    device float* output        [[buffer(3)]],
+    constant LayerNormParams& p [[buffer(4)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    uint row = gid;
+    if (row >= p.batch) return;
+
+    device const float* row_in = input + row * p.dim;
+    device float* row_out = output + row * p.dim;
+
+    threadgroup float shared[256];
+
+    // 1. Compute mean
+    float local_sum = 0.0f;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        local_sum += row_in[i];
+    }
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) shared[lid] += shared[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = shared[0] / float(p.dim);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Compute variance
+    float local_var = 0.0f;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        float diff = row_in[i] - mean;
+        local_var += diff * diff;
+    }
+    shared[lid] = local_var;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) shared[lid] += shared[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_std = rsqrt(shared[0] / float(p.dim) + p.eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Normalize with affine transform
+    for (uint i = lid; i < p.dim; i += group_size) {
+        row_out[i] = gamma[i] * (row_in[i] - mean) * inv_std + beta[i];
+    }
+}
 "#;

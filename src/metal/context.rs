@@ -46,7 +46,8 @@ impl GpuContext {
             "relu_f32", "sigmoid_f32", "tanh_f32",
             "sin_f32", "cos_f32", "abs_f32",
             // Other
-            "scale_f32", "matmul_f32", "sum_f32", "softmax_f32",
+            "scale_f32", "matmul_f32", "sum_f32", "max_f32", "min_f32",
+            "softmax_f32", "transpose_f32", "layernorm_f32",
         ];
 
         let mut pipelines = HashMap::new();
@@ -256,6 +257,118 @@ impl GpuContext {
             MTLSize { width: threads_per_row, height: 1, depth: 1 },
         );
 
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+
+    /// Dispatch a reduction op (sum/max/min). Returns a single f32 result.
+    pub fn dispatch_reduce(&self, kernel: &str, input: &GpuBuffer<f32>) -> f32 {
+        let n = input.len();
+        let pipeline = &self.pipelines[kernel];
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let group_size = max_threads.min(256).min(n.next_power_of_two());
+        let num_groups = (n + group_size - 1) / group_size;
+
+        let partial: GpuBuffer<f32> = GpuBuffer::new(&self.device, num_groups);
+        let count = n as u32;
+
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(partial.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&count as *const _ as *mut _).unwrap(),
+                4, 2,
+            );
+        }
+        let grid = MTLSize { width: num_groups * group_size, height: 1, depth: 1 };
+        let tg = MTLSize { width: group_size, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+
+        // CPU-side final reduction of partial sums
+        let partials = partial.read();
+        match kernel {
+            "sum_f32" => partials.iter().sum(),
+            "max_f32" => partials.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+            "min_f32" => partials.iter().cloned().fold(f32::INFINITY, f32::min),
+            _ => partials.iter().sum(),
+        }
+    }
+
+    /// Dispatch transpose: out[j,i] = input[i,j] for [rows, cols] matrix.
+    pub fn dispatch_transpose(
+        &self,
+        input: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        rows: u32, cols: u32,
+    ) {
+        #[repr(C)]
+        struct TransposeParams { rows: u32, cols: u32 }
+        let params = TransposeParams { rows, cols };
+
+        let pipeline = &self.pipelines["transpose_f32"];
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<TransposeParams>(), 2,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let side = (max_threads as f64).sqrt() as usize;
+        let grid = MTLSize { width: cols as usize, height: rows as usize, depth: 1 };
+        let tg = MTLSize { width: side.min(cols as usize), height: side.min(rows as usize), depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        enc.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+    }
+
+    /// Dispatch layernorm: y = gamma * (x - mean) / sqrt(var + eps) + beta.
+    /// Input shape: [batch, dim].
+    pub fn dispatch_layernorm(
+        &self,
+        input: &GpuBuffer<f32>,
+        gamma: &GpuBuffer<f32>,
+        beta: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        batch: u32, dim: u32, eps: f32,
+    ) {
+        #[repr(C)]
+        struct LayerNormParams { batch: u32, dim: u32, eps: f32 }
+        let params = LayerNormParams { batch, dim, eps };
+
+        let pipeline = &self.pipelines["layernorm_f32"];
+        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(gamma.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(beta.raw()), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 3);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<LayerNormParams>(), 4,
+            );
+        }
+
+        let threads_per_row = (dim as usize).next_power_of_two().min(256);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: batch as usize, height: 1, depth: 1 },
+            MTLSize { width: threads_per_row, height: 1, depth: 1 },
+        );
         enc.endEncoding();
         cmd.commit();
         cmd.waitUntilCompleted();
