@@ -4,7 +4,7 @@
 
 **A from-scratch deep learning library in Rust. No PyTorch, no ONNX, no dependencies you can't read.**
 
-Tensors, reverse-mode autograd, transformer layers, and a working object detector — built from `f32` arrays and first principles.
+Tensors, reverse-mode autograd, neural network layers, optimizers, and working models — built from `f32` arrays and first principles.
 
 [![GitHub Repo stars](https://img.shields.io/github/stars/etam103/peregrine)](https://github.com/etam103/peregrine/stargazers)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
@@ -16,23 +16,26 @@ Tensors, reverse-mode autograd, transformer layers, and a working object detecto
 ---
 
 ```
-cargo build --release     # build the library
-cargo test                # 13 tests, all pass
-cargo run --example rt_detr --release   # train RT-DETR on COCO images
+cargo build --release                          # build the library
+cargo test                                     # 63 tests, all pass
+cargo run --example mnist --release            # train MNIST digit classifier (97.5% accuracy)
+cargo run --example rt_detr --release          # train RT-DETR on COCO images
 ```
 
 ---
 
 ## What's inside
 
-| Layer | What it does |
-|-------|-------------|
-| **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, Apple Accelerate BLAS, rayon parallelism |
-| **`peregrine::nn`** | Multi-head attention, transformer encoder/decoder layers |
+| Module | What it does |
+|--------|-------------|
+| **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, NumPy-style broadcasting, Apple Accelerate BLAS, rayon parallelism |
+| **`peregrine::nn`** | Linear, Embedding, MultiHeadAttention, Transformer encoder/decoder, CrossEntropyLoss, MSELoss |
+| **`peregrine::optim`** | SGD (with momentum, Nesterov, weight decay), Adam, AdamW, LR schedulers (StepLR, CosineAnnealing, Warmup), gradient clipping |
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
+| **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 
-The entire library is ~2,200 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
+The entire library is ~3,900 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
 ---
 
@@ -42,15 +45,60 @@ Every op records itself in the output tensor's `Op` field, building a DAG. Calli
 
 ```rust
 use peregrine::tensor::Tensor;
+use peregrine::optim::Adam;
 
 let x = Tensor::randn(&[2, 3], true);   // requires_grad = true
 let w = Tensor::randn(&[3, 1], true);
 let y = x.matmul(&w).sum();             // forward: builds the graph
 y.backward();                            // backward: computes all gradients
-x.sgd_step(0.01);                       // update weights
+
+let mut opt = Adam::new(vec![w.clone()], 1e-3);
+opt.step();                              // update weights
+opt.zero_grad();
 ```
 
-The backward pass supports: `matmul`, `conv2d`, `add`, `mul`, `relu`, `sigmoid`, `gelu`, `softmax`, `sum`, `scale`, `batch_norm`, `layer_norm`, `transpose`, `reshape`, `concat`, `select`, `bce_with_logits`.
+### Supported ops with autograd
+
+**Arithmetic:** add, sub, mul, div, neg, scale
+**Math:** exp, log, sqrt, abs, pow, sin, cos, tanh
+**Activations:** relu, sigmoid, gelu
+**Reductions:** sum, mean, softmax, log_softmax
+**Shape:** reshape, transpose, squeeze, unsqueeze, concat, select, flatten
+**Layers:** matmul, conv2d, conv2d+relu+pool (fused), max_pool2d, add_bias, batch_norm, layer_norm
+**Loss:** bce_with_logits, cross_entropy_loss, mse_loss
+
+All ops support broadcasting where applicable.
+
+---
+
+## MNIST example
+
+The MNIST example validates the entire stack — tensor ops, autograd, nn layers, and the Adam optimizer:
+
+```
+$ cargo run --example mnist --release
+Loading MNIST...
+Train: 60000 images, Test: 10000 images
+Model: 109386 parameters
+Epoch 1/10:  loss=0.2867, train_acc=91.4%, test_acc=94.9%
+Epoch 5/10:  loss=0.0432, train_acc=98.7%, test_acc=95.5%
+Epoch 10/10: loss=0.0194, train_acc=99.3%, test_acc=97.5%
+```
+
+Model: MLP (784 → 128 → 64 → 10) with ReLU, trained with CrossEntropyLoss + Adam.
+
+---
+
+## PyTorch numerical parity
+
+23 integration tests cross-validate Peregrine against PyTorch reference data, covering matmul, softmax, log_softmax, layernorm, cross_entropy_loss, 14 element-wise ops, Adam optimizer, and a full 10-step MLP training loop. All pass within 1e-4 to 1e-7 absolute error.
+
+```
+$ cargo test --test pytorch_parity
+running 23 tests ... ok
+```
+
+To regenerate reference data: `.venv/bin/python tests/generate_reference.py`
 
 ---
 
@@ -75,22 +123,7 @@ Parameter                              Shape               Params
 backbone.stem_w                        [64, 3, 1, 1]          192
 backbone.stem_b                        [64]                    64
 backbone.stage2.0.conv1_w              [128, 64, 3, 3]    73,728
-backbone.stage2.0.conv1_b              [128]                  128
-backbone.stage2.0.conv2_w              [128, 128, 3, 3]  147,456
-backbone.stage2.0.conv2_b              [128]                  128
-backbone.stage2.0.skip_w               [128, 64, 1, 1]     8,192
-backbone.stage2.0.skip_b               [128]                  128
 ...
-encoder.0.mha.wq                       [64, 64]             4,096
-encoder.0.mha.bq                       [1, 64]                 64
-...
-object_queries                         [20, 64]             1,280
-decoder.0.self_attn.wq                 [64, 64]             4,096
-...
-cls_w                                  [64, 4]                256
-cls_b                                  [1, 4]                   4
-bbox_w                                 [64, 4]                256
-bbox_b                                 [1, 4]                   4
 ──────────────────────────────────────────────────────────────────
 85 parameters                                          1,190,856
 ```
@@ -102,37 +135,10 @@ Call `training_health` periodically during training to monitor gradient health, 
 ```rust
 use peregrine::debug::training_health;
 
-// Every 50 steps during training:
 let report = training_health(&net.named_params());
-
-// Log to wandb
 let metrics = report.to_metrics();
-// Returns: [("health/grad_norm", 0.423), ("health/has_nan", 0.0),
-//           ("health/zero_grad_params", 0.0), ("health/max_grad_weight_ratio", 0.12)]
-wandb_run.log_metrics(step, &metrics);
-
-// Print warnings to terminal (only when issues are detected)
-if !report.warnings.is_empty() {
-    print!("{}", report.display());
-}
+// Returns: [("health/grad_norm", 0.423), ("health/has_nan", 0.0), ...]
 ```
-
-When issues are detected, `report.display()` prints a diagnostic table:
-
-```
-Training Health  (grad_norm = 14.238710)
-  param                                   w_mean       w_std      g_mean       g_std   g/w ratio
-  backbone.stem_w                       0.001523    0.124838   -0.000842    0.193841    1.5528
-  backbone.stage2.0.conv1_w             0.000012    0.038215    0.000000    0.000000    0.0000 ZERO
-  encoder.0.ffn_w1                      0.000183    0.017421    0.042158    0.087312    5.0119
-  ...
-  Warnings:
-    - backbone.stem_w: grad/weight ratio 1.5528 — possible exploding gradients
-    - backbone.stage2.0.conv1_w: gradient is all zeros — parameter may be stalled
-    - encoder.0.ffn_w1: grad/weight ratio 5.0119 — possible exploding gradients
-```
-
-The RT-DETR example integrates both automatically — model summary prints at startup, and training health runs every 50 steps with metrics logged to wandb.
 
 ---
 
@@ -188,14 +194,20 @@ All computation runs on CPU. On Apple Silicon (M-series), matmul and conv2d are 
 ```
 src/
   lib.rs          public API surface
-  tensor.rs       tensor, autograd engine, ops, SGD (~1,900 lines)
-  nn.rs           multi-head attention, transformer encoder/decoder
+  tensor.rs       tensor, autograd engine, ops, broadcasting (~2,400 lines)
+  nn.rs           Linear, Embedding, attention, transformer, loss functions
+  optim.rs        SGD, Adam, AdamW, LR schedulers, gradient clipping
   debug.rs        model summary + training health diagnostics
 examples/
+  mnist/          MNIST digit classifier (97.5% test accuracy)
   rt_detr/        RT-DETR training on COCO
     main.rs         training loop + wandb visualization
     model.rs        ResNet backbone, RT-DETR net, loss, decode, NMS
     dataset.rs      VOC + COCO dataset loaders
+tests/
+  pytorch_parity.rs   23 numerical parity tests vs PyTorch
+  generate_reference.py  script to regenerate PyTorch reference data
+  fixtures/             binary reference tensors
 ```
 
 ---
@@ -204,8 +216,7 @@ examples/
 
 This is a learning project, not a production framework.
 
-- CPU only — no GPU acceleration yet
-- No Adam optimizer (SGD only)
+- CPU only — no GPU acceleration yet (Metal backend planned)
 - Greedy Hungarian matching (not full O(n³) algorithm)
 - Attention forward pass breaks autograd graph (output projection still trains)
 - No model save/load
