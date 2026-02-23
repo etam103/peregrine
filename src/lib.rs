@@ -1,4 +1,6 @@
 pub mod cpu_pool;
+#[cfg(target_arch = "aarch64")]
+pub mod simd_kernels;
 pub mod tensor;
 pub mod nn;
 pub mod debug;

@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 const MAX_BUFFERS_PER_BUCKET: usize = 8;
+const MIN_POOL_SIZE: usize = 1024;
 
 thread_local! {
     static POOL: RefCell<HashMap<usize, Vec<Vec<f32>>>> = RefCell::new(HashMap::new());
@@ -22,6 +23,11 @@ fn bucket_size(len: usize) -> usize {
 /// The returned Vec has length set to `len` (contents are uninitialized/stale).
 #[inline]
 pub fn pool_get(len: usize) -> Vec<f32> {
+    if len < MIN_POOL_SIZE {
+        let mut buf = Vec::with_capacity(len);
+        unsafe { buf.set_len(len); }
+        return buf;
+    }
     let bucket = bucket_size(len);
     let mut buf = POOL.with(|pool| {
         pool.borrow_mut()
@@ -39,6 +45,9 @@ pub fn pool_get(len: usize) -> Vec<f32> {
 /// Return a buffer to the pool for reuse. Caps at MAX_BUFFERS_PER_BUCKET per bucket.
 #[inline]
 pub fn pool_recycle(mut buf: Vec<f32>) {
+    if buf.capacity() < MIN_POOL_SIZE {
+        return; // drop naturally, pool overhead exceeds malloc savings
+    }
     let bucket = bucket_size(buf.capacity());
     // Only recycle buffers whose capacity matches a bucket (avoid odd sizes)
     if buf.capacity() < bucket {
@@ -69,21 +78,32 @@ mod tests {
     #[test]
     fn test_pool_get_returns_correct_length() {
         pool_clear();
+        // Use size >= MIN_POOL_SIZE to test pool path
+        let buf = pool_get(2000);
+        assert_eq!(buf.len(), 2000);
+        assert!(buf.capacity() >= 2048); // next power of 2
+    }
+
+    #[test]
+    fn test_pool_get_small_bypasses_pool() {
+        pool_clear();
+        // Small allocations bypass the pool
         let buf = pool_get(100);
         assert_eq!(buf.len(), 100);
-        assert!(buf.capacity() >= 128); // next power of 2
+        assert_eq!(buf.capacity(), 100); // exact, no bucketing
     }
 
     #[test]
     fn test_pool_recycle_and_reuse() {
         pool_clear();
-        let buf = pool_get(100);
+        // Use size >= MIN_POOL_SIZE to test pool path
+        let buf = pool_get(2000);
         let cap = buf.capacity();
         let ptr = buf.as_ptr();
         pool_recycle(buf);
 
         // Next get of same bucket should reuse
-        let buf2 = pool_get(100);
+        let buf2 = pool_get(2000);
         assert_eq!(buf2.as_ptr(), ptr);
         assert_eq!(buf2.capacity(), cap);
         pool_clear();

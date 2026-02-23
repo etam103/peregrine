@@ -188,6 +188,16 @@ impl Adam {
             };
             let data = &mut inner_ref.data;
 
+            #[cfg(target_arch = "aarch64")]
+            {
+                crate::simd_kernels::adam_step_f32(
+                    data, grad, m, v,
+                    self.beta1, self.beta2, self.lr, bc1, bc2, self.eps,
+                    self.weight_decay, self.decoupled_wd,
+                );
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
             for j in 0..data.len() {
                 let mut g = grad[j];
 
@@ -211,6 +221,7 @@ impl Adam {
 
                 data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
             }
+
             inner_ref.op = crate::tensor::Op::None;
         }
     }

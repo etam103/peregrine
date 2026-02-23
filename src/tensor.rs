@@ -6,6 +6,9 @@ use rayon::prelude::*;
 
 use crate::cpu_pool::{pool_get, pool_recycle};
 
+#[cfg(target_arch = "aarch64")]
+use crate::simd_kernels;
+
 /// Rayon threshold for cheap ops (add, mul, sub, div, relu, neg, abs, scale, add_bias).
 /// At sizes below this, single-threaded SIMD + warm cache is faster than Rayon spawn overhead.
 const PAR_THRESHOLD_CHEAP: usize = 500_000;
@@ -502,6 +505,9 @@ impl Tensor {
                 Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
             } else {
                 let mut data = pool_get(len);
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_add_f32(&a.data, &b.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..len { data[i] = a.data[i] + b.data[i]; }
                 Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
             }
@@ -521,6 +527,9 @@ impl Tensor {
                 Tensor::from_op(data, a.shape.clone(), Op::Mul(self.clone(), other.clone()))
             } else {
                 let mut data = pool_get(len);
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_mul_f32(&a.data, &b.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..len { data[i] = a.data[i] * b.data[i]; }
                 Tensor::from_op(data, a.shape.clone(), Op::Mul(self.clone(), other.clone()))
             }
@@ -567,6 +576,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Relu(self.clone()))
         } else {
             let mut data = pool_get(len);
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_relu_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..len { data[i] = inner.data[i].max(0.0); }
             Tensor::from_op(data, inner.shape.clone(), Op::Relu(self.clone()))
         }
@@ -580,6 +592,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Sigmoid(self.clone()))
         } else {
             let mut data = pool_get(len);
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_sigmoid_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..len { data[i] = 1.0 / (1.0 + (-inner.data[i]).exp()); }
             Tensor::from_op(data, inner.shape.clone(), Op::Sigmoid(self.clone()))
         }
@@ -603,6 +618,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Scale(self.clone(), s))
         } else {
             let mut data = pool_get(len);
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_scale_f32(&inner.data, s, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..len { data[i] = inner.data[i] * s; }
             Tensor::from_op(data, inner.shape.clone(), Op::Scale(self.clone(), s))
         }
@@ -1169,6 +1187,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Gelu(self.clone()))
         } else {
             let mut data = pool_get(len);
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_gelu_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..len {
                 let x = inner.data[i];
                 let inner_val = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
@@ -1188,6 +1209,9 @@ impl Tensor {
                 Tensor::from_op(data, a.shape.clone(), Op::Sub(self.clone(), other.clone()))
             } else {
                 let mut data = pool_get(len);
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_sub_f32(&a.data, &b.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..len { data[i] = a.data[i] - b.data[i]; }
                 Tensor::from_op(data, a.shape.clone(), Op::Sub(self.clone(), other.clone()))
             }
@@ -1207,6 +1231,9 @@ impl Tensor {
                 Tensor::from_op(data, a.shape.clone(), Op::Div(self.clone(), other.clone()))
             } else {
                 let mut data = pool_get(len);
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_div_f32(&a.data, &b.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..len { data[i] = a.data[i] / b.data[i]; }
                 Tensor::from_op(data, a.shape.clone(), Op::Div(self.clone(), other.clone()))
             }
@@ -1224,6 +1251,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Neg(self.clone()))
         } else {
             let mut data = pool_get(len);
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_neg_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..len { data[i] = -inner.data[i]; }
             Tensor::from_op(data, inner.shape.clone(), Op::Neg(self.clone()))
         }
@@ -1237,6 +1267,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         } else {
             let mut data = pool_get(len);
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_exp_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..len { data[i] = inner.data[i].exp(); }
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         }
@@ -1276,6 +1309,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Abs(self.clone()))
         } else {
             let mut data = pool_get(len);
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_abs_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..len { data[i] = inner.data[i].abs(); }
             Tensor::from_op(data, inner.shape.clone(), Op::Abs(self.clone()))
         }
@@ -1329,6 +1365,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Tanh(self.clone()))
         } else {
             let mut data = pool_get(len);
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_tanh_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
             for i in 0..len { data[i] = inner.data[i].tanh(); }
             Tensor::from_op(data, inner.shape.clone(), Op::Tanh(self.clone()))
         }
@@ -1614,6 +1653,12 @@ impl Tensor {
                     } else {
                         let mut ga = pool_get(len);
                         let mut gb = pool_get(len);
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            simd_kernels::vec_mul_f32(&grad, &b_inner.data, &mut ga);
+                            simd_kernels::vec_mul_f32(&grad, &a_inner.data, &mut gb);
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
                         for i in 0..len {
                             ga[i] = grad[i] * b_inner.data[i];
                             gb[i] = grad[i] * a_inner.data[i];
@@ -1693,6 +1738,9 @@ impl Tensor {
                         .collect()
                 } else {
                     let mut gi = pool_get(len);
+                    #[cfg(target_arch = "aarch64")]
+                    simd_kernels::vec_relu_backward_f32(&in_inner.data, &grad, &mut gi);
+                    #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..len {
                         gi[i] = if in_inner.data[i] > 0.0 { grad[i] } else { 0.0 };
                     }
@@ -1712,6 +1760,9 @@ impl Tensor {
                         .collect()
                 } else {
                     let mut gi = pool_get(len);
+                    #[cfg(target_arch = "aarch64")]
+                    simd_kernels::vec_sigmoid_backward_f32(out_data, &grad, &mut gi);
+                    #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..len { gi[i] = grad[i] * out_data[i] * (1.0 - out_data[i]); }
                     gi
                 };
@@ -1729,6 +1780,9 @@ impl Tensor {
                     grad.par_iter().map(|g| g * s).collect()
                 } else {
                     let mut gi = pool_get(len);
+                    #[cfg(target_arch = "aarch64")]
+                    simd_kernels::vec_scale_f32(&grad, s, &mut gi);
+                    #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..len { gi[i] = grad[i] * s; }
                     gi
                 };
@@ -2187,6 +2241,9 @@ impl Tensor {
                     grad.par_iter().map(|g| -g).collect()
                 } else {
                     let mut ng = pool_get(len);
+                    #[cfg(target_arch = "aarch64")]
+                    simd_kernels::vec_neg_f32(&grad, &mut ng);
+                    #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..len { ng[i] = -grad[i]; }
                     ng
                 };
@@ -2244,6 +2301,9 @@ impl Tensor {
                     grad.par_iter().map(|g| -g).collect()
                 } else {
                     let mut gi = pool_get(len);
+                    #[cfg(target_arch = "aarch64")]
+                    simd_kernels::vec_neg_f32(&grad, &mut gi);
+                    #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..len { gi[i] = -grad[i]; }
                     gi
                 };
@@ -2257,6 +2317,9 @@ impl Tensor {
                         .map(|(g, &y)| g * y).collect()
                 } else {
                     let mut gi = pool_get(len);
+                    #[cfg(target_arch = "aarch64")]
+                    simd_kernels::vec_mul_f32(&grad, &self_inner.data, &mut gi);
+                    #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..len { gi[i] = grad[i] * self_inner.data[i]; }
                     gi
                 };
@@ -2299,6 +2362,9 @@ impl Tensor {
                         .map(|(g, &x)| if x >= 0.0 { *g } else { -g }).collect()
                 } else {
                     let mut gi = pool_get(len);
+                    #[cfg(target_arch = "aarch64")]
+                    simd_kernels::vec_abs_backward_f32(&in_inner.data, &grad, &mut gi);
+                    #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..len {
                         gi[i] = if in_inner.data[i] >= 0.0 { grad[i] } else { -grad[i] };
                     }
@@ -2357,6 +2423,9 @@ impl Tensor {
                         .map(|(g, &y)| g * (1.0 - y * y)).collect()
                 } else {
                     let mut gi = pool_get(len);
+                    #[cfg(target_arch = "aarch64")]
+                    simd_kernels::vec_tanh_backward_f32(&self_inner.data, &grad, &mut gi);
+                    #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..len {
                         let y = self_inner.data[i];
                         gi[i] = grad[i] * (1.0 - y * y);
@@ -2532,6 +2601,9 @@ fn accumulate_grad(tensor: &Tensor, grad: &[f32]) {
                     *e += g;
                 });
             } else {
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_add_inplace_f32(existing, grad);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..len {
                     existing[i] += grad[i];
                 }

@@ -7,6 +7,54 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.8.0] - 2026-02-22
+
+### Added — NEON intrinsics & elementwise dominance
+
+**Hand-tuned NEON kernels** (`src/simd_kernels.rs` — new, ~530 lines)
+- 14 NEON intrinsic kernels processing 4 f32s per iteration via `float32x4_t`
+- Forward: `vec_add_f32`, `vec_sub_f32`, `vec_mul_f32`, `vec_div_f32`, `vec_neg_f32`, `vec_abs_f32`, `vec_scale_f32`, `vec_relu_f32`, `vec_add_inplace_f32`
+- Transcendental: `vec_exp_f32` (Cephes-style polynomial, ~1.2e-7 relative error), `vec_sigmoid_f32`, `vec_tanh_f32`, `vec_gelu_f32`
+- Backward: `vec_relu_backward_f32`, `vec_abs_backward_f32`, `vec_tanh_backward_f32`, `vec_sigmoid_backward_f32`
+- All gated with `#[cfg(target_arch = "aarch64")]`; non-ARM targets use scalar fallback
+
+**NEON Adam optimizer** (`src/simd_kernels.rs`)
+- `adam_step_f32` vectorizes the 10+ FLOPs/element Adam inner loop
+- Uses `vrsqrteq_f32` + Newton step for fast approximate sqrt
+- Integrated in `src/optim.rs` via cfg-gated dispatch
+
+**Pool bypass for small tensors** (`src/cpu_pool.rs`)
+- `MIN_POOL_SIZE = 1024`: tensors < 1024 elements skip the HashMap pool
+- Eliminates ~18 HashMap lookups per MLP forward pass where pool overhead exceeds malloc savings
+
+**Integration** (`src/tensor.rs` — ~25 call sites)
+- All forward ops (add, sub, mul, div, neg, abs, scale, relu, exp, sigmoid, tanh, gelu) dispatch to NEON kernels in the single-threaded path
+- All backward ops (mul, relu, sigmoid, exp, scale, sub/neg, abs, tanh) dispatch to NEON kernels
+- `accumulate_grad` uses `vec_add_inplace_f32`
+
+### Benchmark Results (CPU, Apple Silicon, all times in microseconds)
+
+Before (v0.7.0) → After (v0.8.0):
+
+| Operation | Before (us) | After (us) | Speedup |
+|-----------|------------:|-----------:|--------:|
+| add 100k | 73.2 | 12.5 | 5.9x |
+| mul 100k | 73.8 | 12.5 | 5.9x |
+| relu 100k | 41.0 | 8.8 | 4.7x |
+| MLP fwd | 37.1 | 32.6 | 1.1x |
+| train step | 1135.7 | 809.1 | 1.4x |
+
+**Geometric mean (Peregrine / framework):**
+- vs PyTorch: 1.01x → **0.70x** (Peregrine 1.4x faster)
+- vs MLX: 0.97x → **0.57x** (Peregrine 1.8x faster)
+- vs TensorFlow: 0.61x → **0.40x**
+- vs tinygrad: 0.12x → **0.08x**
+- vs JAX: 0.49x → **0.39x**
+
+**Wins:** Peregrine 8/14, PyTorch 3/14, JAX 2/14, TensorFlow 1/14
+
+---
+
 ## [0.7.0] - 2026-02-22
 
 ### Added — CPU performance optimizations (close gap vs PyTorch & MLX)

@@ -17,7 +17,7 @@ Tensors, reverse-mode autograd, neural network layers, optimizers, and working m
 
 ```
 cargo build --release                          # build the library
-cargo test                                     # 67 tests, all pass
+cargo test                                     # 87 tests, all pass
 cargo run --example mnist --release            # train MNIST digit classifier (97.5% accuracy)
 cargo run --example rt_detr --release          # train RT-DETR on COCO images
 ./scripts/bench_compare.sh                     # wall-clock benchmark vs PyTorch, MLX, TF, tinygrad, JAX
@@ -29,7 +29,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 
 | Module | What it does |
 |--------|-------------|
-| **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, NumPy-style broadcasting, Apple Accelerate BLAS, rayon parallelism |
+| **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, NumPy-style broadcasting, Apple Accelerate BLAS, NEON intrinsics, rayon parallelism |
 | **`peregrine::nn`** | Linear, Embedding, MultiHeadAttention, Transformer encoder/decoder, CrossEntropyLoss, MSELoss |
 | **`peregrine::optim`** | SGD (with momentum, Nesterov, weight decay), Adam, AdamW, LR schedulers (StepLR, CosineAnnealing, Warmup), gradient clipping |
 | **`peregrine::serial`** | Save/load model weights in compact binary format |
@@ -186,20 +186,24 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | **5.8** | 6.0 | 23.6 | 79.6 | 438.6 | 82.8 |
-| matmul 512x512 | **159.1** | 179.6 | 180.6 | 637.7 | 434.9 | 710.6 |
-| relu 100k | **41.0** | 41.2 | 31.2 | 35.7 | 348.8 | 114.7 |
-| softmax 8x128 | **3.9** | 39.0 | 19.1 | 10.5 | 658.0 | 34.3 |
-| train step 64 | **1135.7** | 1378.0 | 835.5 | 8639.8 | 25573.0 | 6718.2 |
+| matmul 128x128 | **6.1** | 7.0 | 52.6 | 54.0 | 436.6 | 62.4 |
+| matmul 512x512 | 168.7 | **145.3** | 190.8 | 701.7 | 445.3 | 523.0 |
+| add 100k | **12.5** | 32.3 | 30.4 | 53.0 | 192.7 | 36.8 |
+| mul 100k | **12.5** | 30.0 | 29.4 | 42.9 | 202.4 | 33.2 |
+| relu 100k | **8.8** | 38.8 | 31.9 | 37.4 | 343.0 | 94.2 |
+| softmax 8x128 | **3.9** | 36.3 | 18.2 | 11.5 | 648.4 | 32.8 |
+| train step 64 | **809.1** | 1298.4 | 824.4 | 9601.5 | 25498.4 | 5368.9 |
 
-Geometric mean ratio (lower = Peregrine faster): PyTorch 1.01x, MLX 0.97x, TensorFlow 0.61x, tinygrad 0.12x, JAX 0.49x.
+Geometric mean ratio (lower = Peregrine faster): **PyTorch 0.70x**, **MLX 0.57x**, TensorFlow 0.40x, tinygrad 0.08x, JAX 0.39x. Peregrine wins 8 of 14 ops.
 
 | Optimization | Impact |
 |-------------|--------|
+| Hand-tuned NEON intrinsics | 14 vectorized kernels — 4-6x speedup on elementwise ops |
+| Cephes-style polynomial exp | Fast exp/sigmoid/tanh/gelu via NEON float32x4_t |
+| NEON Adam optimizer | Vectorized Adam step with fast rsqrt approximation |
 | CPU buffer pool | Thread-local size-bucketed pool — eliminates malloc on elementwise ops |
-| SIMD auto-vectorization | `target-cpu=apple-m1` enables full NEON/ASIMD instruction set |
+| Pool bypass for small tensors | Skip HashMap overhead for tensors < 1024 elements |
 | Rayon threshold tuning | Dual thresholds (500K cheap / 100K expensive) — avoids spawn overhead |
-| Adam/SGD borrow fix | Borrow gradients in-place instead of cloning entire Vec |
 | Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
 | Metal GPU backend | 3-5x speedup on element-wise ops at 1M elements |
 
@@ -211,6 +215,7 @@ Geometric mean ratio (lower = Peregrine faster): PyTorch 1.01x, MLX 0.97x, Tenso
 src/
   lib.rs          public API surface
   cpu_pool.rs     thread-local buffer pool for allocation reuse
+  simd_kernels.rs hand-tuned NEON intrinsics for aarch64 (14 kernels + Adam step)
   tensor.rs       tensor, autograd engine, ops, broadcasting (~2,400 lines)
   nn.rs           Linear, Embedding, attention, transformer, loss functions
   optim.rs        SGD, Adam, AdamW, LR schedulers, gradient clipping
