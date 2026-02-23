@@ -8,7 +8,9 @@
 
 mod context;
 mod buffer;
+mod pool;
 mod shaders;
 
 pub use context::GpuContext;
 pub use buffer::GpuBuffer;
+pub use pool::BufferPool;
