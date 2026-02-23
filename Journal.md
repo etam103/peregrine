@@ -179,10 +179,10 @@ Built a complete benchmarking suite to compare Peregrine against PyTorch 2.10.0,
 
 Methodology: 5 warmup iterations discarded, 50 timed iterations (20 for heavy ops), median reported in microseconds.
 
-### Results
+### Results (all times in microseconds)
 
-| Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | Best |
-|-----------|----------:|--------:|----:|-----------:|---------:|------|
+| Operation | Peregrine (us) | PyTorch (us) | MLX (us) | TensorFlow (us) | tinygrad (us) | Best |
+|-----------|---------------:|-------------:|---------:|----------------:|--------------:|------|
 | matmul 128x128 | 6.0 | 5.7 | 20.9 | 93.8 | 459.8 | PyTorch |
 | matmul 256x256 | 32.2 | 30.7 | 47.6 | 194.0 | 435.8 | PyTorch |
 | matmul 512x512 | **162.3** | 165.2 | 173.7 | 675.9 | 434.1 | Peregrine |
