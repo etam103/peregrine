@@ -182,15 +182,15 @@ Input Image [1, 3, 256, 256]
 
 CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compute shaders (`--features metal`). Wall-clock benchmarks run via `./scripts/bench_compare.sh`.
 
-### Peregrine vs ML Frameworks (CPU, wall-clock)
+### Peregrine vs ML Frameworks (CPU, wall-clock, all times in microseconds)
 
-| Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad |
-|-----------|----------:|--------:|----:|-----------:|---------:|
-| matmul 128x128 | **6.0 us** | 5.7 | 20.9 | 93.8 | 459.8 |
-| matmul 512x512 | **162.3 us** | 165.2 | 173.7 | 675.9 | 434.1 |
-| softmax 8x128 | **3.9 us** | 39.7 | 17.0 | 10.2 | 699.7 |
-| MLP fwd 64x784 | **28.5 us** | 28.4 | 52.8 | 250.4 | 1830.8 |
-| train step 64 | **1030.5 us** | 1462.1 | 782.4 | 8414.2 | 24801.1 |
+| Operation | Peregrine (us) | PyTorch (us) | MLX (us) | TensorFlow (us) | tinygrad (us) |
+|-----------|---------------:|-------------:|---------:|----------------:|--------------:|
+| matmul 128x128 | **6.0** | 5.7 | 20.9 | 93.8 | 459.8 |
+| matmul 512x512 | **162.3** | 165.2 | 173.7 | 675.9 | 434.1 |
+| softmax 8x128 | **3.9** | 39.7 | 17.0 | 10.2 | 699.7 |
+| MLP fwd 64x784 | **28.5** | 28.4 | 52.8 | 250.4 | 1830.8 |
+| train step 64 | **1030.5** | 1462.1 | 782.4 | 8414.2 | 24801.1 |
 
 Geometric mean ratio (lower = Peregrine faster): PyTorch 1.12x, MLX 1.16x, TensorFlow 0.66x, tinygrad 0.14x.
 

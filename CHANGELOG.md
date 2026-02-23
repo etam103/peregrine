@@ -20,14 +20,14 @@ Benchmark numbers included for performance-related changes.
 
 14 operations benchmarked: matmul (128/256/512), add, mul, exp (100K/500K), relu, softmax (128/512), MLP forward, training step.
 
-### Benchmark Results (CPU, Apple Silicon)
+### Benchmark Results (CPU, Apple Silicon, all times in microseconds)
 
-| Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad |
-|-----------|----------:|--------:|----:|-----------:|---------:|
-| matmul 512x512 | **162 us** | 165 | 174 | 676 | 434 |
-| softmax 8x128 | **3.9 us** | 39.7 | 17.0 | 10.2 | 700 |
-| MLP fwd 64x784 | **28.5 us** | 28.4 | 52.8 | 250 | 1831 |
-| train step 64 | **1031 us** | 1462 | 782 | 8414 | 24801 |
+| Operation | Peregrine (us) | PyTorch (us) | MLX (us) | TensorFlow (us) | tinygrad (us) |
+|-----------|---------------:|-------------:|---------:|----------------:|--------------:|
+| matmul 512x512 | **162** | 165 | 174 | 676 | 434 |
+| softmax 8x128 | **3.9** | 39.7 | 17.0 | 10.2 | 700 |
+| MLP fwd 64x784 | **28.5** | 28.4 | 52.8 | 250 | 1831 |
+| train step 64 | **1031** | 1462 | 782 | 8414 | 24801 |
 
 **Geometric mean (Peregrine / framework):**
 - vs PyTorch: 1.12x (near parity)
