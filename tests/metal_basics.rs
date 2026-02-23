@@ -85,7 +85,7 @@ fn metal_matmul() {
     let a = gpu.upload(&[1.0f32, 2.0, 3.0, 4.0]);
     let b = gpu.upload(&[5.0f32, 6.0, 7.0, 8.0]);
     let c: GpuBuffer<f32> = gpu.alloc(4);
-    gpu.dispatch_matmul(&a, &b, &c, None, 2, 2, 2, false);
+    gpu.dispatch_matmul(&a, &b, &c, None, 2, 2, 2, false, false, false);
     assert_eq!(c.read(), vec![19.0, 22.0, 43.0, 50.0]);
 }
 
@@ -98,7 +98,7 @@ fn metal_matmul_rect() {
     let a = gpu.upload(&[1.0f32, 2.0, 3.0]);
     let b = gpu.upload(&[1.0f32, 0.0, 0.0, 1.0, 1.0, 1.0]);
     let c: GpuBuffer<f32> = gpu.alloc(2);
-    gpu.dispatch_matmul(&a, &b, &c, None, 1, 2, 3, false);
+    gpu.dispatch_matmul(&a, &b, &c, None, 1, 2, 3, false, false, false);
     assert_eq!(c.read(), vec![4.0, 5.0]);
 }
 
@@ -113,7 +113,7 @@ fn metal_matmul_fused_bias_relu() {
     let b = gpu.upload(&[1.0f32, 0.0, 0.0, 1.0]);
     let bias = gpu.upload(&[10.0f32, 10.0]);
     let c: GpuBuffer<f32> = gpu.alloc(4);
-    gpu.dispatch_matmul(&a, &b, &c, Some(&bias), 2, 2, 2, true);
+    gpu.dispatch_matmul(&a, &b, &c, Some(&bias), 2, 2, 2, true, false, false);
     assert_eq!(c.read(), vec![9.0, 12.0, 13.0, 6.0]);
 }
 

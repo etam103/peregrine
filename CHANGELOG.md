@@ -7,6 +7,73 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.9.0] - 2026-02-23
+
+### Added — Metal autograd integration for end-to-end GPU training
+
+**GPU backward kernels** (`src/metal/shaders.rs` — 10 new compute shaders)
+- `relu_backward_f32`, `sigmoid_backward_f32`, `tanh_backward_f32`, `gelu_backward_f32` — activation backward passes
+- `softmax_backward_f32` — fused per-row softmax Jacobian-vector product
+- `layernorm_backward_f32` — fused grad_input/gamma/beta computation
+- `adam_step_f32` — fused Adam optimizer update on GPU
+- `accumulate_f32` — in-place gradient accumulation
+- `fill_f32` — scalar broadcast fill
+- `matmul_f32` extended with `trans_a`/`trans_b` parameters for backward matmul
+
+**Dual storage in TensorInner** (`src/tensor.rs`)
+- Optional `gpu_data` and `gpu_grad` fields on every tensor (behind `#[cfg(feature = "metal")]`)
+- `to_gpu()`, `to_cpu()`, `is_gpu()` methods for explicit device placement
+- `from_gpu_op()` constructor for tensors produced by GPU forward ops
+- Lazy sync: `data()` and `grad()` auto-sync GPU→CPU on demand
+- `sync_gpu_to_cpu()` ensures CPU data available for fallback paths
+
+**GPU forward dispatch** (`src/tensor.rs` — 19 ops)
+- All forward ops check GPU residence and dispatch to Metal: matmul, add, sub, mul, div, neg, scale, exp, log, sqrt, abs, relu, sigmoid, tanh, gelu, sin, cos, softmax, sum, mean, transpose, layer_norm
+- Mixed CPU/GPU inputs gracefully fall back to CPU path
+- GPU-produced tensors remain GPU-resident (no unnecessary CPU sync)
+
+**GPU backward dispatch** (`src/tensor.rs`)
+- Backward pass dispatches to Metal kernels when gradients and tensors are GPU-resident
+- Covers: MatMul (two transposed matmuls), Add/Sub, Mul, Div, Relu, Sigmoid, Tanh, Gelu, Exp, Scale, Neg, Softmax, LayerNorm, Sum/Mean
+- `gpu_accumulate_grad()` for in-place gradient addition on GPU
+- Automatic fallback to CPU backward when GPU dispatch isn't available
+
+**GPU optimizer step** (`src/optim.rs`)
+- Adam optimizer dispatches fused `adam_step_f32` kernel when params have GPU data + grad
+- Lazy-init GPU moment buffers on first step
+- `zero_grad()` clears both CPU and GPU gradients
+
+**GPU benchmark variants** (`benches/wallclock.rs`)
+- All 14 benchmarks now have GPU counterparts (behind `--features metal`)
+- GPU benchmarks: matmul, add, mul, exp, relu, softmax, MLP forward, training step
+
+**Integration tests** (`tests/metal_autograd.rs` — 17 tests)
+- GPU forward-backward gradient parity for 11 ops (add, sub, mul, relu, sigmoid, tanh, scale, neg, exp, matmul, softmax)
+- GPU MLP training convergence (4→8→1 MLP, Adam, 50 epochs, loss decreases >50%)
+- Mixed CPU/GPU fallback correctness
+- Lazy sync correctness (data, grad, chained ops, GPU↔CPU roundtrip)
+
+### Stats
+
+- 31 Metal compute shaders (up from 21)
+- 140 tests passing (64 unit + 17 autograd + 12 basics + 23 parity + 23 pytorch + 1 doc)
+- ~8,000 lines of Rust (up from ~5,000)
+
+### GPU Benchmark Results (Metal, Apple Silicon, all times in microseconds)
+
+| Operation | CPU (us) | GPU (us) | Note |
+|-----------|----------:|----------:|------|
+| matmul 128x128 | **6.2** | 324.3 | CPU wins (BLAS + small size) |
+| matmul 512x512 | **172.9** | 1673.4 | CPU wins (dispatch overhead) |
+| add 100k | **12.5** | 289.3 | CPU wins (NEON + small size) |
+| relu 100k | **9.3** | 241.5 | CPU wins (NEON + small size) |
+| MLP fwd 64x784 | **33.5** | 881.5 | CPU wins |
+| train step 64 | **921.9** | 1669.7 | CPU wins |
+
+GPU is slower at current tensor sizes due to per-op synchronous `waitUntilCompleted()` overhead (~200-300us per dispatch). Command batching (M7) will eliminate this overhead and shift the crossover point to smaller tensor sizes.
+
+---
+
 ## [0.8.0] - 2026-02-22
 
 ### Added — NEON intrinsics & elementwise dominance

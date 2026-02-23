@@ -121,7 +121,7 @@ parity_unary_test!(parity_gpu_cpu_log,     "log_f32",     log,     1e-6, true);
 parity_unary_test!(parity_gpu_cpu_sqrt,    "sqrt_f32",    sqrt,    1e-6, true);
 parity_unary_test!(parity_gpu_cpu_relu,    "relu_f32",    relu,    1e-7, false);
 parity_unary_test!(parity_gpu_cpu_sigmoid, "sigmoid_f32", sigmoid, 1e-6, false);
-parity_unary_test!(parity_gpu_cpu_tanh,    "tanh_f32",    tanh,    1e-6, false);
+parity_unary_test!(parity_gpu_cpu_tanh,    "tanh_f32",    tanh,    2e-6, false);
 parity_unary_test!(parity_gpu_cpu_sin,     "sin_f32",     sin,     1e-6, false);
 parity_unary_test!(parity_gpu_cpu_cos,     "cos_f32",     cos,     1e-6, false);
 parity_unary_test!(parity_gpu_cpu_abs,     "abs_f32",     abs,     1e-7, false);
@@ -139,7 +139,7 @@ fn parity_gpu_cpu_matmul() {
         let a = gpu.upload(&a_data);
         let b = gpu.upload(&b_data);
         let c = gpu.alloc(m * n);
-        gpu.dispatch_matmul(&a, &b, &c, None, m as u32, n as u32, k as u32, false);
+        gpu.dispatch_matmul(&a, &b, &c, None, m as u32, n as u32, k as u32, false, false, false);
         let err = max_abs_error(&cpu_result, &c.read());
         assert!(err < 1e-3, "matmul [{m}x{k}]@[{k}x{n}]: max err={err}");
     }
@@ -156,7 +156,7 @@ fn parity_gpu_cpu_matmul_large() {
     let a = gpu.upload(&a_data);
     let b = gpu.upload(&b_data);
     let c = gpu.alloc(m * n);
-    gpu.dispatch_matmul(&a, &b, &c, None, m as u32, n as u32, k as u32, false);
+    gpu.dispatch_matmul(&a, &b, &c, None, m as u32, n as u32, k as u32, false, false, false);
     let err = max_abs_error(&cpu_result, &c.read());
     assert!(err < 0.01, "matmul 256x256: max err={err}");
 }

@@ -130,10 +130,16 @@ pub struct Adam {
     m: Vec<Vec<f32>>,   // first moment
     v: Vec<Vec<f32>>,   // second moment
     t: u64,             // timestep
+    #[cfg(feature = "metal")]
+    gpu_m: Vec<Option<crate::metal::GpuBuffer<f32>>>,
+    #[cfg(feature = "metal")]
+    gpu_v: Vec<Option<crate::metal::GpuBuffer<f32>>>,
 }
 
 impl Adam {
     pub fn new(params: Vec<Tensor>, lr: f32) -> Self {
+        #[allow(unused_variables)]
+        let n = params.len();
         let m: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.size()]).collect();
         let v: Vec<Vec<f32>> = params.iter().map(|p| vec![0.0; p.size()]).collect();
         Adam {
@@ -141,6 +147,10 @@ impl Adam {
             beta1: 0.9, beta2: 0.999, eps: 1e-8,
             weight_decay: 0.0, decoupled_wd: false,
             m, v, t: 0,
+            #[cfg(feature = "metal")]
+            gpu_m: (0..n).map(|_| None).collect(),
+            #[cfg(feature = "metal")]
+            gpu_v: (0..n).map(|_| None).collect(),
         }
     }
 
@@ -178,6 +188,53 @@ impl Adam {
         let bc2 = 1.0 - self.beta2.powi(self.t as i32);
 
         for (i, p) in self.params.iter().enumerate() {
+            // --- GPU path: if param has gpu_data + gpu_grad, use fused GPU Adam ---
+            #[cfg(feature = "metal")]
+            {
+                let has_gpu = {
+                    let inner = p.0.borrow();
+                    inner.gpu_data.is_some() && inner.gpu_grad.is_some()
+                };
+                if has_gpu {
+                    // Lazy-init GPU moment buffers
+                    if self.gpu_m[i].is_none() {
+                        if let Some((m_buf, v_buf)) = crate::metal::with_gpu(|gpu| {
+                            let n = p.size();
+                            let m_buf = gpu.alloc(n);
+                            let v_buf = gpu.alloc(n);
+                            gpu.dispatch_fill(&m_buf, 0.0);
+                            gpu.dispatch_fill(&v_buf, 0.0);
+                            (m_buf, v_buf)
+                        }) {
+                            self.gpu_m[i] = Some(m_buf);
+                            self.gpu_v[i] = Some(v_buf);
+                        }
+                    }
+
+                    if let (Some(ref m_buf), Some(ref v_buf)) = (&self.gpu_m[i], &self.gpu_v[i]) {
+                        let done = crate::metal::with_gpu(|gpu| {
+                            let inner = p.0.borrow();
+                            let data_buf = inner.gpu_data.as_ref().unwrap();
+                            let grad_buf = inner.gpu_grad.as_ref().unwrap();
+                            gpu.dispatch_adam_step(
+                                data_buf, grad_buf, m_buf, v_buf,
+                                self.lr, self.beta1, self.beta2, self.eps,
+                                bc1, bc2,
+                                self.weight_decay, self.decoupled_wd,
+                            );
+                        });
+                        if done.is_some() {
+                            let mut inner = p.0.borrow_mut();
+                            inner.gpu_grad = None;
+                            inner.gpu_dirty = true; // GPU data was modified
+                            inner.op = crate::tensor::Op::None;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // --- CPU path ---
             let m = &mut self.m[i];
             let v = &mut self.v[i];
             let mut inner = p.0.borrow_mut();

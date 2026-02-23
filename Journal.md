@@ -349,3 +349,56 @@ The NEON Adam step with fast `vrsqrteq_f32` brought training from 1136us to 809u
 Exp remains a gap (138.5us vs PyTorch 59.3us) — the polynomial approximation is fast but the benchmark shows high variance (min 92.7us). The exp_500k result (211.9us) suggests the approximation is competitive at larger sizes.
 
 The 0.85x target was exceeded by a wide margin: 0.70x vs PyTorch and 0.57x vs MLX. Peregrine now wins 8 of 14 ops outright.
+
+## Round 5: Metal autograd integration (2026-02-23)
+
+**Goal:** Enable end-to-end GPU training by integrating Metal dispatch into autograd backward pass, keeping tensors GPU-resident throughout forward → backward → optimizer.
+
+**Changes:**
+
+1. **10 new backward compute shaders** (`src/metal/shaders.rs`) — `relu_backward_f32`, `sigmoid_backward_f32`, `tanh_backward_f32`, `gelu_backward_f32`, `softmax_backward_f32`, `layernorm_backward_f32`, `adam_step_f32`, `accumulate_f32`, `fill_f32`, plus `trans_a`/`trans_b` support for matmul backward. Total: 31 shaders (up from 21).
+
+2. **Dual storage in TensorInner** — Added optional `gpu_data`, `gpu_grad`, and `gpu_dirty` fields to `TensorInner` (behind `#[cfg(feature = "metal")]`). Tensors can now exist in CPU-only, GPU-only (`gpu_dirty=true`, empty CPU data), or synced states. `data()` and `grad()` auto-sync via `ensure_cpu_data()`.
+
+3. **GPU forward dispatch** — All 19 forward ops (matmul, add, sub, mul, div, neg, scale, exp, log, sqrt, abs, relu, sigmoid, tanh, gelu, softmax, sum, mean, transpose, layer_norm) check GPU residence and dispatch to Metal. GPU results stay GPU-resident via `Tensor::from_gpu_op()`.
+
+4. **GPU backward dispatch** — `propagate_grad()` checks if tensors + gradients are GPU-resident and dispatches backward kernels accordingly. Covers matmul (two transposed matmuls), all elementwise ops, softmax, and layer_norm. Falls back to CPU when GPU dispatch isn't possible.
+
+5. **GPU optimizer step** — Adam dispatches fused `adam_step_f32` kernel when params have GPU data + grad. Moment buffers lazy-init to GPU on first step.
+
+6. **Lazy sync + fallback safety** — Added `sync_gpu_to_cpu()` method called at all CPU fallback points (19 forward ops + 9 backward op categories + 4 ops without GPU blocks). Ensures GPU-dirty tensors have CPU data available before CPU code accesses it.
+
+7. **GPU benchmark variants** — All 14 wall-clock benchmarks now have GPU counterparts via `#[cfg(feature = "metal")]`.
+
+### Key debugging insights
+
+- **sum() GPU forward** initially returned a CPU tensor via `from_op()` instead of `from_gpu_op()`, breaking the backward chain. The loss tensor wasn't GPU-resident, so backward initialized CPU grad, which tried to access empty CPU data on GPU-dirty intermediates.
+- **GPU-dirty tensors with empty CPU data** were the most pervasive issue. When GPU forward blocks are skipped (e.g., shape mismatch) or GPU backward falls through to CPU, code accesses `.data` which is `Vec::new()` on GPU-dirty tensors. Required comprehensive `sync_gpu_to_cpu()` guards across all fallback paths.
+
+### GPU benchmark results (all times in microseconds)
+
+| Operation | CPU (us) | GPU (us) | Ratio |
+|-----------|----------:|----------:|------:|
+| matmul 128x128 | **6.2** | 324.3 | 52x slower |
+| matmul 256x256 | **33.0** | 437.2 | 13x slower |
+| matmul 512x512 | **172.9** | 1673.4 | 9.7x slower |
+| add 100k | **12.5** | 289.3 | 23x slower |
+| add 500k | **151.7** | 405.2 | 2.7x slower |
+| mul 100k | **12.5** | 281.8 | 23x slower |
+| exp 100k | **116.8** | 236.8 | 2.0x slower |
+| relu 100k | **9.3** | 241.5 | 26x slower |
+| softmax 8x128 | **3.9** | 228.0 | 58x slower |
+| MLP fwd 64x784 | **33.5** | 881.5 | 26x slower |
+| train step 64 | **921.9** | 1669.7 | 1.8x slower |
+
+### Analysis
+
+GPU is uniformly slower at these tensor sizes. The bottleneck is per-op synchronous Metal dispatch: each `waitUntilCompleted()` adds ~200-300us of overhead. For a training step with ~20 dispatches, this adds 4-6ms of pure sync cost. The actual GPU compute is fast — for example, add_500k GPU min is 332us vs CPU 91us, but the dispatch overhead dominates the median.
+
+The gap narrows at larger sizes (train_step is only 1.8x slower) because more compute amortizes the fixed dispatch cost. Command batching (accumulating dispatches into a single `MTLCommandBuffer`) is the critical optimization — it would reduce per-op overhead to near-zero, paying the sync cost only once at boundaries.
+
+**Next milestone:** M7 (Metal Command Batching & GPU Performance) — 4 tickets created in Linear:
+- PER-35: Command batching (High priority, critical path)
+- PER-36: Large-tensor GPU benchmarks (blocked by PER-35)
+- PER-37: Threadgroup size tuning
+- PER-38: Fused kernels for common patterns (blocked by PER-35)

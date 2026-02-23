@@ -4,6 +4,7 @@
 //! target/bench_compare/peregrine.json with timing stats for each operation.
 //!
 //! Run: cargo bench --bench wallclock
+//! GPU: cargo bench --bench wallclock --features metal
 
 use peregrine::nn;
 use peregrine::optim::Adam;
@@ -69,8 +70,14 @@ fn stats(mut times: Vec<f64>) -> serde_json::Value {
     })
 }
 
+fn make_result(label: &str, times: Vec<f64>) -> serde_json::Value {
+    let mut s = stats(times);
+    s.as_object_mut().unwrap().insert("op".to_string(), serde_json::json!(label));
+    s
+}
+
 // ---------------------------------------------------------------------------
-// Benchmarks
+// CPU Benchmarks
 // ---------------------------------------------------------------------------
 
 fn bench_matmul() -> Vec<serde_json::Value> {
@@ -80,9 +87,7 @@ fn bench_matmul() -> Vec<serde_json::Value> {
         let a = Tensor::randn(&[size, size], false);
         let w = Tensor::randn(&[size, size], false);
         let times = bench(|| { black_box(a.matmul(&w)); }, iters);
-        let mut s = stats(times);
-        s.as_object_mut().unwrap().insert("op".to_string(), serde_json::json!(format!("matmul_{size}x{size}")));
-        results.push(s);
+        results.push(make_result(&format!("matmul_{size}x{size}"), times));
     }
     results
 }
@@ -93,10 +98,7 @@ fn bench_add() -> Vec<serde_json::Value> {
         let a = Tensor::randn(&[n], false);
         let b = Tensor::randn(&[n], false);
         let times = bench(|| { black_box(a.add(&b)); }, ITERS_FAST);
-        let label = format!("add_{}k", n / 1000);
-        let mut s = stats(times);
-        s.as_object_mut().unwrap().insert("op".to_string(), serde_json::json!(label));
-        results.push(s);
+        results.push(make_result(&format!("add_{}k", n / 1000), times));
     }
     results
 }
@@ -107,10 +109,7 @@ fn bench_mul() -> Vec<serde_json::Value> {
         let a = Tensor::randn(&[n], false);
         let b = Tensor::randn(&[n], false);
         let times = bench(|| { black_box(a.mul(&b)); }, ITERS_FAST);
-        let label = format!("mul_{}k", n / 1000);
-        let mut s = stats(times);
-        s.as_object_mut().unwrap().insert("op".to_string(), serde_json::json!(label));
-        results.push(s);
+        results.push(make_result(&format!("mul_{}k", n / 1000), times));
     }
     results
 }
@@ -120,10 +119,7 @@ fn bench_exp() -> Vec<serde_json::Value> {
     for n in [100_000usize, 500_000] {
         let a = Tensor::randn(&[n], false);
         let times = bench(|| { black_box(a.exp()); }, ITERS_FAST);
-        let label = format!("exp_{}k", n / 1000);
-        let mut s = stats(times);
-        s.as_object_mut().unwrap().insert("op".to_string(), serde_json::json!(label));
-        results.push(s);
+        results.push(make_result(&format!("exp_{}k", n / 1000), times));
     }
     results
 }
@@ -131,9 +127,7 @@ fn bench_exp() -> Vec<serde_json::Value> {
 fn bench_relu() -> Vec<serde_json::Value> {
     let a = Tensor::randn(&[100_000], false);
     let times = bench(|| { black_box(a.relu()); }, ITERS_FAST);
-    let mut s = stats(times);
-    s.as_object_mut().unwrap().insert("op".to_string(), serde_json::json!("relu_100k"));
-    vec![s]
+    vec![make_result("relu_100k", times)]
 }
 
 fn bench_softmax() -> Vec<serde_json::Value> {
@@ -141,10 +135,7 @@ fn bench_softmax() -> Vec<serde_json::Value> {
     for seq in [128usize, 512] {
         let x = Tensor::randn(&[8, seq], false);
         let times = bench(|| { black_box(x.softmax(-1)); }, ITERS_FAST);
-        let label = format!("softmax_8x{seq}");
-        let mut s = stats(times);
-        s.as_object_mut().unwrap().insert("op".to_string(), serde_json::json!(label));
-        results.push(s);
+        results.push(make_result(&format!("softmax_8x{seq}"), times));
     }
     results
 }
@@ -165,9 +156,7 @@ fn bench_mlp_forward() -> Vec<serde_json::Value> {
         black_box(out);
     }, ITERS_FAST);
 
-    let mut s = stats(times);
-    s.as_object_mut().unwrap().insert("op".to_string(), serde_json::json!("mlp_fwd_64x784"));
-    vec![s]
+    vec![make_result("mlp_fwd_64x784", times)]
 }
 
 fn bench_training_step() -> Vec<serde_json::Value> {
@@ -198,9 +187,139 @@ fn bench_training_step() -> Vec<serde_json::Value> {
         black_box(loss);
     }, ITERS_SLOW);
 
-    let mut s = stats(times);
-    s.as_object_mut().unwrap().insert("op".to_string(), serde_json::json!("train_step_64"));
-    vec![s]
+    vec![make_result("train_step_64", times)]
+}
+
+// ---------------------------------------------------------------------------
+// GPU Benchmarks (Metal)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metal")]
+fn gpu_tensor(shape: &[usize], requires_grad: bool) -> Tensor {
+    let t = Tensor::randn(shape, requires_grad);
+    t.to_gpu();
+    t
+}
+
+#[cfg(feature = "metal")]
+fn bench_gpu_matmul() -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    for size in [128, 256, 512] {
+        let iters = if size == 512 { ITERS_SLOW } else { ITERS_FAST };
+        let a = gpu_tensor(&[size, size], false);
+        let w = gpu_tensor(&[size, size], false);
+        let times = bench(|| { black_box(a.matmul(&w)); }, iters);
+        results.push(make_result(&format!("gpu_matmul_{size}x{size}"), times));
+    }
+    results
+}
+
+#[cfg(feature = "metal")]
+fn bench_gpu_add() -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    for n in [100_000usize, 500_000] {
+        let a = gpu_tensor(&[n], false);
+        let b = gpu_tensor(&[n], false);
+        let times = bench(|| { black_box(a.add(&b)); }, ITERS_FAST);
+        results.push(make_result(&format!("gpu_add_{}k", n / 1000), times));
+    }
+    results
+}
+
+#[cfg(feature = "metal")]
+fn bench_gpu_mul() -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    for n in [100_000usize, 500_000] {
+        let a = gpu_tensor(&[n], false);
+        let b = gpu_tensor(&[n], false);
+        let times = bench(|| { black_box(a.mul(&b)); }, ITERS_FAST);
+        results.push(make_result(&format!("gpu_mul_{}k", n / 1000), times));
+    }
+    results
+}
+
+#[cfg(feature = "metal")]
+fn bench_gpu_exp() -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    for n in [100_000usize, 500_000] {
+        let a = gpu_tensor(&[n], false);
+        let times = bench(|| { black_box(a.exp()); }, ITERS_FAST);
+        results.push(make_result(&format!("gpu_exp_{}k", n / 1000), times));
+    }
+    results
+}
+
+#[cfg(feature = "metal")]
+fn bench_gpu_relu() -> Vec<serde_json::Value> {
+    let a = gpu_tensor(&[100_000], false);
+    let times = bench(|| { black_box(a.relu()); }, ITERS_FAST);
+    vec![make_result("gpu_relu_100k", times)]
+}
+
+#[cfg(feature = "metal")]
+fn bench_gpu_softmax() -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+    for seq in [128usize, 512] {
+        let x = gpu_tensor(&[8, seq], false);
+        let times = bench(|| { black_box(x.softmax(-1)); }, ITERS_FAST);
+        results.push(make_result(&format!("gpu_softmax_8x{seq}"), times));
+    }
+    results
+}
+
+#[cfg(feature = "metal")]
+fn bench_gpu_mlp_forward() -> Vec<serde_json::Value> {
+    let w1 = gpu_tensor(&[784, 128], false);
+    let b1 = gpu_tensor(&[1, 128], false);
+    let w2 = gpu_tensor(&[128, 64], false);
+    let b2 = gpu_tensor(&[1, 64], false);
+    let w3 = gpu_tensor(&[64, 10], false);
+    let b3 = gpu_tensor(&[1, 10], false);
+    let x = gpu_tensor(&[64, 784], false);
+
+    let times = bench(|| {
+        let h1 = x.matmul(&w1).add_bias(&b1).relu();
+        let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+        let out = h2.matmul(&w3).add_bias(&b3);
+        black_box(out);
+    }, ITERS_FAST);
+
+    vec![make_result("gpu_mlp_fwd_64x784", times)]
+}
+
+#[cfg(feature = "metal")]
+fn bench_gpu_training_step() -> Vec<serde_json::Value> {
+    let w1 = gpu_tensor(&[784, 128], true);
+    let b1 = Tensor::zeros(&[1, 128], true);
+    b1.to_gpu();
+    let w2 = gpu_tensor(&[128, 64], true);
+    let b2 = Tensor::zeros(&[1, 64], true);
+    b2.to_gpu();
+    let w3 = gpu_tensor(&[64, 10], true);
+    let b3 = Tensor::zeros(&[1, 10], true);
+    b3.to_gpu();
+
+    let batch = 64usize;
+    let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+
+    let mut opt = Adam::new(
+        vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
+        1e-3,
+    );
+
+    let times = bench(|| {
+        let x = gpu_tensor(&[batch, 784], false);
+        let h1 = x.matmul(&w1).add_bias(&b1).relu();
+        let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+        let logits = h2.matmul(&w3).add_bias(&b3);
+        let loss = nn::cross_entropy_loss(&logits, &targets);
+        loss.backward();
+        opt.step();
+        opt.zero_grad();
+        black_box(loss);
+    }, ITERS_SLOW);
+
+    vec![make_result("gpu_train_step_64", times)]
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +330,8 @@ fn main() {
     let out_dir = std::path::Path::new("target/bench_compare");
     std::fs::create_dir_all(out_dir).expect("create output dir");
 
-    let benchmarks: Vec<(&str, fn() -> Vec<serde_json::Value>)> = vec![
+    // CPU benchmarks (always run)
+    let cpu_benchmarks: Vec<(&str, fn() -> Vec<serde_json::Value>)> = vec![
         ("bench_matmul", bench_matmul),
         ("bench_add", bench_add),
         ("bench_mul", bench_mul),
@@ -223,9 +343,32 @@ fn main() {
     ];
 
     let mut all_results = Vec::new();
-    for (name, f) in benchmarks {
-        eprintln!("  Peregrine: {} ...", name);
+    for (name, f) in cpu_benchmarks {
+        eprintln!("  CPU: {} ...", name);
         all_results.extend(f());
+    }
+
+    // GPU benchmarks (metal feature only)
+    #[cfg(feature = "metal")]
+    {
+        peregrine::metal::init_gpu().expect("Failed to initialize Metal GPU");
+        eprintln!("  Metal GPU initialized");
+
+        let gpu_benchmarks: Vec<(&str, fn() -> Vec<serde_json::Value>)> = vec![
+            ("bench_gpu_matmul", bench_gpu_matmul),
+            ("bench_gpu_add", bench_gpu_add),
+            ("bench_gpu_mul", bench_gpu_mul),
+            ("bench_gpu_exp", bench_gpu_exp),
+            ("bench_gpu_relu", bench_gpu_relu),
+            ("bench_gpu_softmax", bench_gpu_softmax),
+            ("bench_gpu_mlp_forward", bench_gpu_mlp_forward),
+            ("bench_gpu_training_step", bench_gpu_training_step),
+        ];
+
+        for (name, f) in gpu_benchmarks {
+            eprintln!("  GPU: {} ...", name);
+            all_results.extend(f());
+        }
     }
 
     let output = serde_json::json!({

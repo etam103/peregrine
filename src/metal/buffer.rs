@@ -59,4 +59,17 @@ impl<T: Copy> GpuBuffer<T> {
     pub fn byte_size(&self) -> usize {
         self.len * std::mem::size_of::<T>()
     }
+
+    /// Construct from a raw MTLBuffer and element count (used by pool).
+    pub fn from_raw(
+        raw: Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>,
+        len: usize,
+    ) -> Self {
+        GpuBuffer { raw, len, _marker: PhantomData }
+    }
+
+    /// Consume self and return the raw MTLBuffer (for recycling into pool).
+    pub fn into_raw(self) -> Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>> {
+        self.raw
+    }
 }

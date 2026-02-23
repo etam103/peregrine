@@ -17,7 +17,7 @@ Tensors, reverse-mode autograd, neural network layers, optimizers, and working m
 
 ```
 cargo build --release                          # build the library
-cargo test                                     # 87 tests, all pass
+cargo test                                     # 87 tests (140 with --features metal)
 cargo run --example mnist --release            # train MNIST digit classifier (97.5% accuracy)
 cargo run --example rt_detr --release          # train RT-DETR on COCO images
 ./scripts/bench_compare.sh                     # wall-clock benchmark vs PyTorch, MLX, TF, tinygrad, JAX
@@ -34,11 +34,11 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::optim`** | SGD (with momentum, Nesterov, weight decay), Adam, AdamW, LR schedulers (StepLR, CosineAnnealing, Warmup), gradient clipping |
 | **`peregrine::serial`** | Save/load model weights in compact binary format |
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
-| **`peregrine::metal`** | Metal GPU backend — 21 compute shaders, buffer pool, unified memory (`--features metal`) |
+| **`peregrine::metal`** | Metal GPU backend — 31 compute shaders (forward + backward), autograd integration, buffer pool, unified memory (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 
-The entire library is ~5,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
+The entire library is ~8,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
 ---
 
@@ -205,7 +205,7 @@ Geometric mean ratio (lower = Peregrine faster): **PyTorch 0.70x**, **MLX 0.57x*
 | Pool bypass for small tensors | Skip HashMap overhead for tensors < 1024 elements |
 | Rayon threshold tuning | Dual thresholds (500K cheap / 100K expensive) — avoids spawn overhead |
 | Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
-| Metal GPU backend | 3-5x speedup on element-wise ops at 1M elements |
+| Metal GPU backend | 31 compute shaders with full autograd integration for end-to-end GPU training |
 
 ---
 
@@ -221,7 +221,7 @@ src/
   optim.rs        SGD, Adam, AdamW, LR schedulers, gradient clipping
   debug.rs        model summary + training health diagnostics
   serial.rs       model weight save/load (binary format)
-  metal/          Metal GPU backend (context, shaders, buffer pool)
+  metal/          Metal GPU backend (context, shaders, buffer pool, autograd dispatch)
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
   wallclock.rs    wall-clock comparison benchmark (JSON output)
@@ -241,6 +241,9 @@ examples/
     dataset.rs      VOC + COCO dataset loaders
 tests/
   pytorch_parity.rs   23 numerical parity tests vs PyTorch
+  metal_parity.rs     23 CPU vs Metal parity tests
+  metal_basics.rs     12 Metal compute shader tests
+  metal_autograd.rs   17 GPU autograd integration tests
   generate_reference.py  script to regenerate PyTorch reference data
   fixtures/             binary reference tensors
 ```
@@ -253,7 +256,7 @@ This is a learning project, not a production framework.
 
 - Greedy Hungarian matching (not full O(n³) algorithm)
 - Attention forward pass breaks autograd graph (output projection still trains)
-- Metal GPU backend is dispatch-only (no autograd integration yet)
+- Metal GPU backend has per-op synchronous dispatch (command batching planned for M7)
 
 ---
 

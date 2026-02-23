@@ -357,6 +357,12 @@ pub(crate) struct TensorInner {
     pub(crate) grad: Option<Vec<f32>>,
     pub(crate) op: Op,
     pub(crate) requires_grad: bool,
+    #[cfg(feature = "metal")]
+    pub(crate) gpu_data: Option<crate::metal::GpuBuffer<f32>>,
+    #[cfg(feature = "metal")]
+    pub(crate) gpu_grad: Option<crate::metal::GpuBuffer<f32>>,
+    #[cfg(feature = "metal")]
+    pub(crate) gpu_dirty: bool,  // true = GPU has newer data than CPU
 }
 
 impl Drop for TensorInner {
@@ -388,6 +394,12 @@ impl Tensor {
             grad: None,
             op: Op::None,
             requires_grad,
+            #[cfg(feature = "metal")]
+            gpu_data: None,
+            #[cfg(feature = "metal")]
+            gpu_grad: None,
+            #[cfg(feature = "metal")]
+            gpu_dirty: false,
         })))
     }
 
@@ -474,10 +486,113 @@ impl Tensor {
             grad: None,
             op,
             requires_grad: true,
+            #[cfg(feature = "metal")]
+            gpu_data: None,
+            #[cfg(feature = "metal")]
+            gpu_grad: None,
+            #[cfg(feature = "metal")]
+            gpu_dirty: false,
         })))
     }
 
+    /// Create a GPU-produced tensor. CPU data is empty; the GPU buffer is authoritative.
+    #[cfg(feature = "metal")]
+    fn from_gpu_op(
+        gpu_data: crate::metal::GpuBuffer<f32>,
+        shape: Vec<usize>,
+        op: Op,
+    ) -> Self {
+        Tensor(Rc::new(RefCell::new(TensorInner {
+            data: Vec::new(), // empty — GPU is authoritative
+            shape,
+            grad: None,
+            op,
+            requires_grad: true,
+            gpu_data: Some(gpu_data),
+            gpu_grad: None,
+            gpu_dirty: true, // GPU has data, CPU does not
+        })))
+    }
+
+    /// Upload CPU data to GPU, making the tensor GPU-resident.
+    #[cfg(feature = "metal")]
+    pub fn to_gpu(&self) {
+        let mut inner = self.0.borrow_mut();
+        if inner.gpu_data.is_some() {
+            return; // already on GPU
+        }
+        if let Some(buf) = crate::metal::with_gpu(|gpu| {
+            gpu.upload(&inner.data)
+        }) {
+            inner.gpu_data = Some(buf);
+            inner.gpu_dirty = true;
+        }
+    }
+
+    /// Sync GPU→CPU and drop GPU buffers.
+    #[cfg(feature = "metal")]
+    pub fn to_cpu(&self) {
+        let mut inner = self.0.borrow_mut();
+        if inner.gpu_dirty {
+            if let Some(ref buf) = inner.gpu_data {
+                inner.data = buf.read();
+            }
+            inner.gpu_dirty = false;
+        }
+        if inner.gpu_grad.is_some() {
+            if inner.grad.is_none() {
+                if let Some(ref buf) = inner.gpu_grad {
+                    inner.grad = Some(buf.read());
+                }
+            }
+        }
+        inner.gpu_data = None;
+        inner.gpu_grad = None;
+    }
+
+    /// Lazily sync GPU data to CPU when CPU reads are needed.
+    #[cfg(feature = "metal")]
+    fn ensure_cpu_data(inner: &mut TensorInner) {
+        if inner.gpu_dirty {
+            if let Some(ref buf) = inner.gpu_data {
+                inner.data = buf.read();
+            }
+            inner.gpu_dirty = false;
+        }
+    }
+
+    /// Lazily sync GPU grad to CPU when CPU grad reads are needed.
+    #[cfg(feature = "metal")]
+    fn ensure_cpu_grad(inner: &mut TensorInner) {
+        if inner.grad.is_none() {
+            if let Some(ref buf) = inner.gpu_grad {
+                inner.grad = Some(buf.read());
+            }
+        }
+    }
+
+    /// Check whether this tensor is GPU-resident.
+    #[cfg(feature = "metal")]
+    pub fn is_gpu(&self) -> bool {
+        self.0.borrow().gpu_data.is_some()
+    }
+
+    /// Ensure CPU data is available (sync from GPU if needed).
+    /// Call before falling through to CPU compute paths.
+    #[cfg(feature = "metal")]
+    fn sync_gpu_to_cpu(&self) {
+        let mut inner = self.0.borrow_mut();
+        Self::ensure_cpu_data(&mut inner);
+    }
+
     pub fn data(&self) -> Vec<f32> {
+        #[cfg(feature = "metal")]
+        {
+            let mut inner = self.0.borrow_mut();
+            Self::ensure_cpu_data(&mut inner);
+            return inner.data.clone();
+        }
+        #[cfg(not(feature = "metal"))]
         self.0.borrow().data.clone()
     }
 
@@ -486,16 +601,57 @@ impl Tensor {
     }
 
     pub fn grad(&self) -> Option<Vec<f32>> {
+        #[cfg(feature = "metal")]
+        {
+            let mut inner = self.0.borrow_mut();
+            Self::ensure_cpu_grad(&mut inner);
+            return inner.grad.clone();
+        }
+        #[cfg(not(feature = "metal"))]
         self.0.borrow().grad.clone()
     }
 
     pub fn size(&self) -> usize {
+        #[cfg(feature = "metal")]
+        {
+            let inner = self.0.borrow();
+            if let Some(ref buf) = inner.gpu_data {
+                return buf.len();
+            }
+            return inner.data.len();
+        }
+        #[cfg(not(feature = "metal"))]
         self.0.borrow().data.len()
     }
 
     // ---- Forward ops ----
 
     pub fn add(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("add_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Add(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
         let a = self.0.borrow();
         let b = other.0.borrow();
         if a.shape == b.shape {
@@ -518,6 +674,31 @@ impl Tensor {
     }
 
     pub fn mul(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("mul_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Mul(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
         let a = self.0.borrow();
         let b = other.0.borrow();
         if a.shape == b.shape {
@@ -541,6 +722,36 @@ impl Tensor {
 
     /// 2D matrix multiply: [M, K] x [K, N] -> [M, N]
     pub fn matmul(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let both_gpu = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                a.gpu_data.is_some() && b.gpu_data.is_some()
+            };
+            if both_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let (m, k) = (a.shape[0], a.shape[1]);
+                    let n = b.shape[1];
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(m * n);
+                    gpu.dispatch_matmul(a_buf, b_buf, &out, None, m as u32, n as u32, k as u32, false, false, false);
+                    out
+                }) {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let shape = vec![a.shape[0], b.shape[1]];
+                    drop(a);
+                    drop(b);
+                    return Tensor::from_gpu_op(result, shape, Op::MatMul(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
         let a = self.0.borrow();
         let b = other.0.borrow();
         assert_eq!(a.shape.len(), 2);
@@ -569,6 +780,23 @@ impl Tensor {
     }
 
     pub fn relu(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("relu_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Relu(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_CHEAP {
@@ -585,6 +813,23 @@ impl Tensor {
     }
 
     pub fn sigmoid(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("sigmoid_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Sigmoid(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_EXPENSIVE {
@@ -601,6 +846,23 @@ impl Tensor {
     }
 
     pub fn sum(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let scalar = gpu.dispatch_reduce("sum_f32", buf);
+                    // Upload scalar back to GPU so backward chain stays GPU-resident
+                    let out_buf = gpu.upload(&[scalar]);
+                    out_buf
+                }) {
+                    return Tensor::from_gpu_op(result, vec![1], Op::Sum(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let s: f32 = if inner.data.len() >= PAR_THRESHOLD_CHEAP {
             inner.data.par_iter().sum()
@@ -611,6 +873,23 @@ impl Tensor {
     }
 
     pub fn scale(&self, s: f32) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_scale(buf, &out, s);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Scale(self.clone(), s));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_CHEAP {
@@ -628,6 +907,8 @@ impl Tensor {
 
     /// Broadcast add: self is [batch, features], bias is [1, features]
     pub fn add_bias(&self, bias: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); bias.sync_gpu_to_cpu(); }
         let a = self.0.borrow();
         let b = bias.0.borrow();
         assert_eq!(a.shape.len(), 2);
@@ -956,6 +1237,8 @@ impl Tensor {
     /// Gather elements by flat index, preserving autograd connectivity.
     /// out[i] = self.data[indices[i]]
     pub fn select(&self, indices: &[usize]) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let data: Vec<f32> = indices.iter().map(|&i| inner.data[i]).collect();
         let n = indices.len();
@@ -965,6 +1248,8 @@ impl Tensor {
     /// BCE with logits loss, reduced to scalar mean. Targets are constants.
     /// Numerically stable: bce(x,t) = max(x,0) - x*t + ln(1 + exp(-|x|))
     pub fn bce_with_logits_loss(&self, targets: &[f32]) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let n = inner.data.len();
         assert_eq!(n, targets.len(), "predictions and targets must have same length");
@@ -990,6 +1275,30 @@ impl Tensor {
     }
 
     pub fn transpose(&self, dim0: usize, dim1: usize) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let can_gpu = {
+                let inner = self.0.borrow();
+                // GPU transpose works only on 2D matrices
+                inner.gpu_data.is_some() && inner.shape.len() == 2 && dim0 != dim1
+            };
+            if can_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let rows = inner.shape[0] as u32;
+                    let cols = inner.shape[1] as u32;
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_transpose(buf, &out, rows, cols);
+                    (out, vec![inner.shape[1], inner.shape[0]])
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1,
+                        Op::Transpose { input: self.clone(), dim0, dim1 });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let ndim = inner.shape.len();
         assert!(dim0 < ndim && dim1 < ndim, "transpose dims out of range");
@@ -1040,6 +1349,40 @@ impl Tensor {
     }
 
     pub fn softmax(&self, dim: isize) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let can_gpu = {
+                let inner = self.0.borrow();
+                let ndim = inner.shape.len();
+                let d = if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize };
+                // GPU softmax works on [batch, dim] — last dim only, 2D
+                inner.gpu_data.is_some() && ndim == 2 && d == ndim - 1
+            };
+            if can_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let batch = inner.shape[0] as u32;
+                    let dim_size = inner.shape[1] as u32;
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_softmax(buf, &out, batch, dim_size);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    let dim_usize = {
+                        let inner = self.0.borrow();
+                        let ndim = inner.shape.len();
+                        if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize }
+                    };
+                    // We need output_data for the backward pass — read it back
+                    let output_data = result.0.read();
+                    return Tensor::from_gpu_op(result.0, result.1.clone(),
+                        Op::Softmax { input: self.clone(), output_data, dim: dim_usize });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let ndim = inner.shape.len();
         let dim = if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize };
@@ -1085,6 +1428,8 @@ impl Tensor {
 
     /// Numerically stable log-softmax: log(softmax(x)) = x - max - log(sum(exp(x - max)))
     pub fn log_softmax(&self, dim: isize) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let ndim = inner.shape.len();
         let dim = if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize };
@@ -1131,6 +1476,66 @@ impl Tensor {
     }
 
     pub fn layer_norm(&self, gamma: &Tensor, beta: &Tensor, normalized_shape: usize) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let can_gpu = {
+                let inner = self.0.borrow();
+                let g = gamma.0.borrow();
+                let b = beta.0.borrow();
+                inner.gpu_data.is_some() && g.gpu_data.is_some() && b.gpu_data.is_some()
+            };
+            if can_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let g = gamma.0.borrow();
+                    let b = beta.0.borrow();
+                    let in_buf = inner.gpu_data.as_ref().unwrap();
+                    let g_buf = g.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let total = in_buf.len();
+                    let batch = (total / normalized_shape) as u32;
+                    let dim = normalized_shape as u32;
+                    let out = gpu.alloc(total);
+                    gpu.dispatch_layernorm(in_buf, g_buf, b_buf, &out, batch, dim, 1e-5);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    // Need normalized and inv_std for backward — compute on CPU from GPU output
+                    // For simplicity, read back and compute
+                    let inner = self.0.borrow();
+                    let total = inner.gpu_data.as_ref().unwrap().len();
+                    let num_instances = total / normalized_shape;
+                    // Read input data for backward cache
+                    let input_data = inner.gpu_data.as_ref().unwrap().read();
+                    drop(inner);
+                    let eps = 1e-5f32;
+                    let mut normalized = vec![0.0f32; total];
+                    let mut inv_std = vec![0.0f32; num_instances];
+                    for inst in 0..num_instances {
+                        let offset = inst * normalized_shape;
+                        let slice = &input_data[offset..offset + normalized_shape];
+                        let mean: f32 = slice.iter().sum::<f32>() / normalized_shape as f32;
+                        let var: f32 = slice.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>()
+                            / normalized_shape as f32;
+                        let istd = 1.0 / (var + eps).sqrt();
+                        inv_std[inst] = istd;
+                        for j in 0..normalized_shape {
+                            normalized[offset + j] = (slice[j] - mean) * istd;
+                        }
+                    }
+                    return Tensor::from_gpu_op(result.0, result.1,
+                        Op::LayerNorm {
+                            input: self.clone(),
+                            gamma: gamma.clone(),
+                            beta: beta.clone(),
+                            normalized,
+                            inv_std,
+                        });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); gamma.sync_gpu_to_cpu(); beta.sync_gpu_to_cpu(); }
         let inner = self.0.borrow();
         let g = gamma.0.borrow();
         let b = beta.0.borrow();
@@ -1176,6 +1581,8 @@ impl Tensor {
     }
 
     pub fn gelu(&self) -> Tensor {
+        // No GPU forward dispatch for GELU (no forward kernel yet — uses CPU path).
+        // Backward will still use gelu_backward_f32 if gpu_grad path is active.
         let inner = self.0.borrow();
         let len = inner.data.len();
         let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
@@ -1200,6 +1607,31 @@ impl Tensor {
     }
 
     pub fn sub(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("sub_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Sub(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
         let a = self.0.borrow();
         let b = other.0.borrow();
         if a.shape == b.shape {
@@ -1222,6 +1654,31 @@ impl Tensor {
     }
 
     pub fn div(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("div_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Div(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
         let a = self.0.borrow();
         let b = other.0.borrow();
         if a.shape == b.shape {
@@ -1244,6 +1701,23 @@ impl Tensor {
     }
 
     pub fn neg(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("neg_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Neg(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_CHEAP {
@@ -1260,6 +1734,23 @@ impl Tensor {
     }
 
     pub fn exp(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("exp_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Exp(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_EXPENSIVE {
@@ -1276,6 +1767,23 @@ impl Tensor {
     }
 
     pub fn log(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("log_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Log(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_EXPENSIVE {
@@ -1289,6 +1797,23 @@ impl Tensor {
     }
 
     pub fn sqrt(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("sqrt_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Sqrt(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_EXPENSIVE {
@@ -1302,6 +1827,23 @@ impl Tensor {
     }
 
     pub fn abs(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("abs_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Abs(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_CHEAP {
@@ -1358,6 +1900,23 @@ impl Tensor {
     }
 
     pub fn tanh(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("tanh_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Tanh(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_EXPENSIVE {
@@ -1375,6 +1934,23 @@ impl Tensor {
 
     /// Scalar mean of all elements (differentiable).
     pub fn mean(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let n = buf.len();
+                    let scalar = gpu.dispatch_reduce("sum_f32", buf) / n as f32;
+                    let out_buf = gpu.upload(&[scalar]);
+                    out_buf
+                }) {
+                    return Tensor::from_gpu_op(result, vec![1], Op::Mean(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let n = inner.data.len();
         let s: f32 = if n >= PAR_THRESHOLD_CHEAP {
@@ -1601,7 +2177,30 @@ impl Tensor {
 
     pub fn backward(&self) {
         let size = self.size();
-        self.0.borrow_mut().grad = Some(vec![1.0; size]);
+
+        #[cfg(feature = "metal")]
+        {
+            // If the loss tensor is GPU-resident, initialize gpu_grad on GPU
+            let is_gpu = self.0.borrow().gpu_data.is_some();
+            if is_gpu {
+                if let Some(grad_buf) = crate::metal::with_gpu(|gpu| {
+                    let buf = gpu.alloc(size);
+                    gpu.dispatch_fill(&buf, 1.0);
+                    buf
+                }) {
+                    self.0.borrow_mut().gpu_grad = Some(grad_buf);
+                } else {
+                    // Fallback to CPU grad
+                    self.0.borrow_mut().grad = Some(vec![1.0; size]);
+                }
+            } else {
+                self.0.borrow_mut().grad = Some(vec![1.0; size]);
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            self.0.borrow_mut().grad = Some(vec![1.0; size]);
+        }
 
         // Topological sort: process each node exactly once, from output to inputs.
         let mut order: Vec<Tensor> = Vec::new();
@@ -1615,6 +2214,27 @@ impl Tensor {
 
     /// Propagate this node's gradient to its op inputs. Non-recursive.
     fn propagate_grad(&self) {
+        // --- GPU backward path ---
+        #[cfg(feature = "metal")]
+        {
+            let has_gpu_grad = self.0.borrow().gpu_grad.is_some();
+            if has_gpu_grad {
+                if self.propagate_grad_gpu() {
+                    return; // GPU backward handled it
+                }
+                // GPU backward couldn't handle this op — sync grad and data to CPU and fall through
+                let mut inner = self.0.borrow_mut();
+                if inner.grad.is_none() {
+                    if let Some(ref buf) = inner.gpu_grad {
+                        inner.grad = Some(buf.read());
+                    }
+                }
+                inner.gpu_grad = None;
+                // Also ensure CPU data is available for the CPU backward path
+                Self::ensure_cpu_data(&mut inner);
+            }
+        }
+
         let (op, grad) = {
             let mut inner = self.0.borrow_mut();
             if matches!(inner.op, Op::None) {
@@ -1626,6 +2246,29 @@ impl Tensor {
             };
             (std::mem::replace(&mut inner.op, Op::None), grad)
         };
+
+        // Ensure input tensors have CPU data for the CPU backward path.
+        // Only needed when metal feature is on and inputs may be GPU-dirty.
+        #[cfg(feature = "metal")]
+        match &op {
+            Op::Mul(a, b) | Op::MatMul(a, b) | Op::Div(a, b) => {
+                a.sync_gpu_to_cpu();
+                b.sync_gpu_to_cpu();
+            }
+            Op::Relu(a) | Op::Gelu(a) | Op::Pow(a, _) | Op::BceLoss(a, _) => {
+                a.sync_gpu_to_cpu();
+            }
+            Op::Conv2d(a, b, c)
+            | Op::Conv2dReluPool { input: a, kernel: b, bias: c, .. } => {
+                a.sync_gpu_to_cpu();
+                b.sync_gpu_to_cpu();
+                c.sync_gpu_to_cpu();
+            }
+            Op::LayerNorm { gamma, .. } => {
+                gamma.sync_gpu_to_cpu();
+            }
+            _ => {}
+        }
 
         match op {
             Op::None => unreachable!(),
@@ -2559,11 +3202,22 @@ impl Tensor {
         if let Some(grad) = inner.grad.take() {
             pool_recycle(grad);
         }
+        #[cfg(feature = "metal")]
+        {
+            inner.gpu_grad = None;
+        }
         inner.op = Op::None;
     }
 
     /// Borrow the gradient slice (None if no gradient accumulated).
     pub fn grad_data(&self) -> Option<Vec<f32>> {
+        #[cfg(feature = "metal")]
+        {
+            let mut inner = self.0.borrow_mut();
+            Self::ensure_cpu_grad(&mut inner);
+            return inner.grad.clone();
+        }
+        #[cfg(not(feature = "metal"))]
         self.0.borrow().grad.clone()
     }
 
@@ -2584,6 +3238,435 @@ impl Tensor {
 
     pub fn requires_grad(&self) -> bool {
         self.0.borrow().requires_grad
+    }
+
+    /// GPU backward pass. Returns true if this op was handled on GPU.
+    #[cfg(feature = "metal")]
+    fn propagate_grad_gpu(&self) -> bool {
+        let op = self.0.borrow().op.clone();
+        if matches!(op, Op::None) {
+            return true; // leaf node — nothing to propagate
+        }
+
+        // Helper: get GPU grad buffer from this node (take it)
+        let gpu_grad = self.0.borrow_mut().gpu_grad.take();
+        let gpu_grad = match gpu_grad {
+            Some(g) => g,
+            None => return false,
+        };
+
+        match op {
+            Op::None => { return true; }
+            Op::Add(ref a, ref b) => {
+                let a_shape = a.shape();
+                let b_shape = b.shape();
+                if a_shape != b_shape {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                // For add: grad passes through to both inputs
+                // Copy the grad buffer for the second input (shared memory = cheap read)
+                let grad_data = gpu_grad.read();
+                if let Some(grad_copy) = crate::metal::with_gpu(|gpu| gpu.upload(&grad_data)) {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(a, gpu_grad);
+                    gpu_accumulate_grad(b, grad_copy);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::MatMul(ref a, ref b) => {
+                // grad_a = grad @ B^T   (grad is [M,N], B is [K,N], grad_a is [M,K])
+                // grad_b = A^T @ grad   (A is [M,K], grad is [M,N], grad_b is [K,N])
+                let a_has_gpu = a.0.borrow().gpu_data.is_some();
+                let b_has_gpu = b.0.borrow().gpu_data.is_some();
+                if !a_has_gpu || !b_has_gpu {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let a_inner = a.0.borrow();
+                    let b_inner = b.0.borrow();
+                    let (m, k) = (a_inner.shape[0], a_inner.shape[1]);
+                    let n = b_inner.shape[1];
+                    let a_buf = a_inner.gpu_data.as_ref().unwrap();
+                    let b_buf = b_inner.gpu_data.as_ref().unwrap();
+
+                    // grad_a = grad[M,N] @ B[K,N]^T = grad[M,N] @ B^T[N,K] -> [M,K]
+                    let grad_a = gpu.alloc(m * k);
+                    gpu.dispatch_matmul(&gpu_grad, b_buf, &grad_a, None,
+                        m as u32, k as u32, n as u32, false, false, true);
+
+                    // grad_b = A[M,K]^T @ grad[M,N] = A^T[K,M] @ grad[M,N] -> [K,N]
+                    let grad_b = gpu.alloc(k * n);
+                    gpu.dispatch_matmul(a_buf, &gpu_grad, &grad_b, None,
+                        k as u32, n as u32, m as u32, false, true, false);
+
+                    drop(a_inner);
+                    drop(b_inner);
+                    (grad_a, grad_b)
+                });
+                if let Some((ga, gb)) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(a, ga);
+                    gpu_accumulate_grad(b, gb);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Relu(ref input) => {
+                let has_gpu = input.0.borrow().gpu_data.is_some();
+                if !has_gpu {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let in_inner = input.0.borrow();
+                    let in_buf = in_inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(in_buf.len());
+                    gpu.dispatch_backward_unary("relu_backward_f32", in_buf, &gpu_grad, &out);
+                    out
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Sigmoid(ref input) => {
+                // sigmoid backward uses the output: grad * s * (1-s)
+                let has_gpu = self.0.borrow().gpu_data.is_some();
+                if !has_gpu {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let self_inner = self.0.borrow();
+                    let out_buf = self_inner.gpu_data.as_ref().unwrap();
+                    let gi = gpu.alloc(out_buf.len());
+                    gpu.dispatch_backward_unary("sigmoid_backward_f32", out_buf, &gpu_grad, &gi);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Tanh(ref input) => {
+                let has_gpu = self.0.borrow().gpu_data.is_some();
+                if !has_gpu {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let self_inner = self.0.borrow();
+                    let out_buf = self_inner.gpu_data.as_ref().unwrap();
+                    let gi = gpu.alloc(out_buf.len());
+                    gpu.dispatch_backward_unary("tanh_backward_f32", out_buf, &gpu_grad, &gi);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Gelu(ref input) => {
+                let has_gpu = input.0.borrow().gpu_data.is_some();
+                if !has_gpu {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let in_inner = input.0.borrow();
+                    let in_buf = in_inner.gpu_data.as_ref().unwrap();
+                    let gi = gpu.alloc(in_buf.len());
+                    gpu.dispatch_backward_unary("gelu_backward_f32", in_buf, &gpu_grad, &gi);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Scale(ref input, s) => {
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let gi = gpu.alloc(gpu_grad.len());
+                    gpu.dispatch_scale(&gpu_grad, &gi, s);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Neg(ref input) => {
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let gi = gpu.alloc(gpu_grad.len());
+                    gpu.dispatch_unary("neg_f32", &gpu_grad, &gi);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Exp(ref input) => {
+                // grad_input = grad * output (exp(x))
+                let has_gpu = self.0.borrow().gpu_data.is_some();
+                if !has_gpu {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let self_inner = self.0.borrow();
+                    let out_buf = self_inner.gpu_data.as_ref().unwrap();
+                    let gi = gpu.alloc(out_buf.len());
+                    gpu.dispatch_binary("mul_f32", &gpu_grad, out_buf, &gi);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Mul(ref a, ref b) => {
+                let a_has_gpu = a.0.borrow().gpu_data.is_some();
+                let b_has_gpu = b.0.borrow().gpu_data.is_some();
+                let same_shape = a.shape() == b.shape();
+                if !a_has_gpu || !b_has_gpu || !same_shape {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let a_inner = a.0.borrow();
+                    let b_inner = b.0.borrow();
+                    let a_buf = a_inner.gpu_data.as_ref().unwrap();
+                    let b_buf = b_inner.gpu_data.as_ref().unwrap();
+                    // grad_a = grad * b, grad_b = grad * a
+                    let ga = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("mul_f32", &gpu_grad, b_buf, &ga);
+                    let gb = gpu.alloc(b_buf.len());
+                    gpu.dispatch_binary("mul_f32", &gpu_grad, a_buf, &gb);
+                    (ga, gb)
+                });
+                if let Some((ga, gb)) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(a, ga);
+                    gpu_accumulate_grad(b, gb);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Sub(ref a, ref b) => {
+                let same_shape = a.shape() == b.shape();
+                if !same_shape {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let neg = gpu.alloc(gpu_grad.len());
+                    gpu.dispatch_unary("neg_f32", &gpu_grad, &neg);
+                    neg
+                });
+                if let Some(neg_grad) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(a, gpu_grad);
+                    gpu_accumulate_grad(b, neg_grad);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Sum(ref input) => {
+                // grad_input = broadcast scalar grad to all elements
+                let n = input.size();
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let gi = gpu.alloc(n);
+                    // Read scalar grad value
+                    let grad_val = gpu_grad.read()[0];
+                    gpu.dispatch_fill(&gi, grad_val);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Mean(ref input) => {
+                let n = input.size();
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let gi = gpu.alloc(n);
+                    let grad_val = gpu_grad.read()[0] / n as f32;
+                    gpu.dispatch_fill(&gi, grad_val);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Softmax { ref input, ref output_data, dim } => {
+                // Use GPU softmax backward if 2D and last dim
+                let in_shape = input.shape();
+                let is_2d_last = in_shape.len() == 2 && dim == in_shape.len() - 1;
+                if !is_2d_last {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let softmax_buf = gpu.upload(output_data);
+                    let gi = gpu.alloc(gpu_grad.len());
+                    let batch = in_shape[0] as u32;
+                    let dim_size = in_shape[1] as u32;
+                    gpu.dispatch_softmax_backward(&softmax_buf, &gpu_grad, &gi, batch, dim_size);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::LayerNorm { ref input, ref gamma, ref beta, ref normalized, ref inv_std } => {
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let g_inner = gamma.0.borrow();
+                    let normalized_shape = g_inner.data.len();
+                    let gamma_buf = if let Some(ref gb) = g_inner.gpu_data {
+                        // Use existing GPU buffer — but we need the data for the kernel
+                        // For layernorm backward we need gamma values on GPU
+                        gb.read() // just use the data directly
+                    } else {
+                        g_inner.data.clone()
+                    };
+                    drop(g_inner);
+                    let total = gpu_grad.len();
+                    let num_instances = total / normalized_shape;
+
+                    // Upload normalized and inv_std to GPU
+                    let norm_buf = gpu.upload(normalized);
+                    let gamma_gpu = gpu.upload(&gamma_buf);
+                    let inv_std_buf = gpu.upload(inv_std);
+                    let gi = gpu.alloc(total);
+                    let grad_gamma = gpu.alloc(normalized_shape);
+                    let grad_beta = gpu.alloc(normalized_shape);
+                    // Zero out grad_gamma and grad_beta
+                    gpu.dispatch_fill(&grad_gamma, 0.0);
+                    gpu.dispatch_fill(&grad_beta, 0.0);
+
+                    gpu.dispatch_layernorm_backward(
+                        &gpu_grad, &norm_buf, &gamma_gpu, &inv_std_buf,
+                        &gi, &grad_gamma, &grad_beta,
+                        num_instances as u32, normalized_shape as u32,
+                    );
+                    (gi, grad_gamma, grad_beta)
+                });
+                if let Some((gi, gg, gb)) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                    // For gamma/beta, sync back to CPU grad since they're typically small
+                    accumulate_grad(gamma, &gg.read());
+                    accumulate_grad(beta, &gb.read());
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::AddBias(ref input, ref bias) => {
+                // input grad = grad (pass-through)
+                // bias grad = sum over rows
+                let bias_inner = bias.0.borrow();
+                let cols = bias_inner.shape[1];
+                let rows = input.0.borrow().shape[0];
+                drop(bias_inner);
+                // Read grad and compute bias grad on CPU (it's small)
+                let grad_data = gpu_grad.read();
+                let mut grad_bias = vec![0.0f32; cols];
+                for r in 0..rows {
+                    for c in 0..cols {
+                        grad_bias[c] += grad_data[r * cols + c];
+                    }
+                }
+                self.0.borrow_mut().op = Op::None;
+                gpu_accumulate_grad(input, gpu_grad);
+                accumulate_grad(bias, &grad_bias);
+            }
+            Op::Transpose { ref input, dim0, dim1 } => {
+                if dim0 == dim1 {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gpu_grad);
+                } else {
+                    // For 2D transpose, transposing the gradient reverses the transpose
+                    let in_shape = input.shape();
+                    if in_shape.len() == 2 {
+                        let handled = crate::metal::with_gpu(|gpu| {
+                            // self shape is transposed: [cols, rows] -> input shape is [rows, cols]
+                            let gi = gpu.alloc(gpu_grad.len());
+                            let rows = in_shape[0] as u32;
+                            let cols = in_shape[1] as u32;
+                            // Grad is in transposed shape [cols, rows], we need to transpose back
+                            gpu.dispatch_transpose(&gpu_grad, &gi, cols, rows);
+                            gi
+                        });
+                        if let Some(gi) = handled {
+                            self.0.borrow_mut().op = Op::None;
+                            gpu_accumulate_grad(input, gi);
+                        } else {
+                            self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                            return false;
+                        }
+                    } else {
+                        self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                        return false;
+                    }
+                }
+            }
+            Op::Flatten { ref input, .. } | Op::Reshape { ref input, .. }
+            | Op::Squeeze { ref input, .. } | Op::Unsqueeze { ref input, .. } => {
+                // These are shape-only ops, gradient passes through
+                self.0.borrow_mut().op = Op::None;
+                gpu_accumulate_grad(input, gpu_grad);
+            }
+            _ => {
+                // For any other ops, fall back to CPU
+                self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                return false;
+            }
+        }
+
+        // Clear the op on the node
+        self.0.borrow_mut().op = Op::None;
+        true
     }
 }
 
@@ -2613,6 +3696,25 @@ fn accumulate_grad(tensor: &Tensor, grad: &[f32]) {
             let mut buf = pool_get(grad.len());
             buf.copy_from_slice(grad);
             inner.grad = Some(buf);
+        }
+    }
+}
+
+/// GPU-resident gradient accumulation: accumulate a GPU buffer into the tensor's gpu_grad.
+#[cfg(feature = "metal")]
+fn gpu_accumulate_grad(tensor: &Tensor, grad_buf: crate::metal::GpuBuffer<f32>) {
+    let mut inner = tensor.0.borrow_mut();
+    if !inner.requires_grad {
+        return;
+    }
+    match inner.gpu_grad {
+        Some(ref existing) => {
+            crate::metal::with_gpu(|gpu| {
+                gpu.dispatch_accumulate(existing, &grad_buf);
+            });
+        }
+        None => {
+            inner.gpu_grad = Some(grad_buf);
         }
     }
 }

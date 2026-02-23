@@ -151,6 +151,8 @@ struct MatmulParams {
     uint K;
     uint fuse_bias;   // 0 = no bias, 1 = add bias
     uint fuse_relu;   // 0 = no relu, 1 = relu
+    uint trans_a;     // 0 = no transpose, 1 = transpose A
+    uint trans_b;     // 0 = no transpose, 1 = transpose B
 };
 
 kernel void matmul_f32(
@@ -167,7 +169,13 @@ kernel void matmul_f32(
 
     float sum = 0.0f;
     for (uint k = 0; k < p.K; k++) {
-        sum += A[row * p.K + k] * B[k * p.N + col];
+        // A indexing: if trans_a, A is stored as [K,M] and we read A[k,row]
+        // otherwise A is [M,K] and we read A[row,k]
+        uint a_idx = p.trans_a ? (k * p.M + row) : (row * p.K + k);
+        // B indexing: if trans_b, B is stored as [N,K] and we read B[col,k]
+        // otherwise B is [K,N] and we read B[k,col]
+        uint b_idx = p.trans_b ? (col * p.K + k) : (k * p.N + col);
+        sum += A[a_idx] * B[b_idx];
     }
     if (p.fuse_bias) {
         sum += bias[col];
@@ -420,5 +428,242 @@ kernel void layernorm_f32(
     for (uint i = lid; i < p.dim; i += group_size) {
         row_out[i] = gamma[i] * (row_in[i] - mean) * inv_std + beta[i];
     }
+}
+
+// ---------------------------------------------------------------------------
+// Backward kernels
+// ---------------------------------------------------------------------------
+
+// ReLU backward: out = (input > 0) ? grad : 0
+kernel void relu_backward_f32(
+    device const float* input   [[buffer(0)]],
+    device const float* grad    [[buffer(1)]],
+    device float* out           [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (input[idx] > 0.0f) ? grad[idx] : 0.0f;
+}
+
+// Sigmoid backward: out = grad * s * (1 - s), where s = sigmoid output
+kernel void sigmoid_backward_f32(
+    device const float* sigmoid_out [[buffer(0)]],
+    device const float* grad        [[buffer(1)]],
+    device float* out               [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float s = sigmoid_out[idx];
+    out[idx] = grad[idx] * s * (1.0f - s);
+}
+
+// Tanh backward: out = grad * (1 - y*y), where y = tanh output
+kernel void tanh_backward_f32(
+    device const float* tanh_out [[buffer(0)]],
+    device const float* grad     [[buffer(1)]],
+    device float* out            [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float y = tanh_out[idx];
+    out[idx] = grad[idx] * (1.0f - y * y);
+}
+
+// GELU backward: full derivative of GELU(x) = 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
+kernel void gelu_backward_f32(
+    device const float* input   [[buffer(0)]],
+    device const float* grad    [[buffer(1)]],
+    device float* out           [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float x = input[idx];
+    float x3 = x * x * x;
+    float sqrt_2_over_pi = 0.7978845608f; // sqrt(2/pi)
+    float inner_val = sqrt_2_over_pi * (x + 0.044715f * x3);
+    float tanh_val = tanh(inner_val);
+    float sech2 = 1.0f - tanh_val * tanh_val;
+    float d_inner = sqrt_2_over_pi * (1.0f + 3.0f * 0.044715f * x * x);
+    out[idx] = grad[idx] * (0.5f * (1.0f + tanh_val) + 0.5f * x * sech2 * d_inner);
+}
+
+// Accumulate in-place: a[i] += b[i]
+kernel void accumulate_f32(
+    device float* a             [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    a[idx] += b[idx];
+}
+
+// Fill buffer with scalar value
+kernel void fill_f32(
+    device float* out           [[buffer(0)]],
+    constant float& value       [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = value;
+}
+
+// Softmax backward: grad_input = y * (grad - dot(grad, y)) per row
+// One threadgroup per row, same as forward softmax
+kernel void softmax_backward_f32(
+    device const float* softmax_out [[buffer(0)]],
+    device const float* grad        [[buffer(1)]],
+    device float* grad_input        [[buffer(2)]],
+    constant SoftmaxParams& p       [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    uint row = gid;
+    if (row >= p.batch) return;
+
+    device const float* y = softmax_out + row * p.dim;
+    device const float* g = grad + row * p.dim;
+    device float* gi = grad_input + row * p.dim;
+
+    threadgroup float shared[256];
+
+    // Compute dot(grad, y) for this row
+    float local_dot = 0.0f;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        local_dot += g[i] * y[i];
+    }
+    shared[lid] = local_dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride && lid + stride < group_size) {
+            shared[lid] += shared[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float dot_val = shared[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // grad_input[i] = y[i] * (grad[i] - dot)
+    for (uint i = lid; i < p.dim; i += group_size) {
+        gi[i] = y[i] * (g[i] - dot_val);
+    }
+}
+
+// LayerNorm backward: compute grad_input, grad_gamma, grad_beta
+// One threadgroup per instance (row). Outputs to 3 buffers.
+struct LayerNormBackwardParams {
+    uint batch;
+    uint dim;
+};
+
+kernel void layernorm_backward_f32(
+    device const float* grad_out    [[buffer(0)]],
+    device const float* normalized  [[buffer(1)]],
+    device const float* gamma       [[buffer(2)]],
+    device const float* inv_std_buf [[buffer(3)]],
+    device float* grad_input        [[buffer(4)]],
+    device float* grad_gamma        [[buffer(5)]],
+    device float* grad_beta         [[buffer(6)]],
+    constant LayerNormBackwardParams& p [[buffer(7)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    uint row = gid;
+    if (row >= p.batch) return;
+
+    uint offset = row * p.dim;
+    float istd = inv_std_buf[row];
+
+    threadgroup float shared_dy[256];
+    threadgroup float shared_dy_xhat[256];
+
+    // Accumulate grad_gamma, grad_beta and compute mean_dy, mean_dy_xhat
+    float local_dy = 0.0f;
+    float local_dy_xhat = 0.0f;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        uint idx = offset + i;
+        float g = grad_out[idx];
+        float xhat = normalized[idx];
+        // Atomically add to grad_gamma/grad_beta (coarse but correct)
+        // For better perf we'd reduce per-row then sum, but this is simpler
+        float dy = g * gamma[i];
+        local_dy += dy;
+        local_dy_xhat += dy * xhat;
+    }
+
+    // Reduce mean_dy
+    shared_dy[lid] = local_dy;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride && lid + stride < group_size) {
+            shared_dy[lid] += shared_dy[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean_dy = shared_dy[0] / float(p.dim);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce mean_dy_xhat
+    shared_dy_xhat[lid] = local_dy_xhat;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride && lid + stride < group_size) {
+            shared_dy_xhat[lid] += shared_dy_xhat[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean_dy_xhat = shared_dy_xhat[0] / float(p.dim);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write grad_input and accumulate grad_gamma/grad_beta
+    for (uint i = lid; i < p.dim; i += group_size) {
+        uint idx = offset + i;
+        float g = grad_out[idx];
+        float xhat = normalized[idx];
+        float dy = g * gamma[i];
+        grad_input[idx] = istd * (dy - mean_dy - xhat * mean_dy_xhat);
+        // Atomic add for grad_gamma/grad_beta (multiple rows write to same gamma index)
+        // Use atomic_fetch_add for device memory
+        atomic_fetch_add_explicit((device atomic_float*)&grad_gamma[i], g * xhat, memory_order_relaxed);
+        atomic_fetch_add_explicit((device atomic_float*)&grad_beta[i], g, memory_order_relaxed);
+    }
+}
+
+// Fused Adam optimizer step
+struct AdamParams {
+    float lr;
+    float beta1;
+    float beta2;
+    float eps;
+    float bc1;          // 1 - beta1^t
+    float bc2;          // 1 - beta2^t
+    float weight_decay;
+    uint  decoupled_wd; // 0 = L2, 1 = AdamW
+};
+
+kernel void adam_step_f32(
+    device float* data      [[buffer(0)]],
+    device const float* grad [[buffer(1)]],
+    device float* m         [[buffer(2)]],
+    device float* v         [[buffer(3)]],
+    constant AdamParams& p  [[buffer(4)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float g = grad[idx];
+
+    // L2 regularization (classic Adam)
+    if (p.weight_decay > 0.0f && p.decoupled_wd == 0) {
+        g += p.weight_decay * data[idx];
+    }
+
+    // Update moments
+    m[idx] = p.beta1 * m[idx] + (1.0f - p.beta1) * g;
+    v[idx] = p.beta2 * v[idx] + (1.0f - p.beta2) * g * g;
+
+    // Bias-corrected estimates
+    float m_hat = m[idx] / p.bc1;
+    float v_hat = v[idx] / p.bc2;
+
+    // Decoupled weight decay (AdamW)
+    if (p.decoupled_wd != 0 && p.weight_decay > 0.0f) {
+        data[idx] -= p.lr * p.weight_decay * data[idx];
+    }
+
+    data[idx] -= p.lr * m_hat / (sqrt(v_hat) + p.eps);
 }
 "#;
