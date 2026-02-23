@@ -101,6 +101,17 @@ pub enum Op {
         inv_std: Vec<f32>,
     },
     Gelu(Tensor),
+    Sub(Tensor, Tensor),
+    Div(Tensor, Tensor),
+    Neg(Tensor),
+    Exp(Tensor),
+    Log(Tensor),
+    Sqrt(Tensor),
+    Abs(Tensor),
+    Pow(Tensor, f32),   // tensor raised to scalar power
+    Sin(Tensor),
+    Cos(Tensor),
+    Tanh(Tensor),
     Concat {
         inputs: Vec<Tensor>,
         split_sizes: Vec<usize>,
@@ -890,6 +901,121 @@ impl Tensor {
         Tensor::from_op(data, inner.shape.clone(), Op::Gelu(self.clone()))
     }
 
+    pub fn sub(&self, other: &Tensor) -> Tensor {
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "shapes must match for sub");
+        let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
+            a.data.par_iter().zip(&b.data).map(|(x, y)| x - y).collect()
+        } else {
+            a.data.iter().zip(&b.data).map(|(x, y)| x - y).collect()
+        };
+        Tensor::from_op(data, a.shape.clone(), Op::Sub(self.clone(), other.clone()))
+    }
+
+    pub fn div(&self, other: &Tensor) -> Tensor {
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "shapes must match for div");
+        let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
+            a.data.par_iter().zip(&b.data).map(|(x, y)| x / y).collect()
+        } else {
+            a.data.iter().zip(&b.data).map(|(x, y)| x / y).collect()
+        };
+        Tensor::from_op(data, a.shape.clone(), Op::Div(self.clone(), other.clone()))
+    }
+
+    pub fn neg(&self) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| -x).collect()
+        } else {
+            inner.data.iter().map(|&x| -x).collect()
+        };
+        Tensor::from_op(data, inner.shape.clone(), Op::Neg(self.clone()))
+    }
+
+    pub fn exp(&self) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x.exp()).collect()
+        } else {
+            inner.data.iter().map(|&x| x.exp()).collect()
+        };
+        Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
+    }
+
+    pub fn log(&self) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x.ln()).collect()
+        } else {
+            inner.data.iter().map(|&x| x.ln()).collect()
+        };
+        Tensor::from_op(data, inner.shape.clone(), Op::Log(self.clone()))
+    }
+
+    pub fn sqrt(&self) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x.sqrt()).collect()
+        } else {
+            inner.data.iter().map(|&x| x.sqrt()).collect()
+        };
+        Tensor::from_op(data, inner.shape.clone(), Op::Sqrt(self.clone()))
+    }
+
+    pub fn abs(&self) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x.abs()).collect()
+        } else {
+            inner.data.iter().map(|&x| x.abs()).collect()
+        };
+        Tensor::from_op(data, inner.shape.clone(), Op::Abs(self.clone()))
+    }
+
+    /// Raise each element to a scalar power: x^p
+    pub fn pow(&self, p: f32) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x.powf(p)).collect()
+        } else {
+            inner.data.iter().map(|&x| x.powf(p)).collect()
+        };
+        Tensor::from_op(data, inner.shape.clone(), Op::Pow(self.clone(), p))
+    }
+
+    pub fn sin(&self) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x.sin()).collect()
+        } else {
+            inner.data.iter().map(|&x| x.sin()).collect()
+        };
+        Tensor::from_op(data, inner.shape.clone(), Op::Sin(self.clone()))
+    }
+
+    pub fn cos(&self) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x.cos()).collect()
+        } else {
+            inner.data.iter().map(|&x| x.cos()).collect()
+        };
+        Tensor::from_op(data, inner.shape.clone(), Op::Cos(self.clone()))
+    }
+
+    pub fn tanh(&self) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = if inner.data.len() >= PAR_THRESHOLD {
+            inner.data.par_iter().map(|&x| x.tanh()).collect()
+        } else {
+            inner.data.iter().map(|&x| x.tanh()).collect()
+        };
+        Tensor::from_op(data, inner.shape.clone(), Op::Tanh(self.clone()))
+    }
+
     pub fn concat(tensors: &[&Tensor], dim: usize) -> Tensor {
         assert!(!tensors.is_empty(), "concat requires at least one tensor");
         let first_shape = tensors[0].shape();
@@ -1013,9 +1139,12 @@ impl Tensor {
             match op {
                 Op::None => vec![],
                 Op::Add(a, b) | Op::Mul(a, b) | Op::MatMul(a, b)
-                | Op::AddBias(a, b) => vec![a, b],
+                | Op::AddBias(a, b) | Op::Sub(a, b) | Op::Div(a, b) => vec![a, b],
                 Op::Relu(a) | Op::Sigmoid(a) | Op::Sum(a)
-                | Op::Scale(a, _) | Op::Select(a, _) | Op::BceLoss(a, _) => vec![a],
+                | Op::Scale(a, _) | Op::Select(a, _) | Op::BceLoss(a, _)
+                | Op::Neg(a) | Op::Exp(a) | Op::Log(a) | Op::Sqrt(a)
+                | Op::Abs(a) | Op::Pow(a, _) | Op::Sin(a) | Op::Cos(a)
+                | Op::Tanh(a) => vec![a],
                 Op::Conv2d(a, b, c) => vec![a, b, c],
                 Op::Conv2dReluPool { input, kernel, bias, .. } => vec![input, kernel, bias],
                 Op::MaxPool2d { input, .. } | Op::Flatten { input, .. }
@@ -1590,6 +1719,140 @@ impl Tensor {
                 accumulate_grad(gamma, &grad_gamma);
                 accumulate_grad(beta, &grad_beta);
             }
+            Op::Sub(ref a, ref b) => {
+                accumulate_grad(a, &grad);
+                let neg_grad: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().map(|g| -g).collect()
+                } else {
+                    grad.iter().map(|g| -g).collect()
+                };
+                accumulate_grad(b, &neg_grad);
+            }
+            Op::Div(ref a, ref b) => {
+                let a_inner = a.0.borrow();
+                let b_inner = b.0.borrow();
+                let (grad_a, grad_b) = if grad.len() >= PAR_THRESHOLD {
+                    let ga: Vec<f32> = grad.par_iter().zip(b_inner.data.par_iter())
+                        .map(|(g, bv)| g / bv).collect();
+                    let gb: Vec<f32> = grad.par_iter().zip(a_inner.data.par_iter().zip(b_inner.data.par_iter()))
+                        .map(|(g, (av, bv))| -g * av / (bv * bv)).collect();
+                    (ga, gb)
+                } else {
+                    let ga: Vec<f32> = grad.iter().zip(&b_inner.data)
+                        .map(|(g, bv)| g / bv).collect();
+                    let gb: Vec<f32> = grad.iter().zip(a_inner.data.iter().zip(&b_inner.data))
+                        .map(|(g, (av, bv))| -g * av / (bv * bv)).collect();
+                    (ga, gb)
+                };
+                drop(a_inner);
+                drop(b_inner);
+                accumulate_grad(a, &grad_a);
+                accumulate_grad(b, &grad_b);
+            }
+            Op::Neg(ref input) => {
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().map(|g| -g).collect()
+                } else {
+                    grad.iter().map(|g| -g).collect()
+                };
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Exp(ref input) => {
+                let self_inner = self.0.borrow();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().zip(self_inner.data.par_iter())
+                        .map(|(g, &y)| g * y).collect()
+                } else {
+                    grad.iter().zip(&self_inner.data)
+                        .map(|(g, &y)| g * y).collect()
+                };
+                drop(self_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Log(ref input) => {
+                let in_inner = input.0.borrow();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g / x).collect()
+                } else {
+                    grad.iter().zip(&in_inner.data)
+                        .map(|(g, &x)| g / x).collect()
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Sqrt(ref input) => {
+                let self_inner = self.0.borrow();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().zip(self_inner.data.par_iter())
+                        .map(|(g, &y)| g / (2.0 * y)).collect()
+                } else {
+                    grad.iter().zip(&self_inner.data)
+                        .map(|(g, &y)| g / (2.0 * y)).collect()
+                };
+                drop(self_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Abs(ref input) => {
+                let in_inner = input.0.borrow();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| if x >= 0.0 { *g } else { -g }).collect()
+                } else {
+                    grad.iter().zip(&in_inner.data)
+                        .map(|(g, &x)| if x >= 0.0 { *g } else { -g }).collect()
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Pow(ref input, p) => {
+                let in_inner = input.0.borrow();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g * p * x.powf(p - 1.0)).collect()
+                } else {
+                    grad.iter().zip(&in_inner.data)
+                        .map(|(g, &x)| g * p * x.powf(p - 1.0)).collect()
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Sin(ref input) => {
+                let in_inner = input.0.borrow();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g * x.cos()).collect()
+                } else {
+                    grad.iter().zip(&in_inner.data)
+                        .map(|(g, &x)| g * x.cos()).collect()
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Cos(ref input) => {
+                let in_inner = input.0.borrow();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| -g * x.sin()).collect()
+                } else {
+                    grad.iter().zip(&in_inner.data)
+                        .map(|(g, &x)| -g * x.sin()).collect()
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Tanh(ref input) => {
+                let self_inner = self.0.borrow();
+                let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
+                    grad.par_iter().zip(self_inner.data.par_iter())
+                        .map(|(g, &y)| g * (1.0 - y * y)).collect()
+                } else {
+                    grad.iter().zip(&self_inner.data)
+                        .map(|(g, &y)| g * (1.0 - y * y)).collect()
+                };
+                drop(self_inner);
+                accumulate_grad(input, &grad_input);
+            }
             Op::Gelu(ref input) => {
                 let in_inner = input.0.borrow();
                 let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
@@ -1880,6 +2143,155 @@ mod tests {
         loss.backward();
         assert!(a.grad().is_some());
         assert!(b.grad().is_some());
+    }
+
+    #[test]
+    fn test_sub() {
+        let a = Tensor::new(vec![3.0, 5.0, 7.0], vec![3], true);
+        let b = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], true);
+        let c = a.sub(&b);
+        assert_eq!(c.data(), vec![2.0, 3.0, 4.0]);
+        let loss = c.sum();
+        loss.backward();
+        assert_eq!(a.grad().unwrap(), vec![1.0, 1.0, 1.0]);
+        assert_eq!(b.grad().unwrap(), vec![-1.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn test_div() {
+        let a = Tensor::new(vec![6.0, 8.0], vec![2], true);
+        let b = Tensor::new(vec![2.0, 4.0], vec![2], true);
+        let c = a.div(&b);
+        assert_eq!(c.data(), vec![3.0, 2.0]);
+        let loss = c.sum();
+        loss.backward();
+        // grad_a = 1/b = [0.5, 0.25]
+        let ga = a.grad().unwrap();
+        assert!((ga[0] - 0.5).abs() < 1e-5);
+        assert!((ga[1] - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_neg() {
+        let a = Tensor::new(vec![1.0, -2.0, 3.0], vec![3], true);
+        let b = a.neg();
+        assert_eq!(b.data(), vec![-1.0, 2.0, -3.0]);
+        let loss = b.sum();
+        loss.backward();
+        assert_eq!(a.grad().unwrap(), vec![-1.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn test_exp_log() {
+        let a = Tensor::new(vec![0.0, 1.0, 2.0], vec![3], true);
+        let b = a.exp();
+        let data = b.data();
+        assert!((data[0] - 1.0).abs() < 1e-5);
+        assert!((data[1] - std::f32::consts::E).abs() < 1e-4);
+        // log(exp(x)) = x
+        let c = b.log();
+        let roundtrip = c.data();
+        for (i, &v) in roundtrip.iter().enumerate() {
+            assert!((v - a.data()[i]).abs() < 1e-5, "log(exp(x)) should equal x");
+        }
+    }
+
+    #[test]
+    fn test_sqrt() {
+        let a = Tensor::new(vec![4.0, 9.0, 16.0], vec![3], true);
+        let b = a.sqrt();
+        assert_eq!(b.data(), vec![2.0, 3.0, 4.0]);
+        let loss = b.sum();
+        loss.backward();
+        // grad = 1 / (2*sqrt(x)) = [0.25, 1/6, 0.125]
+        let ga = a.grad().unwrap();
+        assert!((ga[0] - 0.25).abs() < 1e-5);
+        assert!((ga[2] - 0.125).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_pow() {
+        let a = Tensor::new(vec![2.0, 3.0], vec![2], true);
+        let b = a.pow(3.0);
+        assert_eq!(b.data(), vec![8.0, 27.0]);
+        let loss = b.sum();
+        loss.backward();
+        // grad = 3 * x^2 = [12, 27]
+        let ga = a.grad().unwrap();
+        assert!((ga[0] - 12.0).abs() < 1e-4);
+        assert!((ga[1] - 27.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_sin_cos() {
+        let a = Tensor::new(vec![0.0, std::f32::consts::FRAC_PI_2], vec![2], true);
+        let s = a.sin();
+        let sd = s.data();
+        assert!((sd[0]).abs() < 1e-5, "sin(0) = 0");
+        assert!((sd[1] - 1.0).abs() < 1e-5, "sin(pi/2) = 1");
+
+        let c = a.cos();
+        let cd = c.data();
+        assert!((cd[0] - 1.0).abs() < 1e-5, "cos(0) = 1");
+        assert!((cd[1]).abs() < 1e-5, "cos(pi/2) = 0");
+    }
+
+    #[test]
+    fn test_tanh() {
+        let a = Tensor::new(vec![0.0, 1.0, -1.0], vec![3], true);
+        let b = a.tanh();
+        let data = b.data();
+        assert!((data[0]).abs() < 1e-5, "tanh(0) = 0");
+        assert!((data[1] - 1.0_f32.tanh()).abs() < 1e-5);
+        let loss = b.sum();
+        loss.backward();
+        // grad = 1 - tanh^2(x)
+        let ga = a.grad().unwrap();
+        assert!((ga[0] - 1.0).abs() < 1e-5, "tanh'(0) = 1");
+    }
+
+    #[test]
+    fn test_abs() {
+        let a = Tensor::new(vec![-3.0, 0.0, 5.0], vec![3], true);
+        let b = a.abs();
+        assert_eq!(b.data(), vec![3.0, 0.0, 5.0]);
+        let loss = b.sum();
+        loss.backward();
+        let ga = a.grad().unwrap();
+        assert_eq!(ga, vec![-1.0, 1.0, 1.0]); // sign function (0 maps to +1)
+    }
+
+    /// Finite difference gradient check for all unary ops
+    #[test]
+    fn test_unary_ops_finite_diff() {
+        let eps = 1e-3f32;
+        let x_val = 1.5f32;
+
+        let ops: Vec<(&str, Box<dyn Fn(&Tensor) -> Tensor>, Box<dyn Fn(f32) -> f32>)> = vec![
+            ("exp", Box::new(|t: &Tensor| t.exp()), Box::new(|x: f32| x.exp())),
+            ("log", Box::new(|t: &Tensor| t.log()), Box::new(|x: f32| x.ln())),
+            ("sqrt", Box::new(|t: &Tensor| t.sqrt()), Box::new(|x: f32| x.sqrt())),
+            ("sin", Box::new(|t: &Tensor| t.sin()), Box::new(|x: f32| x.sin())),
+            ("cos", Box::new(|t: &Tensor| t.cos()), Box::new(|x: f32| x.cos())),
+            ("tanh", Box::new(|t: &Tensor| t.tanh()), Box::new(|x: f32| x.tanh())),
+            ("neg", Box::new(|t: &Tensor| t.neg()), Box::new(|x: f32| -x)),
+        ];
+
+        for (name, tensor_op, scalar_op) in &ops {
+            let x = Tensor::new(vec![x_val], vec![1], true);
+            let y = tensor_op(&x);
+            let loss = y.sum();
+            loss.backward();
+            let analytical = x.grad().unwrap()[0];
+
+            let numerical = (scalar_op(x_val + eps) - scalar_op(x_val - eps)) / (2.0 * eps);
+            let diff = (analytical - numerical).abs();
+            assert!(
+                diff < 0.01,
+                "{}: analytical={}, numerical={}, diff={}",
+                name, analytical, numerical, diff
+            );
+        }
     }
 
     #[test]
