@@ -1,56 +1,85 @@
 # Changelog
 
+All notable changes to Peregrine are documented here.
+Benchmark numbers included for performance-related changes.
+
+**Hardware:** Apple Silicon (M-series), macOS, f32 precision
+
+---
+
+## [0.5.0] - 2026-02-22
+
+### Added — Metal GPU Backend (`--features metal`)
+- objc2-metal FFI foundation with safe Rust wrappers (GpuContext, GpuBuffer)
+- 21 Metal compute shaders: add, sub, mul, div, neg, exp, log, sqrt, relu, sigmoid, tanh, sin, cos, abs, scale, matmul (fused bias+relu), sum, max, min, softmax, transpose, layernorm
+- 35 GPU tests (12 basics + 23 CPU vs Metal parity)
+
+| Operation | CPU | GPU | Speedup |
+|-----------|-----|-----|---------|
+| matmul 1024x1024 | 1.07 ms | 3.49 ms | CPU 3.3x (BLAS) |
+| add 1M elements | 1.04 ms | 306 µs | GPU 3.4x |
+| mul 1M elements | 1.17 ms | 294 µs | GPU 4.0x |
+| exp 1M elements | 1.32 ms | 284 µs | GPU 4.6x |
+
+### Added — Numerically stable log_softmax
+- `x - max - log(sum(exp(x - max)))` with backward pass
+- Fixes NaN crash in cross_entropy_loss after many epochs
+
+### Added — MNIST end-to-end example
+- MLP (784→128→64→10), Adam optimizer, 10 epochs, 97.5% test accuracy
+
+### Added — PyTorch numerical parity (23 tests)
+- Cross-validates matmul, softmax, log_softmax, layernorm, cross_entropy, 14 element-wise ops, Adam step, and full 10-step MLP training
+- All within 1e-4 to 1e-7 absolute error
+
+### Added — Criterion benchmark suite
+- `cargo bench` / `cargo bench --features metal`
+- Covers matmul, element-wise, softmax, MLP forward, training step
+
+| Operation | Time |
+|-----------|------|
+| MLP forward batch=64 | 186 µs |
+| Training step (fwd+bwd+Adam) batch=64 | ~3 ms |
+
 ## [0.4.0] - 2026-02-20
 
+### Added — Core tensor ops and training infrastructure
+- 11 element-wise ops with autograd: sub, div, neg, exp, log, sqrt, abs, pow, sin, cos, tanh
+- Reduction/shape ops: mean, squeeze, unsqueeze, max, min, argmax, argmin
+- Creation ops: ones, full, arange, linspace, eye
+- NumPy-style broadcasting for add, sub, mul, div
+- Neural network layers: Linear, Embedding, CrossEntropyLoss, MSELoss
+- Optimizers: SGD (momentum, Nesterov, weight decay), Adam, AdamW
+- LR schedulers: StepLR, CosineAnnealing, Warmup
+- Gradient clipping (by norm and by value)
+
 ### Changed
-- Restructured as `peregrine` library crate. Tensor and nn modules are now a reusable library; RT-DETR moved to examples.
-- Dropped dead YOLO code from detection.rs
-- Moved image/serde/tensorboard deps to dev-dependencies (only needed by examples)
+- Restructured as `peregrine` library crate. RT-DETR moved to examples.
+- Dropped dead YOLO code
 
 ## [0.3.0] - 2026-02-20
 
 ### Added
-- RT-DETR (Real-Time DEtection TRansformer) architecture: multi-head attention, transformer encoder/decoder, ResNet backbone, learned object queries
+- RT-DETR architecture: multi-head attention, transformer encoder/decoder, ResNet backbone, learned object queries
 - Hungarian matching and set-based loss for end-to-end detection training
-- RT-DETR decode and NMS for inference
-- Global gradient clipping (max norm = 1.0) to prevent training divergence
+- Global gradient clipping (max norm = 1.0)
 
 ### Changed
-- Xavier fan-in weight initialization (`std = sqrt(1/fan_in)`) instead of fixed `std = 0.1` — fixes NaN loss from activation/gradient explosion in deep networks
-- Reduced `INPUT_SIZE` from 416 to 256 for RT-DETR, cutting backbone computation ~4x
-- Multi-scale feature pooling to common 32x32 before transformer encoder (3,072 tokens vs 56,784), reducing attention memory from ~52 GB to ~150 MB
-- Eliminated redundant forward pass during training logging — reuse training outputs for detection overlay
+- Xavier fan-in weight initialization — fixes NaN loss in deep networks
+- Multi-scale feature pooling (3,072 tokens vs 56,784), reducing attention memory from ~52 GB to ~150 MB
 
 ## [0.2.0] - 2026-02-20
 
 ### Performance
-- BLAS acceleration via Apple Accelerate framework (macOS) for conv2d (1x1 fast path) and matmul, both forward and backward
-- Rayon parallelism for element-wise ops (add, mul, relu, sigmoid, scale, sum, add_bias) and their backward passes, with 10k-element threshold
-- Clone elimination in backward pass: `std::mem::replace` to take op ownership instead of cloning, direct `RefCell` borrows instead of `.data()`/`.shape()` which cloned entire Vecs
-
-### Added
-- Per-epoch timing in training loop
-- Non-macOS fallback for all BLAS-accelerated paths
+- BLAS acceleration via Apple Accelerate (matmul, conv2d 1x1)
+- Rayon parallelism for element-wise ops (>10k threshold)
+- Clone elimination in backward pass
 
 ## [0.1.0] - 2026-02-18
 
 ### Added
-- Tensor type with N-dimensional storage, shape tracking, and shared ownership
-- Reverse-mode autograd engine with computational graph
-- Forward and backward for: `add`, `mul`, `matmul`, `relu`, `sigmoid`, `sum`, `scale`, `add_bias`
+- Tensor with N-dimensional storage and shared ownership
+- Reverse-mode autograd engine
+- Forward/backward: add, mul, matmul, relu, sigmoid, sum, scale, add_bias
 - SGD optimizer
-- Object detection demo with synthetic 8x8 image data
-- Three-class detection (car, person, dog) with bounding box + confidence + class prediction
-- ASCII bounding box visualization and IoU scoring
-- Learning rate scheduling (warmup → decay)
-
-## Roadmap
-
-- [ ] Conv2d forward and backward
-- [ ] Batch normalization
-- [ ] Proper topological sort for backward pass
-- [ ] Broadcasting for all ops
-- [ ] Tensor reshape / view
-- [ ] Adam optimizer
-- [ ] Load real image data (PNG/JPEG)
-- [ ] GPU acceleration via wgpu or Metal
+- Object detection demo with ASCII visualization
