@@ -2385,6 +2385,12 @@ impl Tensor {
         inner.op = Op::None;
     }
 
+    /// Set the gradient data directly (for testing / manual gradient injection).
+    pub fn set_grad(&self, grad: Vec<f32>) {
+        let mut inner = self.0.borrow_mut();
+        inner.grad = Some(grad);
+    }
+
     pub fn requires_grad(&self) -> bool {
         self.0.borrow().requires_grad
     }
