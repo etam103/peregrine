@@ -144,6 +144,137 @@ fn idx4(n: usize, c: usize, h: usize, w: usize, shape: &[usize]) -> usize {
         + w
 }
 
+// --- Broadcasting helpers ---
+
+/// Compute the broadcast output shape for two input shapes (NumPy rules).
+fn broadcast_shape(a: &[usize], b: &[usize]) -> Vec<usize> {
+    let ndim = a.len().max(b.len());
+    let mut result = vec![0usize; ndim];
+    for i in 0..ndim {
+        let da = if i < ndim - a.len() { 1 } else { a[i - (ndim - a.len())] };
+        let db = if i < ndim - b.len() { 1 } else { b[i - (ndim - b.len())] };
+        assert!(
+            da == db || da == 1 || db == 1,
+            "shapes {:?} and {:?} not broadcastable", a, b
+        );
+        result[i] = da.max(db);
+    }
+    result
+}
+
+/// Compute virtual strides for a tensor shape within a broadcast output shape.
+/// Broadcast dimensions (size 1 in input, >1 in output) get stride 0.
+fn broadcast_strides(shape: &[usize], target_ndim: usize) -> Vec<usize> {
+    let offset = target_ndim - shape.len();
+    let mut strides = vec![0usize; target_ndim];
+    let mut stride = 1usize;
+    for i in (0..shape.len()).rev() {
+        if shape[i] > 1 {
+            strides[i + offset] = stride;
+        }
+        stride *= shape[i];
+    }
+    strides
+}
+
+/// Reduce a gradient from broadcast shape back to the original tensor shape
+/// by summing over broadcast dimensions.
+fn reduce_grad_for_broadcast(grad: &[f32], grad_shape: &[usize], target_shape: &[usize]) -> Vec<f32> {
+    if grad_shape == target_shape {
+        return grad.to_vec();
+    }
+    let ndim = grad_shape.len();
+    let offset = ndim - target_shape.len();
+
+    let mut padded = vec![1usize; ndim];
+    for i in 0..target_shape.len() {
+        padded[i + offset] = target_shape[i];
+    }
+
+    let target_size: usize = target_shape.iter().product();
+    let mut result = vec![0.0f32; target_size];
+
+    let mut grad_strides = vec![1usize; ndim];
+    for i in (0..ndim.saturating_sub(1)).rev() {
+        grad_strides[i] = grad_strides[i + 1] * grad_shape[i + 1];
+    }
+
+    let mut target_strides_full = vec![1usize; ndim];
+    for i in (0..ndim.saturating_sub(1)).rev() {
+        target_strides_full[i] = target_strides_full[i + 1] * padded[i + 1];
+    }
+
+    let total: usize = grad_shape.iter().product();
+    for flat in 0..total {
+        let mut target_flat = 0;
+        let mut rem = flat;
+        for d in 0..ndim {
+            let coord = rem / grad_strides[d];
+            rem %= grad_strides[d];
+            let target_coord = if padded[d] == 1 { 0 } else { coord };
+            target_flat += target_coord * target_strides_full[d];
+        }
+        result[target_flat] += grad[flat];
+    }
+    result
+}
+
+/// Apply a binary op element-wise with NumPy broadcasting.
+fn broadcast_binary_op(
+    a_data: &[f32], a_shape: &[usize],
+    b_data: &[f32], b_shape: &[usize],
+    op: impl Fn(f32, f32) -> f32,
+) -> (Vec<f32>, Vec<usize>) {
+    let out_shape = broadcast_shape(a_shape, b_shape);
+    let ndim = out_shape.len();
+    let a_strides = broadcast_strides(a_shape, ndim);
+    let b_strides = broadcast_strides(b_shape, ndim);
+
+    let mut out_strides = vec![1usize; ndim];
+    for i in (0..ndim.saturating_sub(1)).rev() {
+        out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+    }
+
+    let total: usize = out_shape.iter().product();
+    let mut data = vec![0.0f32; total];
+    for flat in 0..total {
+        let mut a_idx = 0;
+        let mut b_idx = 0;
+        let mut rem = flat;
+        for d in 0..ndim {
+            let coord = rem / out_strides[d];
+            rem %= out_strides[d];
+            a_idx += coord * a_strides[d];
+            b_idx += coord * b_strides[d];
+        }
+        data[flat] = op(a_data[a_idx], b_data[b_idx]);
+    }
+    (data, out_shape)
+}
+
+/// Extract element values from a tensor using broadcast strides (for backward pass).
+fn broadcast_gather(data: &[f32], shape: &[usize], out_shape: &[usize]) -> Vec<f32> {
+    let ndim = out_shape.len();
+    let strides = broadcast_strides(shape, ndim);
+    let mut out_strides = vec![1usize; ndim];
+    for i in (0..ndim.saturating_sub(1)).rev() {
+        out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+    }
+    let total: usize = out_shape.iter().product();
+    let mut result = vec![0.0f32; total];
+    for flat in 0..total {
+        let mut idx = 0;
+        let mut rem = flat;
+        for d in 0..ndim {
+            let coord = rem / out_strides[d];
+            rem %= out_strides[d];
+            idx += coord * strides[d];
+        }
+        result[flat] = data[idx];
+    }
+    result
+}
+
 /// Extract image patches into columns for convolution (same-padding).
 /// Input: flat slice of one batch element [Ci, H, W].
 /// Output: column matrix [Ci*kH*kW, H*W].
@@ -337,25 +468,33 @@ impl Tensor {
     pub fn add(&self, other: &Tensor) -> Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
-        assert_eq!(a.shape, b.shape, "shapes must match for add");
-        let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
-            a.data.par_iter().zip(&b.data).map(|(x, y)| x + y).collect()
+        if a.shape == b.shape {
+            let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
+                a.data.par_iter().zip(&b.data).map(|(x, y)| x + y).collect()
+            } else {
+                a.data.iter().zip(&b.data).map(|(x, y)| x + y).collect()
+            };
+            Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
         } else {
-            a.data.iter().zip(&b.data).map(|(x, y)| x + y).collect()
-        };
-        Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
+            let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x + y);
+            Tensor::from_op(data, out_shape, Op::Add(self.clone(), other.clone()))
+        }
     }
 
     pub fn mul(&self, other: &Tensor) -> Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
-        assert_eq!(a.shape, b.shape, "shapes must match for mul");
-        let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
-            a.data.par_iter().zip(&b.data).map(|(x, y)| x * y).collect()
+        if a.shape == b.shape {
+            let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
+                a.data.par_iter().zip(&b.data).map(|(x, y)| x * y).collect()
+            } else {
+                a.data.iter().zip(&b.data).map(|(x, y)| x * y).collect()
+            };
+            Tensor::from_op(data, a.shape.clone(), Op::Mul(self.clone(), other.clone()))
         } else {
-            a.data.iter().zip(&b.data).map(|(x, y)| x * y).collect()
-        };
-        Tensor::from_op(data, a.shape.clone(), Op::Mul(self.clone(), other.clone()))
+            let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x * y);
+            Tensor::from_op(data, out_shape, Op::Mul(self.clone(), other.clone()))
+        }
     }
 
     /// 2D matrix multiply: [M, K] x [K, N] -> [M, N]
@@ -950,25 +1089,33 @@ impl Tensor {
     pub fn sub(&self, other: &Tensor) -> Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
-        assert_eq!(a.shape, b.shape, "shapes must match for sub");
-        let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
-            a.data.par_iter().zip(&b.data).map(|(x, y)| x - y).collect()
+        if a.shape == b.shape {
+            let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
+                a.data.par_iter().zip(&b.data).map(|(x, y)| x - y).collect()
+            } else {
+                a.data.iter().zip(&b.data).map(|(x, y)| x - y).collect()
+            };
+            Tensor::from_op(data, a.shape.clone(), Op::Sub(self.clone(), other.clone()))
         } else {
-            a.data.iter().zip(&b.data).map(|(x, y)| x - y).collect()
-        };
-        Tensor::from_op(data, a.shape.clone(), Op::Sub(self.clone(), other.clone()))
+            let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x - y);
+            Tensor::from_op(data, out_shape, Op::Sub(self.clone(), other.clone()))
+        }
     }
 
     pub fn div(&self, other: &Tensor) -> Tensor {
         let a = self.0.borrow();
         let b = other.0.borrow();
-        assert_eq!(a.shape, b.shape, "shapes must match for div");
-        let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
-            a.data.par_iter().zip(&b.data).map(|(x, y)| x / y).collect()
+        if a.shape == b.shape {
+            let data: Vec<f32> = if a.data.len() >= PAR_THRESHOLD {
+                a.data.par_iter().zip(&b.data).map(|(x, y)| x / y).collect()
+            } else {
+                a.data.iter().zip(&b.data).map(|(x, y)| x / y).collect()
+            };
+            Tensor::from_op(data, a.shape.clone(), Op::Div(self.clone(), other.clone()))
         } else {
-            a.data.iter().zip(&b.data).map(|(x, y)| x / y).collect()
-        };
-        Tensor::from_op(data, a.shape.clone(), Op::Div(self.clone(), other.clone()))
+            let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x / y);
+            Tensor::from_op(data, out_shape, Op::Div(self.clone(), other.clone()))
+        }
     }
 
     pub fn neg(&self) -> Tensor {
@@ -1319,25 +1466,47 @@ impl Tensor {
         match op {
             Op::None => unreachable!(),
             Op::Add(ref a, ref b) => {
-                accumulate_grad(a, &grad);
-                accumulate_grad(b, &grad);
+                let a_shape = a.shape();
+                let b_shape = b.shape();
+                if a_shape == b_shape {
+                    accumulate_grad(a, &grad);
+                    accumulate_grad(b, &grad);
+                } else {
+                    let out_shape = broadcast_shape(&a_shape, &b_shape);
+                    accumulate_grad(a, &reduce_grad_for_broadcast(&grad, &out_shape, &a_shape));
+                    accumulate_grad(b, &reduce_grad_for_broadcast(&grad, &out_shape, &b_shape));
+                }
             }
             Op::Mul(ref a, ref b) => {
                 let a_inner = a.0.borrow();
                 let b_inner = b.0.borrow();
-                let (grad_a, grad_b) = if grad.len() >= PAR_THRESHOLD {
-                    let ga: Vec<f32> = grad.par_iter().zip(b_inner.data.par_iter()).map(|(g, bv)| g * bv).collect();
-                    let gb: Vec<f32> = grad.par_iter().zip(a_inner.data.par_iter()).map(|(g, av)| g * av).collect();
-                    (ga, gb)
+                if a_inner.shape == b_inner.shape {
+                    let (grad_a, grad_b) = if grad.len() >= PAR_THRESHOLD {
+                        let ga: Vec<f32> = grad.par_iter().zip(b_inner.data.par_iter()).map(|(g, bv)| g * bv).collect();
+                        let gb: Vec<f32> = grad.par_iter().zip(a_inner.data.par_iter()).map(|(g, av)| g * av).collect();
+                        (ga, gb)
+                    } else {
+                        let ga: Vec<f32> = grad.iter().zip(&b_inner.data).map(|(g, bv)| g * bv).collect();
+                        let gb: Vec<f32> = grad.iter().zip(&a_inner.data).map(|(g, av)| g * av).collect();
+                        (ga, gb)
+                    };
+                    drop(a_inner);
+                    drop(b_inner);
+                    accumulate_grad(a, &grad_a);
+                    accumulate_grad(b, &grad_b);
                 } else {
-                    let ga: Vec<f32> = grad.iter().zip(&b_inner.data).map(|(g, bv)| g * bv).collect();
-                    let gb: Vec<f32> = grad.iter().zip(&a_inner.data).map(|(g, av)| g * av).collect();
-                    (ga, gb)
-                };
-                drop(a_inner);
-                drop(b_inner);
-                accumulate_grad(a, &grad_a);
-                accumulate_grad(b, &grad_b);
+                    let a_shape = a_inner.shape.clone();
+                    let b_shape = b_inner.shape.clone();
+                    let out_shape = broadcast_shape(&a_shape, &b_shape);
+                    let b_expanded = broadcast_gather(&b_inner.data, &b_shape, &out_shape);
+                    let a_expanded = broadcast_gather(&a_inner.data, &a_shape, &out_shape);
+                    drop(a_inner);
+                    drop(b_inner);
+                    let grad_a_full: Vec<f32> = grad.iter().zip(&b_expanded).map(|(g, bv)| g * bv).collect();
+                    let grad_b_full: Vec<f32> = grad.iter().zip(&a_expanded).map(|(g, av)| g * av).collect();
+                    accumulate_grad(a, &reduce_grad_for_broadcast(&grad_a_full, &out_shape, &a_shape));
+                    accumulate_grad(b, &reduce_grad_for_broadcast(&grad_b_full, &out_shape, &b_shape));
+                }
             }
             Op::MatMul(ref a, ref b) => {
                 let a_inner = a.0.borrow();
@@ -1846,34 +2015,57 @@ impl Tensor {
                 accumulate_grad(beta, &grad_beta);
             }
             Op::Sub(ref a, ref b) => {
-                accumulate_grad(a, &grad);
+                let a_shape = a.shape();
+                let b_shape = b.shape();
                 let neg_grad: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
                     grad.par_iter().map(|g| -g).collect()
                 } else {
                     grad.iter().map(|g| -g).collect()
                 };
-                accumulate_grad(b, &neg_grad);
+                if a_shape == b_shape {
+                    accumulate_grad(a, &grad);
+                    accumulate_grad(b, &neg_grad);
+                } else {
+                    let out_shape = broadcast_shape(&a_shape, &b_shape);
+                    accumulate_grad(a, &reduce_grad_for_broadcast(&grad, &out_shape, &a_shape));
+                    accumulate_grad(b, &reduce_grad_for_broadcast(&neg_grad, &out_shape, &b_shape));
+                }
             }
             Op::Div(ref a, ref b) => {
                 let a_inner = a.0.borrow();
                 let b_inner = b.0.borrow();
-                let (grad_a, grad_b) = if grad.len() >= PAR_THRESHOLD {
-                    let ga: Vec<f32> = grad.par_iter().zip(b_inner.data.par_iter())
-                        .map(|(g, bv)| g / bv).collect();
-                    let gb: Vec<f32> = grad.par_iter().zip(a_inner.data.par_iter().zip(b_inner.data.par_iter()))
-                        .map(|(g, (av, bv))| -g * av / (bv * bv)).collect();
-                    (ga, gb)
+                if a_inner.shape == b_inner.shape {
+                    let (grad_a, grad_b) = if grad.len() >= PAR_THRESHOLD {
+                        let ga: Vec<f32> = grad.par_iter().zip(b_inner.data.par_iter())
+                            .map(|(g, bv)| g / bv).collect();
+                        let gb: Vec<f32> = grad.par_iter().zip(a_inner.data.par_iter().zip(b_inner.data.par_iter()))
+                            .map(|(g, (av, bv))| -g * av / (bv * bv)).collect();
+                        (ga, gb)
+                    } else {
+                        let ga: Vec<f32> = grad.iter().zip(&b_inner.data)
+                            .map(|(g, bv)| g / bv).collect();
+                        let gb: Vec<f32> = grad.iter().zip(a_inner.data.iter().zip(&b_inner.data))
+                            .map(|(g, (av, bv))| -g * av / (bv * bv)).collect();
+                        (ga, gb)
+                    };
+                    drop(a_inner);
+                    drop(b_inner);
+                    accumulate_grad(a, &grad_a);
+                    accumulate_grad(b, &grad_b);
                 } else {
-                    let ga: Vec<f32> = grad.iter().zip(&b_inner.data)
-                        .map(|(g, bv)| g / bv).collect();
-                    let gb: Vec<f32> = grad.iter().zip(a_inner.data.iter().zip(&b_inner.data))
+                    let a_shape = a_inner.shape.clone();
+                    let b_shape = b_inner.shape.clone();
+                    let out_shape = broadcast_shape(&a_shape, &b_shape);
+                    let a_expanded = broadcast_gather(&a_inner.data, &a_shape, &out_shape);
+                    let b_expanded = broadcast_gather(&b_inner.data, &b_shape, &out_shape);
+                    drop(a_inner);
+                    drop(b_inner);
+                    let grad_a_full: Vec<f32> = grad.iter().zip(&b_expanded).map(|(g, bv)| g / bv).collect();
+                    let grad_b_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&b_expanded))
                         .map(|(g, (av, bv))| -g * av / (bv * bv)).collect();
-                    (ga, gb)
-                };
-                drop(a_inner);
-                drop(b_inner);
-                accumulate_grad(a, &grad_a);
-                accumulate_grad(b, &grad_b);
+                    accumulate_grad(a, &reduce_grad_for_broadcast(&grad_a_full, &out_shape, &a_shape));
+                    accumulate_grad(b, &reduce_grad_for_broadcast(&grad_b_full, &out_shape, &b_shape));
+                }
             }
             Op::Neg(ref input) => {
                 let grad_input: Vec<f32> = if grad.len() >= PAR_THRESHOLD {
@@ -2482,6 +2674,64 @@ mod tests {
         assert_eq!(x.min(), 1.0);
         assert_eq!(x.argmax(), 5);
         assert_eq!(x.argmin(), 1);
+    }
+
+    #[test]
+    fn test_broadcast_add() {
+        // [2, 3] + [3] -> [2, 3]
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let b = Tensor::new(vec![10.0, 20.0, 30.0], vec![3], true);
+        let c = a.add(&b);
+        assert_eq!(c.shape(), vec![2, 3]);
+        assert_eq!(c.data(), vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
+        let loss = c.sum();
+        loss.backward();
+        // grad_a = 1 for each element (no reduction needed, shapes broadcast naturally)
+        assert_eq!(a.grad().unwrap(), vec![1.0; 6]);
+        // grad_b = sum over dim 0 = [2.0, 2.0, 2.0]
+        assert_eq!(b.grad().unwrap(), vec![2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn test_broadcast_mul() {
+        // [2, 3] * [1, 3] -> [2, 3]
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let b = Tensor::new(vec![2.0, 3.0, 4.0], vec![1, 3], true);
+        let c = a.mul(&b);
+        assert_eq!(c.shape(), vec![2, 3]);
+        assert_eq!(c.data(), vec![2.0, 6.0, 12.0, 8.0, 15.0, 24.0]);
+        let loss = c.sum();
+        loss.backward();
+        // grad_a[i,j] = b[0,j]
+        assert_eq!(a.grad().unwrap(), vec![2.0, 3.0, 4.0, 2.0, 3.0, 4.0]);
+        // grad_b[0,j] = sum over i of a[i,j]
+        assert_eq!(b.grad().unwrap(), vec![5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn test_broadcast_sub_div() {
+        // [2, 2] - [2] -> [2, 2]
+        let a = Tensor::new(vec![10.0, 20.0, 30.0, 40.0], vec![2, 2], true);
+        let b = Tensor::new(vec![1.0, 2.0], vec![2], true);
+        let c = a.sub(&b);
+        assert_eq!(c.data(), vec![9.0, 18.0, 29.0, 38.0]);
+        let loss = c.sum();
+        loss.backward();
+        assert_eq!(a.grad().unwrap(), vec![1.0; 4]);
+        assert_eq!(b.grad().unwrap(), vec![-2.0, -2.0]);
+    }
+
+    #[test]
+    fn test_broadcast_scalar() {
+        // [3] + [1] -> [3]
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], true);
+        let b = Tensor::new(vec![10.0], vec![1], true);
+        let c = a.add(&b);
+        assert_eq!(c.data(), vec![11.0, 12.0, 13.0]);
+        let loss = c.sum();
+        loss.backward();
+        assert_eq!(a.grad().unwrap(), vec![1.0, 1.0, 1.0]);
+        assert_eq!(b.grad().unwrap(), vec![3.0]); // sum of grads
     }
 
     #[test]
