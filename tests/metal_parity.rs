@@ -283,3 +283,80 @@ fn parity_gpu_cpu_layernorm() {
         assert!(err < 1e-4, "layernorm [{batch}x{dim}]: max err={err}");
     }
 }
+
+// --- Fused MatMul+Bias+Relu ---
+
+#[test]
+fn parity_matmul_bias_relu() {
+    // Compare fused GPU path vs unfused CPU path (forward + backward)
+    for (m, k, n) in [(4, 8, 6), (16, 32, 10), (64, 128, 64)] {
+        let a_data = random_data(m * k);
+        let w_data = random_data(k * n);
+        let b_data = random_data(n);
+
+        // Unfused CPU path
+        let a_cpu = Tensor::new(a_data.clone(), vec![m, k], true);
+        let w_cpu = Tensor::new(w_data.clone(), vec![k, n], true);
+        let b_cpu = Tensor::new(b_data.clone(), vec![1, n], true);
+        let out_cpu = a_cpu.matmul(&w_cpu).add_bias(&b_cpu).relu();
+        let cpu_fwd = out_cpu.data();
+        out_cpu.backward();
+        let cpu_ga = a_cpu.grad().unwrap();
+        let cpu_gw = w_cpu.grad().unwrap();
+        let cpu_gb = b_cpu.grad().unwrap();
+
+        // Fused GPU path
+        let a_gpu = Tensor::new(a_data.clone(), vec![m, k], true);
+        a_gpu.to_gpu();
+        let w_gpu = Tensor::new(w_data.clone(), vec![k, n], true);
+        w_gpu.to_gpu();
+        let b_gpu = Tensor::new(b_data.clone(), vec![1, n], true);
+        b_gpu.to_gpu();
+        let out_gpu = a_gpu.matmul_bias_relu(&w_gpu, &b_gpu);
+        let gpu_fwd = out_gpu.data();
+        out_gpu.backward();
+        let gpu_ga = a_gpu.grad().unwrap();
+        let gpu_gw = w_gpu.grad().unwrap();
+        let gpu_gb = b_gpu.grad().unwrap();
+
+        let tol = 1e-3;
+        let fwd_err = max_abs_error(&cpu_fwd, &gpu_fwd);
+        assert!(fwd_err < tol, "matmul_bias_relu fwd [{m}x{k}x{n}]: err={fwd_err}");
+        let ga_err = max_abs_error(&cpu_ga, &gpu_ga);
+        assert!(ga_err < tol, "matmul_bias_relu grad_a [{m}x{k}x{n}]: err={ga_err}");
+        let gw_err = max_abs_error(&cpu_gw, &gpu_gw);
+        assert!(gw_err < tol, "matmul_bias_relu grad_w [{m}x{k}x{n}]: err={gw_err}");
+        let gb_err = max_abs_error(&cpu_gb, &gpu_gb);
+        assert!(gb_err < tol, "matmul_bias_relu grad_b [{m}x{k}x{n}]: err={gb_err}");
+    }
+}
+
+#[test]
+fn parity_matmul_bias_relu_training_loop() {
+    use peregrine::nn;
+    use peregrine::optim::Adam;
+    // Full fused MLP training loop: verifies forward+backward+optimizer work in release mode
+    let w1 = Tensor::randn(&[784, 128], true);   w1.to_gpu();
+    let b1 = Tensor::zeros(&[1, 128], true);     b1.to_gpu();
+    let w2 = Tensor::randn(&[128, 64], true);    w2.to_gpu();
+    let b2 = Tensor::zeros(&[1, 64], true);      b2.to_gpu();
+    let w3 = Tensor::randn(&[64, 10], true);     w3.to_gpu();
+    let b3 = Tensor::zeros(&[1, 10], true);      b3.to_gpu();
+    let batch = 64usize;
+    let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+    let mut opt = Adam::new(
+        vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
+        1e-3,
+    );
+    for _ in 0..3 {
+        let x = Tensor::randn(&[batch, 784], false);
+        x.to_gpu();
+        let h1 = x.matmul_bias_relu(&w1, &b1);
+        let h2 = h1.matmul_bias_relu(&w2, &b2);
+        let logits = h2.matmul(&w3).add_bias(&b3);
+        let loss = nn::cross_entropy_loss(&logits, &targets);
+        loss.backward();
+        opt.step();
+        opt.zero_grad();
+    }
+}

@@ -141,9 +141,12 @@ kernel void scale_f32(
 }
 
 // ---------------------------------------------------------------------------
-// Fused matmul + bias + relu: C = relu(A @ B + bias)
-// Naive implementation — dispatched as 2D grid [M, N]
+// Tiled matmul + bias + relu: C = relu(A @ B + bias)
+// Uses threadgroup shared memory for tile-based data reuse.
+// Each threadgroup computes a TILE_SIZE x TILE_SIZE tile of C.
 // ---------------------------------------------------------------------------
+
+constant uint TILE_SIZE = 16;
 
 struct MatmulParams {
     uint M;
@@ -161,29 +164,51 @@ kernel void matmul_f32(
     device float* C             [[buffer(2)]],
     device const float* bias    [[buffer(3)]],
     constant MatmulParams& p    [[buffer(4)]],
-    uint2 gid [[thread_position_in_grid]])
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
 {
     uint row = gid.y;
     uint col = gid.x;
-    if (row >= p.M || col >= p.N) return;
+
+    threadgroup float As[TILE_SIZE][TILE_SIZE];
+    threadgroup float Bs[TILE_SIZE][TILE_SIZE];
 
     float sum = 0.0f;
-    for (uint k = 0; k < p.K; k++) {
-        // A indexing: if trans_a, A is stored as [K,M] and we read A[k,row]
-        // otherwise A is [M,K] and we read A[row,k]
-        uint a_idx = p.trans_a ? (k * p.M + row) : (row * p.K + k);
-        // B indexing: if trans_b, B is stored as [N,K] and we read B[col,k]
-        // otherwise B is [K,N] and we read B[k,col]
-        uint b_idx = p.trans_b ? (col * p.K + k) : (k * p.N + col);
-        sum += A[a_idx] * B[b_idx];
+    uint num_tiles = (p.K + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint t = 0; t < num_tiles; t++) {
+        // Load tile of A into shared memory
+        uint a_k = t * TILE_SIZE + lid.x;
+        if (row < p.M && a_k < p.K) {
+            uint a_idx = p.trans_a ? (a_k * p.M + row) : (row * p.K + a_k);
+            As[lid.y][lid.x] = A[a_idx];
+        } else {
+            As[lid.y][lid.x] = 0.0f;
+        }
+
+        // Load tile of B into shared memory
+        uint b_k = t * TILE_SIZE + lid.y;
+        if (b_k < p.K && col < p.N) {
+            uint b_idx = p.trans_b ? (col * p.K + b_k) : (b_k * p.N + col);
+            Bs[lid.y][lid.x] = B[b_idx];
+        } else {
+            Bs[lid.y][lid.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += As[lid.y][k] * Bs[k][lid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (p.fuse_bias) {
-        sum += bias[col];
+
+    if (row < p.M && col < p.N) {
+        if (p.fuse_bias) sum += bias[col];
+        if (p.fuse_relu) sum = max(sum, 0.0f);
+        C[row * p.N + col] = sum;
     }
-    if (p.fuse_relu) {
-        sum = max(sum, 0.0f);
-    }
-    C[row * p.N + col] = sum;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +225,7 @@ kernel void sum_f32(
     uint gid [[threadgroup_position_in_grid]],
     uint group_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared[256];
+    threadgroup float shared[1024];
 
     float val = (tid < count) ? input[tid] : 0.0f;
     shared[lid] = val;
@@ -244,7 +269,7 @@ kernel void softmax_f32(
     device const float* row_in = input + row * p.dim;
     device float* row_out = output + row * p.dim;
 
-    threadgroup float shared[256];
+    threadgroup float shared[1024];
 
     // 1. Find max (initialize unused lanes to -INFINITY)
     float local_max = -INFINITY;
@@ -298,7 +323,7 @@ kernel void max_f32(
     uint gid [[threadgroup_position_in_grid]],
     uint group_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared[256];
+    threadgroup float shared[1024];
 
     float val = (tid < count) ? input[tid] : -INFINITY;
     shared[lid] = val;
@@ -328,7 +353,7 @@ kernel void min_f32(
     uint gid [[threadgroup_position_in_grid]],
     uint group_size [[threads_per_threadgroup]])
 {
-    threadgroup float shared[256];
+    threadgroup float shared[1024];
 
     float val = (tid < count) ? input[tid] : INFINITY;
     shared[lid] = val;
@@ -393,7 +418,7 @@ kernel void layernorm_f32(
     device const float* row_in = input + row * p.dim;
     device float* row_out = output + row * p.dim;
 
-    threadgroup float shared[256];
+    threadgroup float shared[1024];
 
     // 1. Compute mean
     float local_sum = 0.0f;
@@ -519,7 +544,7 @@ kernel void softmax_backward_f32(
     device const float* g = grad + row * p.dim;
     device float* gi = grad_input + row * p.dim;
 
-    threadgroup float shared[256];
+    threadgroup float shared[1024];
 
     // Compute dot(grad, y) for this row
     float local_dot = 0.0f;
@@ -569,8 +594,8 @@ kernel void layernorm_backward_f32(
     uint offset = row * p.dim;
     float istd = inv_std_buf[row];
 
-    threadgroup float shared_dy[256];
-    threadgroup float shared_dy_xhat[256];
+    threadgroup float shared_dy[1024];
+    threadgroup float shared_dy_xhat[1024];
 
     // Accumulate grad_gamma, grad_beta and compute mean_dy, mean_dy_xhat
     float local_dy = 0.0f;
@@ -702,7 +727,7 @@ kernel void log_softmax_f32(
     device const float* row_in = input + row * p.dim;
     device float* row_out = output + row * p.dim;
 
-    threadgroup float shared[256];
+    threadgroup float shared[1024];
 
     // 1. Find max
     float local_max = -INFINITY;
@@ -760,7 +785,7 @@ kernel void log_softmax_backward_f32(
     device const float* g = grad + row * p.dim;
     device float* gi = grad_input + row * p.dim;
 
-    threadgroup float shared[256];
+    threadgroup float shared[1024];
 
     // Compute sum(grad) for this row
     float local_sum = 0.0f;

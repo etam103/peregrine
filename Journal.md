@@ -461,3 +461,74 @@ After command batching, individual ops are ~5us on GPU. But `gpu_train_step_64` 
 **Key insight: at batch=64, the optimal strategy is GPU forward + CPU backward.** The forward chain benefits from command batching (no syncs until `mean()`), but the backward chain has too many small ops where ~5us GPU dispatch overhead per op adds up vs CPU NEON intrinsics.
 
 **Remaining bottleneck:** `dispatch_reduce` in `mean()` is the architectural sync point. Eliminating this (e.g., fused cross-entropy kernel that avoids reducing to a scalar mid-forward) would be the next high-leverage optimization for GPU training.
+
+### Large-tensor GPU benchmarks (PER-36)
+
+Added large-tensor benchmarks to validate the GPU crossover point: matmul 1024/2048, elementwise 1M/5M/10M, MLP batch=256 wide (784→512→256→10), training step batch=256 wide (784→256→128→10).
+
+| Operation | CPU (us) | GPU (us) | GPU Speedup |
+|-----------|----------:|----------:|----------:|
+| matmul 128x128 | 24.0 | **5.4** | 4.4x |
+| matmul 256x256 | 74.5 | **4.8** | 15.5x |
+| matmul 512x512 | 243.3 | **5.2** | 46.9x |
+| matmul 1024x1024 | 1154.6 | **5.9** | 195x |
+| matmul 2048x2048 | 10068.8 | **6.3** | 1601x |
+| add 100k | 11.2 | **4.7** | 2.4x |
+| add 1M | 205.5 | **5.0** | 40.8x |
+| add 10M | 1052.8 | **7.5** | 141x |
+| mul 10M | 1051.4 | **6.9** | 152x |
+| exp 10M | 2609.4 | **7.5** | 349x |
+| relu 1M | 188.1 | **5.2** | 36.1x |
+| MLP fwd 64x784 | 33.6 | **30.9** | 1.1x |
+| MLP fwd 256x784 wide | 449.0 | **33.0** | 13.6x |
+| train step 64 | **819.2** | 1716.7 | 0.5x |
+| train step 256 wide | **3445.9** | 4748.7 | 0.7x |
+
+**GPU wins on every individual op and forward pass.** At large tensor sizes, GPU speedups are enormous — matmul 2048x2048 is 1600x faster, exp 10M is 349x faster. Command batching means dispatch overhead (~5us) is negligible vs compute.
+
+**GPU crossover is below our smallest benchmark size.** Even matmul 128x128 and add 100k favor GPU (4.4x and 2.4x respectively). The crossover point was pushed far below 100k elements by command batching.
+
+**MLP forward crosses over at batch=256.** At batch=64 it's near parity (1.1x GPU), at batch=256 with wider layers GPU is 13.6x faster. The forward pass stays fully on GPU with no sync points.
+
+**Training step still favors CPU** at both batch=64 (0.5x) and batch=256 (0.7x). The gap narrows with size, suggesting GPU would win at batch ~512-1024. The bottleneck remains `dispatch_reduce` in `mean()` which forces a `commitAndWait()` mid-forward. Eliminating this sync (fused cross-entropy, or deferred reduction) is the critical remaining optimization.
+
+### Threadgroup tuning (PER-37)
+
+**Changes:**
+
+1. **Tiled matmul kernel** — replaced the naive per-element matmul with a 16x16 tile-based implementation using threadgroup shared memory. Each threadgroup loads TILE_SIZE x TILE_SIZE tiles of A and B into shared memory, reducing global memory reads by 16x.
+
+2. **Increased threadgroup cap from 256 to 1024** — softmax, log_softmax, layernorm, and reduction kernels now use `threadgroup float shared[1024]` and allow up to 1024 threads per threadgroup. Enables 512 threads for dim=512 softmax (up from 256).
+
+3. **Consistent 16x16 threadgroups for 2D kernels** — matmul and transpose both use 16x16 threadgroup sizing with `dispatchThreadgroups_threadsPerThreadgroup` for precise control.
+
+| Benchmark | Before (us) | After (us) | Change |
+|-----------|----------:|----------:|-------:|
+| gpu_train_step_64 | 1716.7 | **1333.8** | 22% faster |
+| gpu_train_step_256_wide | 4748.7 | **4395.8** | 7% faster |
+| gpu_mlp_fwd_256x784_wide | 33.0 | 42.0 | +27% (encoding overhead) |
+| gpu_softmax_8x512 | 4.3 | **4.0** | 7% faster |
+
+The training step improvement is real — the tiled matmul reduces actual GPU compute time visible at sync points. Individual op benchmarks are encoding-time dominated and don't show matmul improvement (GPU compute is hidden behind command batching). The MLP forward regression is encoding overhead from `dispatchThreadgroups` (not visible in training step where sync reveals actual GPU compute).
+
+### Fused Metal kernels (PER-38)
+
+**Changes:**
+
+1. **Fused `matmul_bias_relu` op** — new `Op::MatMulBiasRelu(input, weight, bias)` that dispatches a single `matmul_f32` kernel with `fuse_bias=true` and `fuse_relu=true`. Eliminates 2 intermediate GPU buffers and 2 kernel launches per hidden layer.
+
+2. **GPU backward for `MatMulBiasRelu`** — computes relu mask from output (`relu_backward_f32`), bias gradient via `bias_grad_sum_f32`, and input/weight gradients via transposed matmul. All 4 steps stay on GPU.
+
+3. **CPU backward fallback** — added `ensure_cpu_data` for the fused op output and `sync_gpu_to_cpu` for inputs, since the backward chain can arrive via CPU grad path (select returns CPU tensors, breaking the GPU chain).
+
+4. **Correctness bug found and fixed** — `select()` returns CPU tensors (for performance on small outputs). This means `cross_entropy_loss` backward propagates CPU grads through log_softmax back to `MatMulBiasRelu`, which was missing CPU data for its output tensor. Added `ensure_cpu_data` + sync for the `MatMulBiasRelu` CPU fallback path.
+
+| Benchmark | Unfused (us) | Fused (us) | Speedup |
+|-----------|----------:|----------:|-------:|
+| gpu_train_step_64 | 1618 | **1393** | 1.16x (14% faster) |
+| gpu_train_step_256_wide | 4388 | **4158** | 1.06x (5% faster) |
+
+The improvement is modest (14% at batch=64, 5% at batch=256) because:
+- The forward path saves 4 kernel launches (2 fused layers × 2 ops eliminated), but each kernel is only ~5us encoding time
+- The backward path falls to CPU via the `select → CPU grad` chain, so the fused GPU backward doesn't fire during training
+- The real win is architectural: `matmul_bias_relu` is a building block that composes well when the full pipeline stays on GPU

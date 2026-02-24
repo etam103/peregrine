@@ -379,15 +379,16 @@ impl GpuContext {
             );
         }
 
-        let grid_size = MTLSize { width: n as usize, height: m as usize, depth: 1 };
-        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
-        let side = (max_threads as f64).sqrt() as usize;
-        let threadgroup_size = MTLSize {
-            width: side.min(n as usize),
-            height: side.min(m as usize),
+        // Tiled matmul: always TILE_SIZE x TILE_SIZE threadgroups
+        // Kernel handles out-of-bounds threads via bounds checking
+        let tile_size = 16usize;
+        let threadgroup_size = MTLSize { width: tile_size, height: tile_size, depth: 1 };
+        let num_groups = MTLSize {
+            width: (n as usize + tile_size - 1) / tile_size,
+            height: (m as usize + tile_size - 1) / tile_size,
             depth: 1,
         };
-        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
 
         enc.endEncoding();
     }
@@ -425,7 +426,7 @@ impl GpuContext {
         }
 
         // One threadgroup per row — must be power of 2 for tree reduction
-        let threads_per_row = (dim as usize).next_power_of_two().min(256);
+        let threads_per_row = (dim as usize).next_power_of_two().min(1024);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: batch as usize, height: 1, depth: 1 },
             MTLSize { width: threads_per_row, height: 1, depth: 1 },
@@ -468,7 +469,7 @@ impl GpuContext {
             );
         }
 
-        let threads_per_row = (dim as usize).next_power_of_two().min(256);
+        let threads_per_row = (dim as usize).next_power_of_two().min(1024);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: batch as usize, height: 1, depth: 1 },
             MTLSize { width: threads_per_row, height: 1, depth: 1 },
@@ -482,7 +483,7 @@ impl GpuContext {
         let n = input.len();
         let pipeline = &self.pipelines[kernel];
         let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
-        let group_size = max_threads.min(256).min(n.next_power_of_two());
+        let group_size = max_threads.min(1024).min(n.next_power_of_two());
         let num_groups = (n + group_size - 1) / group_size;
 
         let partial: GpuBuffer<f32> = GpuBuffer::new(&self.device, num_groups);
@@ -544,10 +545,8 @@ impl GpuContext {
             );
         }
 
-        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
-        let side = (max_threads as f64).sqrt() as usize;
         let grid = MTLSize { width: cols as usize, height: rows as usize, depth: 1 };
-        let tg = MTLSize { width: side.min(cols as usize), height: side.min(rows as usize), depth: 1 };
+        let tg = MTLSize { width: 16usize.min(cols as usize), height: 16usize.min(rows as usize), depth: 1 };
         enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
         enc.endEncoding();
     }
@@ -582,7 +581,7 @@ impl GpuContext {
             );
         }
 
-        let threads_per_row = (dim as usize).next_power_of_two().min(256);
+        let threads_per_row = (dim as usize).next_power_of_two().min(1024);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: batch as usize, height: 1, depth: 1 },
             MTLSize { width: threads_per_row, height: 1, depth: 1 },
@@ -625,7 +624,7 @@ impl GpuContext {
             );
         }
 
-        let threads_per_row = (dim as usize).next_power_of_two().min(256);
+        let threads_per_row = (dim as usize).next_power_of_two().min(1024);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: batch as usize, height: 1, depth: 1 },
             MTLSize { width: threads_per_row, height: 1, depth: 1 },
@@ -794,7 +793,7 @@ impl GpuContext {
             );
         }
 
-        let threads_per_row = (dim as usize).next_power_of_two().min(256);
+        let threads_per_row = (dim as usize).next_power_of_two().min(1024);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: batch as usize, height: 1, depth: 1 },
             MTLSize { width: threads_per_row, height: 1, depth: 1 },
@@ -837,7 +836,7 @@ impl GpuContext {
             );
         }
 
-        let threads_per_row = (dim as usize).next_power_of_two().min(256);
+        let threads_per_row = (dim as usize).next_power_of_two().min(1024);
         enc.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize { width: batch as usize, height: 1, depth: 1 },
             MTLSize { width: threads_per_row, height: 1, depth: 1 },

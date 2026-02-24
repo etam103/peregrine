@@ -18,7 +18,8 @@ use std::time::Instant;
 
 const WARMUP: usize = 5;
 const ITERS_FAST: usize = 50;
-const ITERS_SLOW: usize = 20; // matmul 512, training step
+const ITERS_SLOW: usize = 20; // matmul 512+, training step
+const ITERS_VSLOW: usize = 10; // matmul 2048, 10M elements, large training
 
 // ---------------------------------------------------------------------------
 // Timing helpers
@@ -76,14 +77,32 @@ fn make_result(label: &str, times: Vec<f64>) -> serde_json::Value {
     s
 }
 
+fn size_label(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else {
+        format!("{}k", n / 1_000)
+    }
+}
+
+fn iters_for_elwise(n: usize) -> usize {
+    if n >= 10_000_000 { ITERS_VSLOW }
+    else if n >= 5_000_000 { ITERS_SLOW }
+    else { ITERS_FAST }
+}
+
 // ---------------------------------------------------------------------------
 // CPU Benchmarks
 // ---------------------------------------------------------------------------
 
 fn bench_matmul() -> Vec<serde_json::Value> {
     let mut results = Vec::new();
-    for size in [128, 256, 512] {
-        let iters = if size == 512 { ITERS_SLOW } else { ITERS_FAST };
+    for size in [128, 256, 512, 1024, 2048] {
+        let iters = match size {
+            2048 => ITERS_VSLOW,
+            512 | 1024 => ITERS_SLOW,
+            _ => ITERS_FAST,
+        };
         let a = Tensor::randn(&[size, size], false);
         let w = Tensor::randn(&[size, size], false);
         let times = bench(|| { black_box(a.matmul(&w)); }, iters);
@@ -94,40 +113,44 @@ fn bench_matmul() -> Vec<serde_json::Value> {
 
 fn bench_add() -> Vec<serde_json::Value> {
     let mut results = Vec::new();
-    for n in [100_000usize, 500_000] {
+    for n in [100_000usize, 500_000, 1_000_000, 5_000_000, 10_000_000] {
         let a = Tensor::randn(&[n], false);
         let b = Tensor::randn(&[n], false);
-        let times = bench(|| { black_box(a.add(&b)); }, ITERS_FAST);
-        results.push(make_result(&format!("add_{}k", n / 1000), times));
+        let times = bench(|| { black_box(a.add(&b)); }, iters_for_elwise(n));
+        results.push(make_result(&format!("add_{}", size_label(n)), times));
     }
     results
 }
 
 fn bench_mul() -> Vec<serde_json::Value> {
     let mut results = Vec::new();
-    for n in [100_000usize, 500_000] {
+    for n in [100_000usize, 500_000, 1_000_000, 5_000_000, 10_000_000] {
         let a = Tensor::randn(&[n], false);
         let b = Tensor::randn(&[n], false);
-        let times = bench(|| { black_box(a.mul(&b)); }, ITERS_FAST);
-        results.push(make_result(&format!("mul_{}k", n / 1000), times));
+        let times = bench(|| { black_box(a.mul(&b)); }, iters_for_elwise(n));
+        results.push(make_result(&format!("mul_{}", size_label(n)), times));
     }
     results
 }
 
 fn bench_exp() -> Vec<serde_json::Value> {
     let mut results = Vec::new();
-    for n in [100_000usize, 500_000] {
+    for n in [100_000usize, 500_000, 1_000_000, 5_000_000, 10_000_000] {
         let a = Tensor::randn(&[n], false);
-        let times = bench(|| { black_box(a.exp()); }, ITERS_FAST);
-        results.push(make_result(&format!("exp_{}k", n / 1000), times));
+        let times = bench(|| { black_box(a.exp()); }, iters_for_elwise(n));
+        results.push(make_result(&format!("exp_{}", size_label(n)), times));
     }
     results
 }
 
 fn bench_relu() -> Vec<serde_json::Value> {
-    let a = Tensor::randn(&[100_000], false);
-    let times = bench(|| { black_box(a.relu()); }, ITERS_FAST);
-    vec![make_result("relu_100k", times)]
+    let mut results = Vec::new();
+    for n in [100_000usize, 1_000_000] {
+        let a = Tensor::randn(&[n], false);
+        let times = bench(|| { black_box(a.relu()); }, ITERS_FAST);
+        results.push(make_result(&format!("relu_{}", size_label(n)), times));
+    }
+    results
 }
 
 fn bench_softmax() -> Vec<serde_json::Value> {
@@ -141,53 +164,109 @@ fn bench_softmax() -> Vec<serde_json::Value> {
 }
 
 fn bench_mlp_forward() -> Vec<serde_json::Value> {
-    let w1 = Tensor::randn(&[784, 128], false);
-    let b1 = Tensor::randn(&[1, 128], false);
-    let w2 = Tensor::randn(&[128, 64], false);
-    let b2 = Tensor::randn(&[1, 64], false);
-    let w3 = Tensor::randn(&[64, 10], false);
-    let b3 = Tensor::randn(&[1, 10], false);
-    let x = Tensor::randn(&[64, 784], false);
+    let mut results = Vec::new();
 
-    let times = bench(|| {
-        let h1 = x.matmul(&w1).add_bias(&b1).relu();
-        let h2 = h1.matmul(&w2).add_bias(&b2).relu();
-        let out = h2.matmul(&w3).add_bias(&b3);
-        black_box(out);
-    }, ITERS_FAST);
+    // Small: batch=64, 784->128->64->10
+    {
+        let w1 = Tensor::randn(&[784, 128], false);
+        let b1 = Tensor::randn(&[1, 128], false);
+        let w2 = Tensor::randn(&[128, 64], false);
+        let b2 = Tensor::randn(&[1, 64], false);
+        let w3 = Tensor::randn(&[64, 10], false);
+        let b3 = Tensor::randn(&[1, 10], false);
+        let x = Tensor::randn(&[64, 784], false);
 
-    vec![make_result("mlp_fwd_64x784", times)]
+        let times = bench(|| {
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let out = h2.matmul(&w3).add_bias(&b3);
+            black_box(out);
+        }, ITERS_FAST);
+        results.push(make_result("mlp_fwd_64x784", times));
+    }
+
+    // Large: batch=256, 784->512->256->10
+    {
+        let w1 = Tensor::randn(&[784, 512], false);
+        let b1 = Tensor::randn(&[1, 512], false);
+        let w2 = Tensor::randn(&[512, 256], false);
+        let b2 = Tensor::randn(&[1, 256], false);
+        let w3 = Tensor::randn(&[256, 10], false);
+        let b3 = Tensor::randn(&[1, 10], false);
+        let x = Tensor::randn(&[256, 784], false);
+
+        let times = bench(|| {
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let out = h2.matmul(&w3).add_bias(&b3);
+            black_box(out);
+        }, ITERS_SLOW);
+        results.push(make_result("mlp_fwd_256x784_wide", times));
+    }
+
+    results
 }
 
 fn bench_training_step() -> Vec<serde_json::Value> {
-    let w1 = Tensor::randn(&[784, 128], true);
-    let b1 = Tensor::zeros(&[1, 128], true);
-    let w2 = Tensor::randn(&[128, 64], true);
-    let b2 = Tensor::zeros(&[1, 64], true);
-    let w3 = Tensor::randn(&[64, 10], true);
-    let b3 = Tensor::zeros(&[1, 10], true);
+    let mut results = Vec::new();
 
-    let batch = 64usize;
-    let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+    // Small: batch=64, 784->128->64->10
+    {
+        let w1 = Tensor::randn(&[784, 128], true);
+        let b1 = Tensor::zeros(&[1, 128], true);
+        let w2 = Tensor::randn(&[128, 64], true);
+        let b2 = Tensor::zeros(&[1, 64], true);
+        let w3 = Tensor::randn(&[64, 10], true);
+        let b3 = Tensor::zeros(&[1, 10], true);
+        let batch = 64usize;
+        let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+        let mut opt = Adam::new(
+            vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
+            1e-3,
+        );
+        let times = bench(|| {
+            let x = Tensor::randn(&[batch, 784], false);
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let logits = h2.matmul(&w3).add_bias(&b3);
+            let loss = nn::cross_entropy_loss(&logits, &targets);
+            loss.backward();
+            opt.step();
+            opt.zero_grad();
+            black_box(loss);
+        }, ITERS_SLOW);
+        results.push(make_result("train_step_64", times));
+    }
 
-    let mut opt = Adam::new(
-        vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
-        1e-3,
-    );
+    // Large: batch=256, 784->256->128->10
+    {
+        let w1 = Tensor::randn(&[784, 256], true);
+        let b1 = Tensor::zeros(&[1, 256], true);
+        let w2 = Tensor::randn(&[256, 128], true);
+        let b2 = Tensor::zeros(&[1, 128], true);
+        let w3 = Tensor::randn(&[128, 10], true);
+        let b3 = Tensor::zeros(&[1, 10], true);
+        let batch = 256usize;
+        let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+        let mut opt = Adam::new(
+            vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
+            1e-3,
+        );
+        let times = bench(|| {
+            let x = Tensor::randn(&[batch, 784], false);
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let logits = h2.matmul(&w3).add_bias(&b3);
+            let loss = nn::cross_entropy_loss(&logits, &targets);
+            loss.backward();
+            opt.step();
+            opt.zero_grad();
+            black_box(loss);
+        }, ITERS_VSLOW);
+        results.push(make_result("train_step_256_wide", times));
+    }
 
-    let times = bench(|| {
-        let x = Tensor::randn(&[batch, 784], false);
-        let h1 = x.matmul(&w1).add_bias(&b1).relu();
-        let h2 = h1.matmul(&w2).add_bias(&b2).relu();
-        let logits = h2.matmul(&w3).add_bias(&b3);
-        let loss = nn::cross_entropy_loss(&logits, &targets);
-        loss.backward();
-        opt.step();
-        opt.zero_grad();
-        black_box(loss);
-    }, ITERS_SLOW);
-
-    vec![make_result("train_step_64", times)]
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -202,10 +281,21 @@ fn gpu_tensor(shape: &[usize], requires_grad: bool) -> Tensor {
 }
 
 #[cfg(feature = "metal")]
+fn gpu_zeros(shape: &[usize], requires_grad: bool) -> Tensor {
+    let t = Tensor::zeros(shape, requires_grad);
+    t.to_gpu();
+    t
+}
+
+#[cfg(feature = "metal")]
 fn bench_gpu_matmul() -> Vec<serde_json::Value> {
     let mut results = Vec::new();
-    for size in [128, 256, 512] {
-        let iters = if size == 512 { ITERS_SLOW } else { ITERS_FAST };
+    for size in [128, 256, 512, 1024, 2048] {
+        let iters = match size {
+            2048 => ITERS_VSLOW,
+            512 | 1024 => ITERS_SLOW,
+            _ => ITERS_FAST,
+        };
         let a = gpu_tensor(&[size, size], false);
         let w = gpu_tensor(&[size, size], false);
         let times = bench(|| { black_box(a.matmul(&w)); }, iters);
@@ -217,11 +307,11 @@ fn bench_gpu_matmul() -> Vec<serde_json::Value> {
 #[cfg(feature = "metal")]
 fn bench_gpu_add() -> Vec<serde_json::Value> {
     let mut results = Vec::new();
-    for n in [100_000usize, 500_000] {
+    for n in [100_000usize, 500_000, 1_000_000, 5_000_000, 10_000_000] {
         let a = gpu_tensor(&[n], false);
         let b = gpu_tensor(&[n], false);
-        let times = bench(|| { black_box(a.add(&b)); }, ITERS_FAST);
-        results.push(make_result(&format!("gpu_add_{}k", n / 1000), times));
+        let times = bench(|| { black_box(a.add(&b)); }, iters_for_elwise(n));
+        results.push(make_result(&format!("gpu_add_{}", size_label(n)), times));
     }
     results
 }
@@ -229,11 +319,11 @@ fn bench_gpu_add() -> Vec<serde_json::Value> {
 #[cfg(feature = "metal")]
 fn bench_gpu_mul() -> Vec<serde_json::Value> {
     let mut results = Vec::new();
-    for n in [100_000usize, 500_000] {
+    for n in [100_000usize, 500_000, 1_000_000, 5_000_000, 10_000_000] {
         let a = gpu_tensor(&[n], false);
         let b = gpu_tensor(&[n], false);
-        let times = bench(|| { black_box(a.mul(&b)); }, ITERS_FAST);
-        results.push(make_result(&format!("gpu_mul_{}k", n / 1000), times));
+        let times = bench(|| { black_box(a.mul(&b)); }, iters_for_elwise(n));
+        results.push(make_result(&format!("gpu_mul_{}", size_label(n)), times));
     }
     results
 }
@@ -241,19 +331,23 @@ fn bench_gpu_mul() -> Vec<serde_json::Value> {
 #[cfg(feature = "metal")]
 fn bench_gpu_exp() -> Vec<serde_json::Value> {
     let mut results = Vec::new();
-    for n in [100_000usize, 500_000] {
+    for n in [100_000usize, 500_000, 1_000_000, 5_000_000, 10_000_000] {
         let a = gpu_tensor(&[n], false);
-        let times = bench(|| { black_box(a.exp()); }, ITERS_FAST);
-        results.push(make_result(&format!("gpu_exp_{}k", n / 1000), times));
+        let times = bench(|| { black_box(a.exp()); }, iters_for_elwise(n));
+        results.push(make_result(&format!("gpu_exp_{}", size_label(n)), times));
     }
     results
 }
 
 #[cfg(feature = "metal")]
 fn bench_gpu_relu() -> Vec<serde_json::Value> {
-    let a = gpu_tensor(&[100_000], false);
-    let times = bench(|| { black_box(a.relu()); }, ITERS_FAST);
-    vec![make_result("gpu_relu_100k", times)]
+    let mut results = Vec::new();
+    for n in [100_000usize, 1_000_000] {
+        let a = gpu_tensor(&[n], false);
+        let times = bench(|| { black_box(a.relu()); }, ITERS_FAST);
+        results.push(make_result(&format!("gpu_relu_{}", size_label(n)), times));
+    }
+    results
 }
 
 #[cfg(feature = "metal")]
@@ -269,57 +363,173 @@ fn bench_gpu_softmax() -> Vec<serde_json::Value> {
 
 #[cfg(feature = "metal")]
 fn bench_gpu_mlp_forward() -> Vec<serde_json::Value> {
-    let w1 = gpu_tensor(&[784, 128], false);
-    let b1 = gpu_tensor(&[1, 128], false);
-    let w2 = gpu_tensor(&[128, 64], false);
-    let b2 = gpu_tensor(&[1, 64], false);
-    let w3 = gpu_tensor(&[64, 10], false);
-    let b3 = gpu_tensor(&[1, 10], false);
-    let x = gpu_tensor(&[64, 784], false);
+    let mut results = Vec::new();
 
-    let times = bench(|| {
-        let h1 = x.matmul(&w1).add_bias(&b1).relu();
-        let h2 = h1.matmul(&w2).add_bias(&b2).relu();
-        let out = h2.matmul(&w3).add_bias(&b3);
-        black_box(out);
-    }, ITERS_FAST);
+    // Small: batch=64, 784->128->64->10
+    {
+        let w1 = gpu_tensor(&[784, 128], false);
+        let b1 = gpu_tensor(&[1, 128], false);
+        let w2 = gpu_tensor(&[128, 64], false);
+        let b2 = gpu_tensor(&[1, 64], false);
+        let w3 = gpu_tensor(&[64, 10], false);
+        let b3 = gpu_tensor(&[1, 10], false);
+        let x = gpu_tensor(&[64, 784], false);
 
-    vec![make_result("gpu_mlp_fwd_64x784", times)]
+        let times = bench(|| {
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let out = h2.matmul(&w3).add_bias(&b3);
+            black_box(out);
+        }, ITERS_FAST);
+        results.push(make_result("gpu_mlp_fwd_64x784", times));
+    }
+
+    // Large: batch=256, 784->512->256->10
+    {
+        let w1 = gpu_tensor(&[784, 512], false);
+        let b1 = gpu_tensor(&[1, 512], false);
+        let w2 = gpu_tensor(&[512, 256], false);
+        let b2 = gpu_tensor(&[1, 256], false);
+        let w3 = gpu_tensor(&[256, 10], false);
+        let b3 = gpu_tensor(&[1, 10], false);
+        let x = gpu_tensor(&[256, 784], false);
+
+        let times = bench(|| {
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let out = h2.matmul(&w3).add_bias(&b3);
+            black_box(out);
+        }, ITERS_SLOW);
+        results.push(make_result("gpu_mlp_fwd_256x784_wide", times));
+    }
+
+    results
 }
 
 #[cfg(feature = "metal")]
 fn bench_gpu_training_step() -> Vec<serde_json::Value> {
-    let w1 = gpu_tensor(&[784, 128], true);
-    let b1 = Tensor::zeros(&[1, 128], true);
-    b1.to_gpu();
-    let w2 = gpu_tensor(&[128, 64], true);
-    let b2 = Tensor::zeros(&[1, 64], true);
-    b2.to_gpu();
-    let w3 = gpu_tensor(&[64, 10], true);
-    let b3 = Tensor::zeros(&[1, 10], true);
-    b3.to_gpu();
+    let mut results = Vec::new();
 
-    let batch = 64usize;
-    let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+    // Small: batch=64, 784->128->64->10
+    {
+        let w1 = gpu_tensor(&[784, 128], true);
+        let b1 = gpu_zeros(&[1, 128], true);
+        let w2 = gpu_tensor(&[128, 64], true);
+        let b2 = gpu_zeros(&[1, 64], true);
+        let w3 = gpu_tensor(&[64, 10], true);
+        let b3 = gpu_zeros(&[1, 10], true);
+        let batch = 64usize;
+        let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+        let mut opt = Adam::new(
+            vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
+            1e-3,
+        );
+        let times = bench(|| {
+            let x = gpu_tensor(&[batch, 784], false);
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let logits = h2.matmul(&w3).add_bias(&b3);
+            let loss = nn::cross_entropy_loss(&logits, &targets);
+            loss.backward();
+            opt.step();
+            opt.zero_grad();
+            black_box(loss);
+        }, ITERS_SLOW);
+        results.push(make_result("gpu_train_step_64", times));
+    }
 
-    let mut opt = Adam::new(
-        vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
-        1e-3,
-    );
+    // Large: batch=256, 784->256->128->10
+    {
+        let w1 = gpu_tensor(&[784, 256], true);
+        let b1 = gpu_zeros(&[1, 256], true);
+        let w2 = gpu_tensor(&[256, 128], true);
+        let b2 = gpu_zeros(&[1, 128], true);
+        let w3 = gpu_tensor(&[128, 10], true);
+        let b3 = gpu_zeros(&[1, 10], true);
+        let batch = 256usize;
+        let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+        let mut opt = Adam::new(
+            vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
+            1e-3,
+        );
+        let times = bench(|| {
+            let x = gpu_tensor(&[batch, 784], false);
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let logits = h2.matmul(&w3).add_bias(&b3);
+            let loss = nn::cross_entropy_loss(&logits, &targets);
+            loss.backward();
+            opt.step();
+            opt.zero_grad();
+            black_box(loss);
+        }, ITERS_VSLOW);
+        results.push(make_result("gpu_train_step_256_wide", times));
+    }
 
-    let times = bench(|| {
-        let x = gpu_tensor(&[batch, 784], false);
-        let h1 = x.matmul(&w1).add_bias(&b1).relu();
-        let h2 = h1.matmul(&w2).add_bias(&b2).relu();
-        let logits = h2.matmul(&w3).add_bias(&b3);
-        let loss = nn::cross_entropy_loss(&logits, &targets);
-        loss.backward();
-        opt.step();
-        opt.zero_grad();
-        black_box(loss);
-    }, ITERS_SLOW);
+    results
+}
 
-    vec![make_result("gpu_train_step_64", times)]
+#[cfg(feature = "metal")]
+fn bench_gpu_training_step_fused() -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+
+    // Fused: batch=64, 784->128->64->10 (matmul_bias_relu)
+    {
+        let w1 = gpu_tensor(&[784, 128], true);
+        let b1 = gpu_zeros(&[1, 128], true);
+        let w2 = gpu_tensor(&[128, 64], true);
+        let b2 = gpu_zeros(&[1, 64], true);
+        let w3 = gpu_tensor(&[64, 10], true);
+        let b3 = gpu_zeros(&[1, 10], true);
+        let batch = 64usize;
+        let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+        let mut opt = Adam::new(
+            vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
+            1e-3,
+        );
+        let times = bench(|| {
+            let x = gpu_tensor(&[batch, 784], false);
+            let h1 = x.matmul_bias_relu(&w1, &b1);
+            let h2 = h1.matmul_bias_relu(&w2, &b2);
+            let logits = h2.matmul(&w3).add_bias(&b3);
+            let loss = nn::cross_entropy_loss(&logits, &targets);
+            loss.backward();
+            opt.step();
+            opt.zero_grad();
+            black_box(loss);
+        }, ITERS_SLOW);
+        results.push(make_result("gpu_train_fused_64", times));
+    }
+
+    // Fused: batch=256, 784->256->128->10 (matmul_bias_relu)
+    {
+        let w1 = gpu_tensor(&[784, 256], true);
+        let b1 = gpu_zeros(&[1, 256], true);
+        let w2 = gpu_tensor(&[256, 128], true);
+        let b2 = gpu_zeros(&[1, 128], true);
+        let w3 = gpu_tensor(&[128, 10], true);
+        let b3 = gpu_zeros(&[1, 10], true);
+        let batch = 256usize;
+        let targets: Vec<usize> = (0..batch).map(|i| i % 10).collect();
+        let mut opt = Adam::new(
+            vec![w1.clone(), b1.clone(), w2.clone(), b2.clone(), w3.clone(), b3.clone()],
+            1e-3,
+        );
+        let times = bench(|| {
+            let x = gpu_tensor(&[batch, 784], false);
+            let h1 = x.matmul_bias_relu(&w1, &b1);
+            let h2 = h1.matmul_bias_relu(&w2, &b2);
+            let logits = h2.matmul(&w3).add_bias(&b3);
+            let loss = nn::cross_entropy_loss(&logits, &targets);
+            loss.backward();
+            opt.step();
+            opt.zero_grad();
+            black_box(loss);
+        }, ITERS_VSLOW);
+        results.push(make_result("gpu_train_fused_256_wide", times));
+    }
+
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -363,12 +573,51 @@ fn main() {
             ("bench_gpu_softmax", bench_gpu_softmax),
             ("bench_gpu_mlp_forward", bench_gpu_mlp_forward),
             ("bench_gpu_training_step", bench_gpu_training_step),
+            ("bench_gpu_training_fused", bench_gpu_training_step_fused),
         ];
 
         for (name, f) in gpu_benchmarks {
             eprintln!("  GPU: {} ...", name);
             all_results.extend(f());
         }
+
+        // Print CPU vs GPU comparison table
+        eprintln!();
+        eprintln!("  CPU vs GPU Comparison (median, microseconds):");
+        eprintln!("  {:<30} {:>10} {:>10} {:>10}", "Operation", "CPU (us)", "GPU (us)", "Speedup");
+        eprintln!("  {}", "-".repeat(63));
+
+        for result in &all_results {
+            let op = result["op"].as_str().unwrap();
+            if !op.starts_with("gpu_") { continue; }
+            let cpu_op = &op[4..];
+            if let Some(cpu_result) = all_results.iter().find(|r| r["op"].as_str().unwrap() == cpu_op) {
+                let cpu_med = cpu_result["median_us"].as_f64().unwrap();
+                let gpu_med = result["median_us"].as_f64().unwrap();
+                let speedup = cpu_med / gpu_med;
+                let winner = if speedup > 1.0 { "GPU wins" } else { "CPU wins" };
+                eprintln!("  {:<30} {:>10.1} {:>10.1} {:>8.1}x  {}", cpu_op, cpu_med, gpu_med, speedup, winner);
+            }
+        }
+        // Print fused vs unfused comparison
+        eprintln!("  Fused vs Unfused GPU Training (median, microseconds):");
+        eprintln!("  {:<30} {:>10} {:>10} {:>10}", "Benchmark", "Unfused", "Fused", "Speedup");
+        eprintln!("  {}", "-".repeat(63));
+        for (unfused, fused) in [
+            ("gpu_train_step_64", "gpu_train_fused_64"),
+            ("gpu_train_step_256_wide", "gpu_train_fused_256_wide"),
+        ] {
+            if let (Some(u), Some(f)) = (
+                all_results.iter().find(|r| r["op"].as_str().unwrap() == unfused),
+                all_results.iter().find(|r| r["op"].as_str().unwrap() == fused),
+            ) {
+                let u_med = u["median_us"].as_f64().unwrap();
+                let f_med = f["median_us"].as_f64().unwrap();
+                let speedup = u_med / f_med;
+                eprintln!("  {:<30} {:>10.1} {:>10.1} {:>8.1}x", unfused, u_med, f_med, speedup);
+            }
+        }
+        eprintln!();
     }
 
     let output = serde_json::json!({
