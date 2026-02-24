@@ -34,7 +34,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::optim`** | SGD (with momentum, Nesterov, weight decay), Adam, AdamW, LR schedulers (StepLR, CosineAnnealing, Warmup), gradient clipping |
 | **`peregrine::serial`** | Save/load model weights in compact binary format |
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
-| **`peregrine::metal`** | Metal GPU backend — 31 compute shaders (forward + backward), autograd integration, buffer pool, unified memory (`--features metal`) |
+| **`peregrine::metal`** | Metal GPU backend — 38 compute shaders (forward + backward), command batching, autograd integration, buffer pool, unified memory (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 
@@ -205,7 +205,7 @@ Geometric mean ratio (lower = Peregrine faster): **PyTorch 0.70x**, **MLX 0.57x*
 | Pool bypass for small tensors | Skip HashMap overhead for tensors < 1024 elements |
 | Rayon threshold tuning | Dual thresholds (500K cheap / 100K expensive) — avoids spawn overhead |
 | Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
-| Metal GPU backend | 31 compute shaders with full autograd integration for end-to-end GPU training |
+| Metal GPU backend | 38 compute shaders with command batching and full autograd integration for end-to-end GPU training |
 
 ---
 
@@ -256,7 +256,7 @@ This is a learning project, not a production framework.
 
 - Greedy Hungarian matching (not full O(n³) algorithm)
 - Attention forward pass breaks autograd graph (output projection still trains)
-- Metal GPU backend has per-op synchronous dispatch (command batching planned for M7)
+- GPU training step is slower than CPU at batch=64 due to `dispatch_reduce` sync in `mean()`; larger batches would favor GPU
 
 ---
 

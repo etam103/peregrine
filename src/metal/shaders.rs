@@ -624,6 +624,179 @@ kernel void layernorm_backward_f32(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Gather: out[i] = input[indices[i]]
+// ---------------------------------------------------------------------------
+
+kernel void gather_f32(
+    device const float* input   [[buffer(0)]],
+    device const uint* indices  [[buffer(1)]],
+    device float* out           [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = input[indices[idx]];
+}
+
+// Scatter-add: grad_input[indices[i]] += grad[i]  (atomic for safety)
+kernel void scatter_add_f32(
+    device const float* grad      [[buffer(0)]],
+    device const uint* indices    [[buffer(1)]],
+    device float* grad_input      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    atomic_fetch_add_explicit(
+        (device atomic_float*)&grad_input[indices[idx]],
+        grad[idx],
+        memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Bias add: out[i] = input[i] + bias[i % cols]
+// ---------------------------------------------------------------------------
+
+kernel void bias_add_f32(
+    device const float* input [[buffer(0)]],
+    device const float* bias  [[buffer(1)]],
+    device float* out         [[buffer(2)]],
+    constant uint& cols       [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = input[idx] + bias[idx % cols];
+}
+
+// ---------------------------------------------------------------------------
+// Bias gradient: sum grad over rows → bias_grad[col] = sum_r grad[r, col]
+// ---------------------------------------------------------------------------
+
+kernel void bias_grad_sum_f32(
+    device const float* grad     [[buffer(0)]],
+    device float* bias_grad      [[buffer(1)]],
+    constant uint& rows          [[buffer(2)]],
+    constant uint& cols          [[buffer(3)]],
+    uint col [[thread_position_in_grid]])
+{
+    if (col >= cols) return;
+    float sum = 0.0f;
+    for (uint r = 0; r < rows; r++) {
+        sum += grad[r * cols + col];
+    }
+    bias_grad[col] = sum;
+}
+
+// ---------------------------------------------------------------------------
+// Log-softmax: out[i] = x[i] - max - log(sum(exp(x - max)))
+// One threadgroup per row, same structure as softmax_f32
+// ---------------------------------------------------------------------------
+
+kernel void log_softmax_f32(
+    device const float* input   [[buffer(0)]],
+    device float* output        [[buffer(1)]],
+    constant SoftmaxParams& p   [[buffer(2)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    uint row = gid;
+    if (row >= p.batch) return;
+
+    device const float* row_in = input + row * p.dim;
+    device float* row_out = output + row * p.dim;
+
+    threadgroup float shared[256];
+
+    // 1. Find max
+    float local_max = -INFINITY;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        local_max = max(local_max, row_in[i]);
+    }
+    shared[lid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride && lid + stride < group_size) {
+            shared[lid] = max(shared[lid], shared[lid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = shared[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Compute sum(exp(x - max))
+    float local_sum = 0.0f;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        local_sum += exp(row_in[i] - row_max);
+    }
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride && lid + stride < group_size) {
+            shared[lid] += shared[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float log_sum = log(shared[0]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Output: x - max - log(sum_exp)
+    for (uint i = lid; i < p.dim; i += group_size) {
+        row_out[i] = row_in[i] - row_max - log_sum;
+    }
+}
+
+// Log-softmax backward: grad_input[i] = grad[i] - exp(output[i]) * sum(grad)
+// One threadgroup per row
+kernel void log_softmax_backward_f32(
+    device const float* log_softmax_out [[buffer(0)]],
+    device const float* grad            [[buffer(1)]],
+    device float* grad_input            [[buffer(2)]],
+    constant SoftmaxParams& p           [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    uint row = gid;
+    if (row >= p.batch) return;
+
+    device const float* y = log_softmax_out + row * p.dim;
+    device const float* g = grad + row * p.dim;
+    device float* gi = grad_input + row * p.dim;
+
+    threadgroup float shared[256];
+
+    // Compute sum(grad) for this row
+    float local_sum = 0.0f;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        local_sum += g[i];
+    }
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride && lid + stride < group_size) {
+            shared[lid] += shared[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum_grad = shared[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // grad_input[i] = grad[i] - exp(log_softmax[i]) * sum(grad)
+    for (uint i = lid; i < p.dim; i += group_size) {
+        gi[i] = g[i] - exp(y[i]) * sum_grad;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scale-fill: dst[i] = src[0] * scalar (broadcast scalar from reduction)
+// ---------------------------------------------------------------------------
+
+kernel void scale_fill_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant float& scalar  [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    dst[idx] = src[0] * scalar;
+}
+
 // Fused Adam optimizer step
 struct AdamParams {
     float lr;

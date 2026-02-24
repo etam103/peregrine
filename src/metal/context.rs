@@ -2,6 +2,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use super::buffer::GpuBuffer;
@@ -23,6 +24,7 @@ pub struct GpuContext {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) pool: BufferPool,
+    pending_cmd: RefCell<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
 }
 
 impl GpuContext {
@@ -55,6 +57,11 @@ impl GpuContext {
             "relu_backward_f32", "sigmoid_backward_f32", "tanh_backward_f32",
             "gelu_backward_f32", "accumulate_f32", "fill_f32",
             "softmax_backward_f32", "layernorm_backward_f32", "adam_step_f32",
+            // New forward/backward kernels
+            "bias_add_f32", "bias_grad_sum_f32",
+            "log_softmax_f32", "log_softmax_backward_f32",
+            "scale_fill_f32",
+            "gather_f32", "scatter_add_f32",
         ];
 
         let mut pipelines = HashMap::new();
@@ -71,7 +78,7 @@ impl GpuContext {
 
         let pool = BufferPool::new(&device);
 
-        Ok(GpuContext { device, queue, pipelines, pool })
+        Ok(GpuContext { device, queue, pipelines, pool, pending_cmd: RefCell::new(None) })
     }
 
     /// Device name (e.g. "Apple M2 Max").
@@ -111,6 +118,27 @@ impl GpuContext {
         GpuBuffer::from_raw(raw, len)
     }
 
+    // --- Command batching ---
+
+    /// Lazily create or return the pending command buffer.
+    fn ensure_cmd(&self) -> std::cell::RefMut<'_, Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>> {
+        let mut cmd = self.pending_cmd.borrow_mut();
+        if cmd.is_none() {
+            *cmd = Some(self.queue.commandBuffer().expect("command buffer"));
+        }
+        cmd
+    }
+
+    /// Commit the pending command buffer and wait for completion.
+    /// No-op if no commands are pending.
+    pub fn sync(&self) {
+        let cmd = self.pending_cmd.borrow_mut().take();
+        if let Some(cmd) = cmd {
+            cmd.commit();
+            cmd.waitUntilCompleted();
+        }
+    }
+
     // --- Dispatch helpers ---
 
     /// Dispatch a binary element-wise op: out[i] = op(a[i], b[i]).
@@ -126,7 +154,8 @@ impl GpuContext {
         assert_eq!(n, out.len());
 
         let pipeline = &self.pipelines[kernel];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
 
         enc.setComputePipelineState(pipeline);
@@ -142,8 +171,6 @@ impl GpuContext {
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch a unary element-wise op: out[i] = op(a[i]).
@@ -157,7 +184,8 @@ impl GpuContext {
         assert_eq!(n, out.len());
 
         let pipeline = &self.pipelines[kernel];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
 
         enc.setComputePipelineState(pipeline);
@@ -172,8 +200,6 @@ impl GpuContext {
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch a backward unary op: out[i] = kernel(cached[i], grad[i]).
@@ -190,7 +216,8 @@ impl GpuContext {
         assert_eq!(n, out.len());
 
         let pipeline = &self.pipelines[kernel];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
 
         enc.setComputePipelineState(pipeline);
@@ -206,8 +233,6 @@ impl GpuContext {
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// In-place accumulate: a[i] += b[i].
@@ -220,7 +245,8 @@ impl GpuContext {
         assert_eq!(n, b.len());
 
         let pipeline = &self.pipelines["accumulate_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
 
         enc.setComputePipelineState(pipeline);
@@ -235,8 +261,6 @@ impl GpuContext {
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Fill a buffer with a scalar value.
@@ -247,7 +271,8 @@ impl GpuContext {
     ) {
         let n = out.len();
         let pipeline = &self.pipelines["fill_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
 
         enc.setComputePipelineState(pipeline);
@@ -266,8 +291,6 @@ impl GpuContext {
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch scale: out[i] = a[i] * scalar.
@@ -281,7 +304,8 @@ impl GpuContext {
         assert_eq!(n, out.len());
 
         let pipeline = &self.pipelines["scale_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
 
         enc.setComputePipelineState(pipeline);
@@ -301,8 +325,6 @@ impl GpuContext {
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch matmul: C = op(A)[M,K] @ op(B)[K,N], optionally fused with bias and relu.
@@ -338,7 +360,8 @@ impl GpuContext {
         };
 
         let pipeline = &self.pipelines["matmul_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
 
         enc.setComputePipelineState(pipeline);
@@ -367,8 +390,6 @@ impl GpuContext {
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch softmax over rows: out[b][i] = softmax(in[b][:])[i].
@@ -388,7 +409,8 @@ impl GpuContext {
         let params = SoftmaxParams { batch, dim };
 
         let pipeline = &self.pipelines["softmax_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
 
         enc.setComputePipelineState(pipeline);
@@ -410,8 +432,6 @@ impl GpuContext {
         );
 
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch softmax backward.
@@ -432,7 +452,8 @@ impl GpuContext {
         let params = SoftmaxParams { batch, dim };
 
         let pipeline = &self.pipelines["softmax_backward_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
 
         enc.setComputePipelineState(pipeline);
@@ -454,8 +475,6 @@ impl GpuContext {
         );
 
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch a reduction op (sum/max/min). Returns a single f32 result.
@@ -469,23 +488,26 @@ impl GpuContext {
         let partial: GpuBuffer<f32> = GpuBuffer::new(&self.device, num_groups);
         let count = n as u32;
 
-        let cmd = self.queue.commandBuffer().expect("command buffer");
-        let enc = cmd.computeCommandEncoder().expect("encoder");
-        enc.setComputePipelineState(pipeline);
-        unsafe {
-            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
-            enc.setBuffer_offset_atIndex(Some(partial.raw()), 0, 1);
-            enc.setBytes_length_atIndex(
-                std::ptr::NonNull::new(&count as *const _ as *mut _).unwrap(),
-                4, 2,
-            );
-        }
-        let grid = MTLSize { width: num_groups * group_size, height: 1, depth: 1 };
-        let tg = MTLSize { width: group_size, height: 1, depth: 1 };
-        enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
-        enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
+        {
+            let cmd_ref = self.ensure_cmd();
+            let cmd = cmd_ref.as_ref().unwrap();
+            let enc = cmd.computeCommandEncoder().expect("encoder");
+            enc.setComputePipelineState(pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(partial.raw()), 0, 1);
+                enc.setBytes_length_atIndex(
+                    std::ptr::NonNull::new(&count as *const _ as *mut _).unwrap(),
+                    4, 2,
+                );
+            }
+            let grid = MTLSize { width: num_groups * group_size, height: 1, depth: 1 };
+            let tg = MTLSize { width: group_size, height: 1, depth: 1 };
+            enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
+            enc.endEncoding();
+        } // drop RefMut guard before sync
+
+        self.sync();
 
         // CPU-side final reduction of partial sums
         let partials = partial.read();
@@ -509,7 +531,8 @@ impl GpuContext {
         let params = TransposeParams { rows, cols };
 
         let pipeline = &self.pipelines["transpose_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
         enc.setComputePipelineState(pipeline);
         unsafe {
@@ -527,8 +550,6 @@ impl GpuContext {
         let tg = MTLSize { width: side.min(cols as usize), height: side.min(rows as usize), depth: 1 };
         enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch layernorm: y = gamma * (x - mean) / sqrt(var + eps) + beta.
@@ -546,7 +567,8 @@ impl GpuContext {
         let params = LayerNormParams { batch, dim, eps };
 
         let pipeline = &self.pipelines["layernorm_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
         enc.setComputePipelineState(pipeline);
         unsafe {
@@ -566,8 +588,6 @@ impl GpuContext {
             MTLSize { width: threads_per_row, height: 1, depth: 1 },
         );
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch layernorm backward.
@@ -587,7 +607,8 @@ impl GpuContext {
         let params = LayerNormBackwardParams { batch, dim };
 
         let pipeline = &self.pipelines["layernorm_backward_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
         enc.setComputePipelineState(pipeline);
         unsafe {
@@ -610,8 +631,6 @@ impl GpuContext {
             MTLSize { width: threads_per_row, height: 1, depth: 1 },
         );
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
     }
 
     /// Dispatch fused Adam optimizer step.
@@ -644,7 +663,8 @@ impl GpuContext {
 
         let n = data.len();
         let pipeline = &self.pipelines["adam_step_f32"];
-        let cmd = self.queue.commandBuffer().expect("command buffer");
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
         let enc = cmd.computeCommandEncoder().expect("encoder");
         enc.setComputePipelineState(pipeline);
         unsafe {
@@ -663,16 +683,273 @@ impl GpuContext {
         let grid_size = MTLSize { width: n, height: 1, depth: 1 };
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
         enc.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
+    }
+
+    /// Dispatch bias add: out[i] = input[i] + bias[i % cols].
+    pub fn dispatch_bias_add(
+        &self,
+        input: &GpuBuffer<f32>,
+        bias: &GpuBuffer<f32>,
+        out: &GpuBuffer<f32>,
+        cols: u32,
+    ) {
+        let n = input.len();
+        assert_eq!(n, out.len());
+        assert_eq!(bias.len(), cols as usize);
+
+        let pipeline = &self.pipelines["bias_add_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(bias.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 2);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&cols as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch bias gradient sum: bias_grad[col] = sum_r grad[r, col].
+    pub fn dispatch_bias_grad_sum(
+        &self,
+        grad: &GpuBuffer<f32>,
+        bias_grad: &GpuBuffer<f32>,
+        rows: u32,
+        cols: u32,
+    ) {
+        assert_eq!(grad.len(), (rows * cols) as usize);
+        assert_eq!(bias_grad.len(), cols as usize);
+
+        let pipeline = &self.pipelines["bias_grad_sum_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(grad.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(bias_grad.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&rows as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<u32>(),
+                2,
+            );
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&cols as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(cols as usize), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: cols as usize, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch log-softmax over rows: out[b][i] = log_softmax(in[b][:])[i].
+    pub fn dispatch_log_softmax(
+        &self,
+        input: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        batch: u32,
+        dim: u32,
+    ) {
+        #[repr(C)]
+        struct SoftmaxParams {
+            batch: u32,
+            dim: u32,
+        }
+
+        let params = SoftmaxParams { batch, dim };
+
+        let pipeline = &self.pipelines["log_softmax_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<SoftmaxParams>(),
+                2,
+            );
+        }
+
+        let threads_per_row = (dim as usize).next_power_of_two().min(256);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: batch as usize, height: 1, depth: 1 },
+            MTLSize { width: threads_per_row, height: 1, depth: 1 },
+        );
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch log-softmax backward.
+    pub fn dispatch_log_softmax_backward(
+        &self,
+        log_softmax_out: &GpuBuffer<f32>,
+        grad: &GpuBuffer<f32>,
+        grad_input: &GpuBuffer<f32>,
+        batch: u32,
+        dim: u32,
+    ) {
+        #[repr(C)]
+        struct SoftmaxParams {
+            batch: u32,
+            dim: u32,
+        }
+
+        let params = SoftmaxParams { batch, dim };
+
+        let pipeline = &self.pipelines["log_softmax_backward_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(log_softmax_out.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(grad.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(grad_input.raw()), 0, 2);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<SoftmaxParams>(),
+                3,
+            );
+        }
+
+        let threads_per_row = (dim as usize).next_power_of_two().min(256);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: batch as usize, height: 1, depth: 1 },
+            MTLSize { width: threads_per_row, height: 1, depth: 1 },
+        );
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch scale-fill: dst[i] = src[0] * scalar.
+    pub fn dispatch_scale_fill(
+        &self,
+        src: &GpuBuffer<f32>,
+        dst: &GpuBuffer<f32>,
+        scalar: f32,
+    ) {
+        let n = dst.len();
+
+        let pipeline = &self.pipelines["scale_fill_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(src.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(dst.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&scalar as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<f32>(),
+                2,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch gather: out[i] = input[indices[i]].
+    pub fn dispatch_gather(
+        &self,
+        input: &GpuBuffer<f32>,
+        indices: &GpuBuffer<u32>,
+        out: &GpuBuffer<f32>,
+    ) {
+        let n = indices.len();
+        assert_eq!(n, out.len());
+
+        let pipeline = &self.pipelines["gather_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(indices.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 2);
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch scatter-add: grad_input[indices[i]] += grad[i].
+    /// `grad_input` must be pre-zeroed.
+    pub fn dispatch_scatter_add(
+        &self,
+        grad: &GpuBuffer<f32>,
+        indices: &GpuBuffer<u32>,
+        grad_input: &GpuBuffer<f32>,
+    ) {
+        let n = indices.len();
+        assert_eq!(n, grad.len());
+
+        let pipeline = &self.pipelines["scatter_add_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(grad.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(indices.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(grad_input.raw()), 0, 2);
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+}
+
+impl Drop for GpuContext {
+    fn drop(&mut self) {
+        self.sync();
     }
 }
 
 // ---------------------------------------------------------------------------
 // Thread-local GPU singleton
 // ---------------------------------------------------------------------------
-
-use std::cell::RefCell;
 
 thread_local! {
     static GPU_CONTEXT: RefCell<Option<GpuContext>> = const { RefCell::new(None) };
@@ -711,5 +988,15 @@ where
     GPU_CONTEXT.with(|ctx| {
         let mut ctx = ctx.borrow_mut();
         ctx.as_mut().map(f)
+    })
+}
+
+/// Flush any pending GPU commands. No-op if no GPU or no pending commands.
+pub fn gpu_sync() {
+    GPU_CONTEXT.with(|ctx| {
+        let ctx = ctx.borrow();
+        if let Some(ref gpu) = *ctx {
+            gpu.sync();
+        }
     })
 }

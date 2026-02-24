@@ -44,6 +44,7 @@ fn parity_gpu_cpu_add() {
         let b_gpu = gpu.upload(&b_data);
         let out = gpu.alloc(size);
         gpu.dispatch_binary("add_f32", &a_gpu, &b_gpu, &out);
+        gpu.sync();
         let gpu_result = out.read();
         let err = max_abs_error(&cpu_result, &gpu_result);
         assert!(err < 1e-6, "add size={size}: max err={err}");
@@ -61,6 +62,7 @@ fn parity_gpu_cpu_sub() {
     let b = gpu.upload(&b_data);
     let out = gpu.alloc(1024);
     gpu.dispatch_binary("sub_f32", &a, &b, &out);
+    gpu.sync();
     let err = max_abs_error(&cpu_result, &out.read());
     assert!(err < 1e-6, "sub: max err={err}");
 }
@@ -76,6 +78,7 @@ fn parity_gpu_cpu_mul() {
     let b = gpu.upload(&b_data);
     let out = gpu.alloc(1024);
     gpu.dispatch_binary("mul_f32", &a, &b, &out);
+    gpu.sync();
     let err = max_abs_error(&cpu_result, &out.read());
     assert!(err < 1e-6, "mul: max err={err}");
 }
@@ -91,6 +94,7 @@ fn parity_gpu_cpu_div() {
     let b = gpu.upload(&b_data);
     let out = gpu.alloc(1024);
     gpu.dispatch_binary("div_f32", &a, &b, &out);
+    gpu.sync();
     let err = max_abs_error(&cpu_result, &out.read());
     assert!(err < 1e-5, "div: max err={err}");
 }
@@ -108,6 +112,7 @@ macro_rules! parity_unary_test {
                 let a = gpu.upload(&data);
                 let out = gpu.alloc(size);
                 gpu.dispatch_unary($kernel, &a, &out);
+                gpu.sync();
                 let err = max_abs_error(&cpu_result, &out.read());
                 assert!(err < $tol, "{} size={}: max err={}", $kernel, size, err);
             }
@@ -140,6 +145,7 @@ fn parity_gpu_cpu_matmul() {
         let b = gpu.upload(&b_data);
         let c = gpu.alloc(m * n);
         gpu.dispatch_matmul(&a, &b, &c, None, m as u32, n as u32, k as u32, false, false, false);
+        gpu.sync();
         let err = max_abs_error(&cpu_result, &c.read());
         assert!(err < 1e-3, "matmul [{m}x{k}]@[{k}x{n}]: max err={err}");
     }
@@ -157,6 +163,7 @@ fn parity_gpu_cpu_matmul_large() {
     let b = gpu.upload(&b_data);
     let c = gpu.alloc(m * n);
     gpu.dispatch_matmul(&a, &b, &c, None, m as u32, n as u32, k as u32, false, false, false);
+    gpu.sync();
     let err = max_abs_error(&cpu_result, &c.read());
     assert!(err < 0.01, "matmul 256x256: max err={err}");
 }
@@ -172,6 +179,7 @@ fn parity_gpu_cpu_softmax() {
         let input = gpu.upload(&data);
         let output = gpu.alloc(batch * dim);
         gpu.dispatch_softmax(&input, &output, batch as u32, dim as u32);
+        gpu.sync();
         let err = max_abs_error(&cpu_result, &output.read());
         assert!(err < 1e-5, "softmax [{batch}x{dim}]: max err={err}");
     }
@@ -185,6 +193,7 @@ fn parity_gpu_cpu_softmax_large_values() {
     let input = gpu.upload(&data);
     let output = gpu.alloc(80);
     gpu.dispatch_softmax(&input, &output, 8, 10);
+    gpu.sync();
     let err = max_abs_error(&cpu_result, &output.read());
     assert!(err < 1e-5, "softmax large values: max err={err}");
 }
@@ -238,6 +247,7 @@ fn parity_gpu_cpu_transpose() {
         let input = gpu.upload(&data);
         let output = gpu.alloc(rows * cols);
         gpu.dispatch_transpose(&input, &output, rows as u32, cols as u32);
+        gpu.sync();
         let err = max_abs_error(&cpu_result, &output.read());
         assert!(err < 1e-7, "transpose [{rows}x{cols}]: max err={err}");
     }
@@ -266,6 +276,7 @@ fn parity_gpu_cpu_layernorm() {
         let output_buf = gpu.alloc(batch * dim);
         gpu.dispatch_layernorm(&input_buf, &gamma_buf, &beta_buf, &output_buf,
                                batch as u32, dim as u32, 1e-5);
+        gpu.sync();
         let gpu_result = output_buf.read();
 
         let err = max_abs_error(&cpu_result, &gpu_result);

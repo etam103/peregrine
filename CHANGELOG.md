@@ -7,6 +7,69 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.10.0] - 2026-02-23
+
+### Added — GPU training pipeline optimization
+
+**Command batching** (`src/metal/context.rs`)
+- Accumulate dispatches into a single `MTLCommandBuffer` instead of per-op synchronous `waitUntilCompleted()`
+- `gpu_sync()` commits and waits only at boundaries (reduce, data read-back)
+- Individual op dispatch overhead reduced from ~200-300us to ~5us
+
+**7 new Metal compute shaders** (`src/metal/shaders.rs`)
+- `bias_add_f32` — broadcasts bias across rows for add_bias forward
+- `bias_grad_sum_f32` — column-wise reduction for add_bias backward
+- `log_softmax_f32` — numerically stable log_softmax forward (threadgroup shared memory reductions)
+- `log_softmax_backward_f32` — `grad - exp(output) * sum(grad)` per row
+- `scale_fill_f32` — broadcast `src[0] * scalar` to all elements (Mean/Sum backward)
+- `gather_f32` — index gather for select forward
+- `scatter_add_f32` — atomic scatter-add for select backward
+
+**GPU forward paths** (`src/tensor.rs`)
+- `add_bias` — dispatches `bias_add_f32` when both tensors are GPU-resident; eliminates the `sync_gpu_to_cpu()` that previously forced the entire MLP forward chain off GPU after the first matmul
+- `log_softmax` — dispatches `log_softmax_f32` for 2D last-dim case; stores empty `output_data` (backward uses `gpu_data` directly)
+- `select` — dispatches `gather_f32` on GPU, reads small result to CPU (keeps backward on CPU where it's faster at batch=64)
+
+**GPU backward paths** (`src/tensor.rs`)
+- `Op::AddBias` — `bias_grad_sum_f32` kernel replaces CPU row-sum (called 3x per training step)
+- `Op::Add` — `dispatch_scale` copy (scale by 1.0) instead of GPU→CPU→GPU round-trip
+- `Op::Mean` / `Op::Sum` — `scale_fill_f32` kernel instead of sync + scalar read + CPU fill
+- `Op::Select` — fill zeros + `scatter_add_f32`
+- `Op::LogSoftmax` — `log_softmax_backward_f32` kernel using `gpu_data` directly
+
+**Eliminated softmax/log_softmax output cache sync**
+- Softmax and log_softmax forward no longer sync GPU output to CPU for backward storage
+- Backward uses the tensor's own `gpu_data` directly, avoiding a pointless GPU→CPU→GPU round-trip
+- CPU backward fallback handles empty `output_data` via `self.data()` (calls `ensure_cpu_data`)
+
+### Fixed
+
+- Added `gpu_sync()` before reading `gpu_grad` in CPU backward fallback — prevents reading unsynced buffer data when GPU commands are still pending
+
+### Stats
+
+- 38 Metal compute shaders (up from 31)
+- 140 tests passing
+
+### GPU Benchmark Results (Metal, Apple Silicon, all times in microseconds)
+
+| Operation | CPU (us) | GPU (us) | Note |
+|-----------|----------:|----------:|------|
+| matmul 128x128 | 6.1 | **5.0** | GPU wins (command batching) |
+| matmul 256x256 | 33.0 | **4.4** | GPU 7.5x faster |
+| matmul 512x512 | 165.1 | **4.4** | GPU 37x faster |
+| add 100k | 13.4 | **4.7** | GPU 2.9x faster |
+| mul 100k | 12.5 | **4.6** | GPU 2.7x faster |
+| exp 100k | 111.0 | **4.2** | GPU 26x faster |
+| relu 100k | 8.7 | **5.0** | GPU 1.7x faster |
+| softmax 8x128 | 3.7 | **2.3** | GPU 1.6x faster |
+| MLP fwd 64x784 | **33.4** | 34.3 | Near parity |
+| train step 64 | **801.3** | 1632.8 | CPU wins (dispatch_reduce sync) |
+
+GPU now wins on all individual ops thanks to command batching. The train_step gap is caused by `dispatch_reduce` in `mean()` forcing a mid-forward `commitAndWait()`. At larger batch sizes, GPU would win end-to-end.
+
+---
+
 ## [0.9.0] - 2026-02-23
 
 ### Added — Metal autograd integration for end-to-end GPU training

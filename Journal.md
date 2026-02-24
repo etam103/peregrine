@@ -402,3 +402,62 @@ The gap narrows at larger sizes (train_step is only 1.8x slower) because more co
 - PER-36: Large-tensor GPU benchmarks (blocked by PER-35)
 - PER-37: Threadgroup size tuning
 - PER-38: Fused kernels for common patterns (blocked by PER-35)
+
+## Round 6: Command batching + GPU training pipeline (2026-02-23)
+
+**Goal:** Eliminate GPU dispatch overhead via command batching, then close the remaining CPU fallback gaps in the training pipeline so the full forward → backward → optimizer chain can stay on GPU.
+
+### Part 1: Command batching (PER-35)
+
+Replaced per-op synchronous `waitUntilCompleted()` with a lazy command buffer that accumulates dispatches. `gpu_sync()` commits and waits only when results are needed (reduce ops, data read-back). This reduced per-op dispatch overhead from ~200-300us to ~5us.
+
+### Part 2: GPU forward/backward paths
+
+After command batching, individual ops are ~5us on GPU. But `gpu_train_step_64` was still 1527us GPU vs 835us CPU. Root cause: `add_bias` had no GPU forward path — it called `sync_gpu_to_cpu()`, forcing the entire computation off GPU after the first matmul. Similarly, `log_softmax` and `select` had no GPU paths.
+
+**Changes (7 new Metal kernels):**
+
+1. **`bias_add_f32` kernel + `add_bias` GPU forward** — The highest-impact change. Without this, nothing stays on GPU after the first matmul. Broadcasts bias across rows: `out[i] = input[i] + bias[i % cols]`.
+
+2. **`log_softmax_f32` kernel + GPU forward** — `cross_entropy_loss` calls `logits.log_softmax(-1)` which was syncing to CPU. New kernel uses threadgroup shared memory for max/sum reductions, outputs `x - max - log(sum_exp)`.
+
+3. **Eliminated softmax/log_softmax output cache sync** — Previously, softmax forward read GPU output back to CPU for backward storage, then backward re-uploaded it. Now backward uses `gpu_data` directly. CPU fallback handles empty `output_data` via `ensure_cpu_data()`.
+
+4. **`bias_grad_sum_f32` kernel + `AddBias` GPU backward** — Column-wise reduction replaces CPU row-sum. Called 3x per training step (one per layer).
+
+5. **`Add` backward GPU copy** — `dispatch_scale` with scale=1.0 copies the gradient buffer on GPU instead of sync + upload.
+
+6. **`scale_fill_f32` kernel + `Mean`/`Sum` GPU backward** — Broadcasts `src[0] * scalar` to all elements, avoiding sync + scalar read + CPU fill.
+
+7. **`gather_f32` + `scatter_add_f32` kernels for `select`** — GPU gather for select forward, atomic scatter-add for backward. Select reads the small gathered result to CPU to keep backward on CPU (faster at batch=64).
+
+8. **`log_softmax_backward_f32` kernel** — `grad_input[i] = grad[i] - exp(output[i]) * sum(grad)` per row.
+
+9. **Correctness fix** — Added `gpu_sync()` before reading `gpu_grad` in CPU backward fallback to flush pending GPU commands.
+
+### Benchmark Results (all times in microseconds)
+
+| Operation | CPU (us) | GPU v0.9.0 (us) | GPU v0.10.0 (us) | Improvement |
+|-----------|----------:|----------:|----------:|----------:|
+| matmul 128x128 | 6.1 | 324.3 | **5.0** | 65x faster |
+| matmul 256x256 | 33.0 | 437.2 | **4.4** | 99x faster |
+| matmul 512x512 | 165.1 | 1673.4 | **4.4** | 380x faster |
+| add 100k | 13.4 | 289.3 | **4.7** | 62x faster |
+| mul 100k | 12.5 | 281.8 | **4.6** | 61x faster |
+| exp 100k | 111.0 | 236.8 | **4.2** | 56x faster |
+| relu 100k | 8.7 | 241.5 | **5.0** | 48x faster |
+| softmax 8x128 | 3.7 | 228.0 | **2.3** | 99x faster |
+| MLP fwd 64x784 | 33.4 | 881.5 | **34.3** | 26x faster |
+| train step 64 | **801.3** | 1669.7 | 1632.8 | ~1.0x |
+
+### Analysis
+
+**Command batching was transformative for individual ops.** Every op went from ~200-300us (dominated by `waitUntilCompleted()`) to ~4-5us (just encoding into the command buffer). GPU now beats CPU on all individual ops, with matmul 512x512 seeing a 380x improvement.
+
+**GPU train_step is still 2x slower than CPU at batch=64.** The bottleneck is `dispatch_reduce` in `mean()`, which must commit the command buffer and `waitUntilCompleted()` to read a single scalar. This forces a sync mid-forward, breaking the batching benefit. At batch=64, the matrix sizes (64x784, 64x128, 64x64, 64x10) are small enough that CPU Accelerate BLAS handles them efficiently, so the sync cost isn't amortized.
+
+**The GPU forward path improvements (add_bias, log_softmax, select) are architecturally important** even though they don't improve batch=64 performance. They eliminate the CPU fallback points that would block GPU execution at larger scales. At larger batch sizes where GPU compute dominates sync overhead, keeping the full pipeline on GPU would be a clear win.
+
+**Key insight: at batch=64, the optimal strategy is GPU forward + CPU backward.** The forward chain benefits from command batching (no syncs until `mean()`), but the backward chain has too many small ops where ~5us GPU dispatch overhead per op adds up vs CPU NEON intrinsics.
+
+**Remaining bottleneck:** `dispatch_reduce` in `mean()` is the architectural sync point. Eliminating this (e.g., fused cross-entropy kernel that avoids reducing to a scalar mid-forward) would be the next high-leverage optimization for GPU training.

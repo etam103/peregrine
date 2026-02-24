@@ -532,6 +532,7 @@ impl Tensor {
     /// Sync GPU→CPU and drop GPU buffers.
     #[cfg(feature = "metal")]
     pub fn to_cpu(&self) {
+        crate::metal::gpu_sync();
         let mut inner = self.0.borrow_mut();
         if inner.gpu_dirty {
             if let Some(ref buf) = inner.gpu_data {
@@ -554,6 +555,9 @@ impl Tensor {
     #[cfg(feature = "metal")]
     fn ensure_cpu_data(inner: &mut TensorInner) {
         if inner.gpu_dirty {
+            if let Some(ref _buf) = inner.gpu_data {
+                crate::metal::gpu_sync();
+            }
             if let Some(ref buf) = inner.gpu_data {
                 inner.data = buf.read();
             }
@@ -565,6 +569,9 @@ impl Tensor {
     #[cfg(feature = "metal")]
     fn ensure_cpu_grad(inner: &mut TensorInner) {
         if inner.grad.is_none() {
+            if let Some(ref _buf) = inner.gpu_grad {
+                crate::metal::gpu_sync();
+            }
             if let Some(ref buf) = inner.gpu_grad {
                 inner.grad = Some(buf.read());
             }
@@ -908,6 +915,33 @@ impl Tensor {
     /// Broadcast add: self is [batch, features], bias is [1, features]
     pub fn add_bias(&self, bias: &Tensor) -> Tensor {
         #[cfg(feature = "metal")]
+        {
+            let both_gpu = {
+                let a = self.0.borrow();
+                let b = bias.0.borrow();
+                a.gpu_data.is_some() && b.gpu_data.is_some()
+            };
+            if both_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = bias.0.borrow();
+                    assert_eq!(a.shape.len(), 2);
+                    assert_eq!(b.shape.len(), 2);
+                    assert_eq!(b.shape[0], 1);
+                    assert_eq!(a.shape[1], b.shape[1]);
+                    let cols = a.shape[1] as u32;
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_bias_add(a_buf, b_buf, &out, cols);
+                    (out, a.shape.clone())
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1,
+                        Op::AddBias(self.clone(), bias.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
         { self.sync_gpu_to_cpu(); bias.sync_gpu_to_cpu(); }
         let a = self.0.borrow();
         let b = bias.0.borrow();
@@ -1238,6 +1272,29 @@ impl Tensor {
     /// out[i] = self.data[indices[i]]
     pub fn select(&self, indices: &[usize]) -> Tensor {
         #[cfg(feature = "metal")]
+        {
+            let has_gpu = self.0.borrow().gpu_data.is_some();
+            if has_gpu {
+                // GPU gather: avoids syncing the full input buffer to CPU.
+                // We sync+read only the small gathered result, keeping backward on CPU
+                // (faster for the small tensors in the loss tail).
+                if let Some(data) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+                    let idx_buf = gpu.upload(&indices_u32);
+                    let out: crate::metal::GpuBuffer<f32> = gpu.alloc(indices.len());
+                    gpu.dispatch_gather(buf, &idx_buf, &out);
+                    gpu.sync();
+                    out.read()
+                }) {
+                    let n = data.len();
+                    return Tensor::from_op(data, vec![n],
+                        Op::Select(self.clone(), indices.to_vec()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
         self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let data: Vec<f32> = indices.iter().map(|&i| inner.data[i]).collect();
@@ -1374,10 +1431,9 @@ impl Tensor {
                         let ndim = inner.shape.len();
                         if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize }
                     };
-                    // We need output_data for the backward pass — read it back
-                    let output_data = result.0.read();
+                    // Store empty output_data — backward will use gpu_data directly
                     return Tensor::from_gpu_op(result.0, result.1.clone(),
-                        Op::Softmax { input: self.clone(), output_data, dim: dim_usize });
+                        Op::Softmax { input: self.clone(), output_data: Vec::new(), dim: dim_usize });
                 }
             }
         }
@@ -1428,6 +1484,36 @@ impl Tensor {
 
     /// Numerically stable log-softmax: log(softmax(x)) = x - max - log(sum(exp(x - max)))
     pub fn log_softmax(&self, dim: isize) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let can_gpu = {
+                let inner = self.0.borrow();
+                inner.gpu_data.is_some() && inner.shape.len() == 2
+            };
+            if can_gpu {
+                let dim_usize = {
+                    let inner = self.0.borrow();
+                    let ndim = inner.shape.len();
+                    if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize }
+                };
+                if dim_usize == 1 {
+                    if let Some(result) = crate::metal::with_gpu(|gpu| {
+                        let inner = self.0.borrow();
+                        let buf = inner.gpu_data.as_ref().unwrap();
+                        let batch = inner.shape[0] as u32;
+                        let dim_size = inner.shape[1] as u32;
+                        let out = gpu.alloc(buf.len());
+                        gpu.dispatch_log_softmax(buf, &out, batch, dim_size);
+                        let shape = inner.shape.clone();
+                        (out, shape)
+                    }) {
+                        // Store empty output_data — backward will use gpu_data directly
+                        return Tensor::from_gpu_op(result.0, result.1,
+                            Op::LogSoftmax { input: self.clone(), output_data: Vec::new(), dim: dim_usize });
+                    }
+                }
+            }
+        }
         #[cfg(feature = "metal")]
         self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
@@ -1502,6 +1588,7 @@ impl Tensor {
                 }) {
                     // Need normalized and inv_std for backward — compute on CPU from GPU output
                     // For simplicity, read back and compute
+                    crate::metal::gpu_sync();
                     let inner = self.0.borrow();
                     let total = inner.gpu_data.as_ref().unwrap().len();
                     let num_instances = total / normalized_shape;
@@ -2223,6 +2310,7 @@ impl Tensor {
                     return; // GPU backward handled it
                 }
                 // GPU backward couldn't handle this op — sync grad and data to CPU and fall through
+                crate::metal::gpu_sync(); // flush pending GPU commands before reading buffers
                 let mut inner = self.0.borrow_mut();
                 if inner.grad.is_none() {
                     if let Some(ref buf) = inner.gpu_grad {
@@ -2782,6 +2870,8 @@ impl Tensor {
                 }
             }
             Op::Softmax { ref input, ref output_data, dim } => {
+                // If output_data is empty (GPU forward path), recover from self.data()
+                let out_data = if output_data.is_empty() { self.data() } else { output_data.clone() };
                 let in_shape = input.shape();
                 let outer: usize = in_shape[..dim].iter().product();
                 let dim_size = in_shape[dim];
@@ -2795,17 +2885,19 @@ impl Tensor {
                         let mut dot = 0.0f32;
                         for d in 0..dim_size {
                             let idx = base + d * inner_size;
-                            dot += grad[idx] * output_data[idx];
+                            dot += grad[idx] * out_data[idx];
                         }
                         for d in 0..dim_size {
                             let idx = base + d * inner_size;
-                            grad_input[idx] = output_data[idx] * (grad[idx] - dot);
+                            grad_input[idx] = out_data[idx] * (grad[idx] - dot);
                         }
                     }
                 }
                 accumulate_grad(input, &grad_input);
             }
             Op::LogSoftmax { ref input, ref output_data, dim } => {
+                // If output_data is empty (GPU forward path), recover from self.data()
+                let out_data = if output_data.is_empty() { self.data() } else { output_data.clone() };
                 let in_shape = input.shape();
                 let outer: usize = in_shape[..dim].iter().product();
                 let dim_size = in_shape[dim];
@@ -2826,7 +2918,7 @@ impl Tensor {
                         for d in 0..dim_size {
                             let idx = base + d * inner_size;
                             // softmax = exp(log_softmax)
-                            grad_input[idx] = grad[idx] - output_data[idx].exp() * sum_grad;
+                            grad_input[idx] = grad[idx] - out_data[idx].exp() * sum_grad;
                         }
                     }
                 }
@@ -3265,9 +3357,12 @@ impl Tensor {
                     return false;
                 }
                 // For add: grad passes through to both inputs
-                // Copy the grad buffer for the second input (shared memory = cheap read)
-                let grad_data = gpu_grad.read();
-                if let Some(grad_copy) = crate::metal::with_gpu(|gpu| gpu.upload(&grad_data)) {
+                // Copy via scale-by-1 (no sync needed)
+                if let Some(grad_copy) = crate::metal::with_gpu(|gpu| {
+                    let copy = gpu.alloc(gpu_grad.len());
+                    gpu.dispatch_scale(&gpu_grad, &copy, 1.0);
+                    copy
+                }) {
                     self.0.borrow_mut().op = Op::None;
                     gpu_accumulate_grad(a, gpu_grad);
                     gpu_accumulate_grad(b, grad_copy);
@@ -3501,13 +3596,11 @@ impl Tensor {
                 }
             }
             Op::Sum(ref input) => {
-                // grad_input = broadcast scalar grad to all elements
+                // grad_input = broadcast scalar grad to all elements (no sync)
                 let n = input.size();
                 let handled = crate::metal::with_gpu(|gpu| {
                     let gi = gpu.alloc(n);
-                    // Read scalar grad value
-                    let grad_val = gpu_grad.read()[0];
-                    gpu.dispatch_fill(&gi, grad_val);
+                    gpu.dispatch_scale_fill(&gpu_grad, &gi, 1.0);
                     gi
                 });
                 if let Some(gi) = handled {
@@ -3522,8 +3615,7 @@ impl Tensor {
                 let n = input.size();
                 let handled = crate::metal::with_gpu(|gpu| {
                     let gi = gpu.alloc(n);
-                    let grad_val = gpu_grad.read()[0] / n as f32;
-                    gpu.dispatch_fill(&gi, grad_val);
+                    gpu.dispatch_scale_fill(&gpu_grad, &gi, 1.0 / n as f32);
                     gi
                 });
                 if let Some(gi) = handled {
@@ -3542,12 +3634,51 @@ impl Tensor {
                     self.0.borrow_mut().gpu_grad = Some(gpu_grad);
                     return false;
                 }
+                // Use self's gpu_data directly (the softmax output); fall back to output_data
+                let self_has_gpu = self.0.borrow().gpu_data.is_some();
                 let handled = crate::metal::with_gpu(|gpu| {
-                    let softmax_buf = gpu.upload(output_data);
                     let gi = gpu.alloc(gpu_grad.len());
                     let batch = in_shape[0] as u32;
                     let dim_size = in_shape[1] as u32;
-                    gpu.dispatch_softmax_backward(&softmax_buf, &gpu_grad, &gi, batch, dim_size);
+                    if self_has_gpu {
+                        let self_inner = self.0.borrow();
+                        let softmax_buf = self_inner.gpu_data.as_ref().unwrap();
+                        gpu.dispatch_softmax_backward(softmax_buf, &gpu_grad, &gi, batch, dim_size);
+                    } else {
+                        let softmax_buf = gpu.upload(output_data);
+                        gpu.dispatch_softmax_backward(&softmax_buf, &gpu_grad, &gi, batch, dim_size);
+                    }
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::LogSoftmax { ref input, ref output_data, dim } => {
+                let in_shape = input.shape();
+                let is_2d_last = in_shape.len() == 2 && dim == in_shape.len() - 1;
+                if !is_2d_last {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                // Use self's gpu_data (log_softmax output); fall back to output_data
+                let self_has_gpu = self.0.borrow().gpu_data.is_some();
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let gi = gpu.alloc(gpu_grad.len());
+                    let batch = in_shape[0] as u32;
+                    let dim_size = in_shape[1] as u32;
+                    if self_has_gpu {
+                        let self_inner = self.0.borrow();
+                        let lsm_buf = self_inner.gpu_data.as_ref().unwrap();
+                        gpu.dispatch_log_softmax_backward(lsm_buf, &gpu_grad, &gi, batch, dim_size);
+                    } else {
+                        let lsm_buf = gpu.upload(output_data);
+                        gpu.dispatch_log_softmax_backward(&lsm_buf, &gpu_grad, &gi, batch, dim_size);
+                    }
                     gi
                 });
                 if let Some(gi) = handled {
@@ -3559,6 +3690,7 @@ impl Tensor {
                 }
             }
             Op::LayerNorm { ref input, ref gamma, ref beta, ref normalized, ref inv_std } => {
+                crate::metal::gpu_sync();
                 let handled = crate::metal::with_gpu(|gpu| {
                     let g_inner = gamma.0.borrow();
                     let normalized_shape = g_inner.data.len();
@@ -3595,6 +3727,7 @@ impl Tensor {
                     self.0.borrow_mut().op = Op::None;
                     gpu_accumulate_grad(input, gi);
                     // For gamma/beta, sync back to CPU grad since they're typically small
+                    crate::metal::gpu_sync();
                     accumulate_grad(gamma, &gg.read());
                     accumulate_grad(beta, &gb.read());
                 } else {
@@ -3604,22 +3737,24 @@ impl Tensor {
             }
             Op::AddBias(ref input, ref bias) => {
                 // input grad = grad (pass-through)
-                // bias grad = sum over rows
+                // bias grad = sum over rows (GPU kernel)
                 let bias_inner = bias.0.borrow();
                 let cols = bias_inner.shape[1];
                 let rows = input.0.borrow().shape[0];
                 drop(bias_inner);
-                // Read grad and compute bias grad on CPU (it's small)
-                let grad_data = gpu_grad.read();
-                let mut grad_bias = vec![0.0f32; cols];
-                for r in 0..rows {
-                    for c in 0..cols {
-                        grad_bias[c] += grad_data[r * cols + c];
-                    }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let bias_grad = gpu.alloc(cols);
+                    gpu.dispatch_bias_grad_sum(&gpu_grad, &bias_grad, rows as u32, cols as u32);
+                    bias_grad
+                });
+                if let Some(bg) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gpu_grad);
+                    gpu_accumulate_grad(bias, bg);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
                 }
-                self.0.borrow_mut().op = Op::None;
-                gpu_accumulate_grad(input, gpu_grad);
-                accumulate_grad(bias, &grad_bias);
             }
             Op::Transpose { ref input, dim0, dim1 } => {
                 if dim0 == dim1 {
@@ -3656,6 +3791,24 @@ impl Tensor {
                 // These are shape-only ops, gradient passes through
                 self.0.borrow_mut().op = Op::None;
                 gpu_accumulate_grad(input, gpu_grad);
+            }
+            Op::Select(ref input, ref indices) => {
+                let in_size = input.size();
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let indices_u32: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+                    let idx_buf = gpu.upload(&indices_u32);
+                    let gi = gpu.alloc(in_size);
+                    gpu.dispatch_fill(&gi, 0.0);
+                    gpu.dispatch_scatter_add(&gpu_grad, &idx_buf, &gi);
+                    gi
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
             }
             _ => {
                 // For any other ops, fall back to CPU
