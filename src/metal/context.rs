@@ -69,6 +69,15 @@ impl GpuContext {
             "log_softmax_f32", "log_softmax_backward_f32",
             "scale_fill_f32",
             "gather_f32", "scatter_add_f32",
+            // Phase 1B: Binary math ops
+            "maximum_f32", "minimum_f32", "power_f32", "arctan2_f32", "logaddexp_f32",
+            // Phase 1C: Clip, Where, NanToNum
+            "clip_f32", "where_f32", "nan_to_num_f32",
+            // Phase 1D: Comparison / Logical ops (binary)
+            "equal_f32", "not_equal_f32", "greater_f32", "greater_equal_f32",
+            "less_f32", "less_equal_f32", "logical_and_f32", "logical_or_f32",
+            // Phase 1D: Comparison / Logical ops (unary)
+            "isnan_f32", "isinf_f32", "isfinite_f32", "logical_not_f32",
         ];
 
         let mut pipelines = HashMap::new();
@@ -936,6 +945,128 @@ impl GpuContext {
             enc.setBuffer_offset_atIndex(Some(grad.raw()), 0, 0);
             enc.setBuffer_offset_atIndex(Some(indices.raw()), 0, 1);
             enc.setBuffer_offset_atIndex(Some(grad_input.raw()), 0, 2);
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch clip: out[i] = clamp(a[i], min_val, max_val).
+    pub fn dispatch_clip(
+        &self,
+        a: &GpuBuffer<f32>,
+        out: &GpuBuffer<f32>,
+        min_val: f32,
+        max_val: f32,
+    ) {
+        let n = a.len();
+        assert_eq!(n, out.len());
+
+        #[repr(C)]
+        struct ClipParams {
+            min_val: f32,
+            max_val: f32,
+        }
+
+        let params = ClipParams { min_val, max_val };
+
+        let pipeline = &self.pipelines["clip_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(a.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<ClipParams>(),
+                2,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch ternary where: out[i] = (cond[i] != 0) ? x[i] : y[i].
+    pub fn dispatch_ternary(
+        &self,
+        cond: &GpuBuffer<f32>,
+        x: &GpuBuffer<f32>,
+        y: &GpuBuffer<f32>,
+        out: &GpuBuffer<f32>,
+    ) {
+        let n = cond.len();
+        assert_eq!(n, x.len());
+        assert_eq!(n, y.len());
+        assert_eq!(n, out.len());
+
+        let pipeline = &self.pipelines["where_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(cond.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(x.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(y.raw()), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 3);
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch nan_to_num: replace NaN/Inf with specified values.
+    pub fn dispatch_nan_to_num(
+        &self,
+        a: &GpuBuffer<f32>,
+        out: &GpuBuffer<f32>,
+        nan_val: f32,
+        posinf_val: f32,
+        neginf_val: f32,
+    ) {
+        let n = a.len();
+        assert_eq!(n, out.len());
+
+        #[repr(C)]
+        struct NanToNumParams {
+            nan_val: f32,
+            posinf_val: f32,
+            neginf_val: f32,
+        }
+
+        let params = NanToNumParams { nan_val, posinf_val, neginf_val };
+
+        let pipeline = &self.pipelines["nan_to_num_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(a.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<NanToNumParams>(),
+                2,
+            );
         }
 
         let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
