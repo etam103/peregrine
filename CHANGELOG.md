@@ -7,6 +7,81 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.11.0] - 2026-02-26
+
+### Added — MLX feature parity sprint
+
+Massive expansion of the tensor op library, NN modules, optimizers, and supporting infrastructure. Brings Peregrine from ~60 ops to ~200 ops, closing the gap with MLX/PyTorch.
+
+**Phase 1A: 21 unary math ops** (`src/tensor.rs`, `src/metal/shaders.rs`)
+- reciprocal, square, rsqrt, floor, ceil, round, sign, expm1, log2, log10, log1p, erf, erfinv, sinh, cosh, arcsin, arccos, arctan, arcsinh, arccosh, arctanh
+- Compositions: degrees, radians (no new kernel needed)
+- 17 new Op variants with full autograd backward
+- 21 new Metal compute kernels
+
+**Phase 1B-1D: binary, clip/where, comparison ops** (`src/tensor.rs`, `src/metal/shaders.rs`, `src/metal/context.rs`)
+- Binary math: maximum, minimum, power, arctan2, logaddexp
+- Conditional: clip (with ClipParams), where (ternary), nan_to_num
+- 12 comparison/logical ops: equal, not_equal, greater, greater_equal, less, less_equal, logical_and, logical_or, logical_not, isnan, isinf, isfinite
+- Utility: allclose, array_equal
+- New dispatch methods: `dispatch_clip`, `dispatch_ternary`, `dispatch_nan_to_num`
+
+**Phase 1E: 18 axis reduction ops** (`src/tensor.rs`, `src/metal/shaders.rs`, `src/metal/context.rs`)
+- Differentiable: sum_axis, mean_axis, max_axis, min_axis, var, std, prod_axis, logsumexp, cumsum, cumprod
+- Non-differentiable: any, all, argmax_axis, argmin_axis, sort, argsort, topk
+- ReduceAxisParams + VarAxisParams structs for GPU dispatch
+- New dispatch methods: `dispatch_reduce_axis`, `dispatch_var_axis`
+- Helper methods: resolve_axis (negative indexing), axis_params, reduced_shape
+
+**Phase 1F: 16 shape/indexing ops** (`src/tensor.rs`, `src/metal/shaders.rs`, `src/metal/context.rs`)
+- tril, triu, repeat, tile, pad, roll, take, stack, split, broadcast_to, diagonal, diag, trace, outer, inner, expand_dims
+- 4 new Metal kernels (tril, triu, pad, repeat) with TrilTriuParams/PadParams/RepeatParams
+- New dispatch methods: `dispatch_tril`, `dispatch_triu`
+
+**Phase 2: 18 activations + PReLU** (`src/tensor.rs`, `src/nn.rs`, `src/metal/shaders.rs`)
+- Dedicated kernels: leaky_relu, elu (with forward + backward Metal kernels)
+- Composed: silu, softplus, mish, hard_tanh, relu6, hardswish, softsign, log_sigmoid, selu, celu, gelu_fast, softmin, glu, hard_shrink, soft_shrink
+- PReLU module with learnable weight parameter
+- New dispatch methods: `dispatch_unary_param`, `dispatch_backward_unary_param`
+
+**Phase 3: 11 loss functions + 12 NN layers** (`src/nn.rs`)
+- Loss functions: l1, nll, smooth_l1, huber, kl_div, cosine_similarity, triplet, hinge, log_cosh, margin_ranking, gaussian_nll
+- Module trait with forward(), params(), named_params(), train(), eval()
+- Layers: RMSNorm, Dropout (train/eval mode), Identity, Sequential, RNN, LSTM, GRU, RoPE, Conv1d, AvgPool2d, GroupNorm, instance_norm
+- Module impls for Linear, Embedding, PReLU, AvgPool2d
+
+**Phase 4: 6 optimizers + 3 LR schedulers** (`src/optim.rs`)
+- Optimizers: RmsProp (centered, momentum), Adagrad, Adamax, AdaDelta, Lion (sign-based), Adafactor (factored)
+- LrSchedule trait (implemented for all existing schedulers)
+- New schedulers: ExponentialDecayLr, LinearScheduleLr, JoinSchedules
+
+**Phase 5: Random module** (`src/random.rs` — NEW)
+- Xoshiro256++ PRNG engine (no external dependencies)
+- 10 distributions: uniform, normal, randint, bernoulli, truncated_normal, gumbel, categorical, laplace, permutation
+- Tensor::rand() and Tensor::rand_like() convenience methods
+
+**Phase 6: FFT module** (`src/fft.rs` — NEW)
+- CPU via Apple Accelerate vDSP (fft_zrip) with Cooley-Tukey radix-2 fallback
+- fft, ifft, rfft, irfft, fftshift, ifftshift
+- Complex representation: trailing dim of size 2
+
+**Phase 7: Linear algebra module** (`src/linalg.rs` — NEW)
+- CPU via LAPACK (Accelerate framework)
+- norm, solve (sgesv), inv (sgetrf+sgetri), cholesky (spotrf), svd (sgesdd), qr (sgeqrf+sorgqr), eigh (ssyev), lu (sgetrf), det, pinv, cross, triangular_solve (strtrs)
+
+**Phase 8: Transforms + Init** (`src/transforms.rs`, `src/init.rs` — NEW)
+- grad(f, inputs), value_and_grad(f, inputs), checkpoint (stub)
+- Weight init: glorot_uniform, glorot_normal, he_normal, he_uniform, lecun_normal, constant, orthogonal
+
+### Stats
+
+- 98 Metal compute shaders (up from 38), 30 dispatch methods (up from 24)
+- 292 tests passing (235 unit + 34 activation + 23 parity)
+- ~19,500 lines of Rust (up from ~8,000)
+- 5 new modules: random, fft, linalg, transforms, init
+
+---
+
 ## [0.10.0] - 2026-02-23
 
 ### Added — GPU training pipeline optimization
