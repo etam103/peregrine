@@ -1267,4 +1267,53 @@ kernel void logical_not_f32(
 {
     out[idx] = (a[idx] == 0.0f) ? 1.0f : 0.0f;
 }
+
+// ---------------------------------------------------------------------------
+// Leaky ReLU: out = x > 0 ? x : alpha * x
+// ---------------------------------------------------------------------------
+
+kernel void leaky_relu_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    constant float& alpha  [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float x = a[idx];
+    out[idx] = x > 0.0f ? x : alpha * x;
+}
+
+kernel void leaky_relu_backward_f32(
+    device const float* input   [[buffer(0)]],
+    device const float* grad    [[buffer(1)]],
+    device float* out           [[buffer(2)]],
+    constant float& alpha       [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = input[idx] > 0.0f ? grad[idx] : alpha * grad[idx];
+}
+
+// ---------------------------------------------------------------------------
+// ELU: out = x > 0 ? x : alpha * (exp(x) - 1)
+// ---------------------------------------------------------------------------
+
+kernel void elu_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    constant float& alpha  [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float x = a[idx];
+    out[idx] = x > 0.0f ? x : alpha * (exp(x) - 1.0f);
+}
+
+kernel void elu_backward_f32(
+    device const float* input   [[buffer(0)]],
+    device const float* grad    [[buffer(1)]],
+    device float* out           [[buffer(2)]],
+    constant float& alpha       [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float x = input[idx];
+    out[idx] = x > 0.0f ? grad[idx] : grad[idx] * alpha * exp(x);
+}
 "#;

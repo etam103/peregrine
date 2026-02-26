@@ -78,6 +78,9 @@ impl GpuContext {
             "less_f32", "less_equal_f32", "logical_and_f32", "logical_or_f32",
             // Phase 1D: Comparison / Logical ops (unary)
             "isnan_f32", "isinf_f32", "isfinite_f32", "logical_not_f32",
+            // Activation kernels
+            "leaky_relu_f32", "leaky_relu_backward_f32",
+            "elu_f32", "elu_backward_f32",
         ];
 
         let mut pipelines = HashMap::new();
@@ -241,6 +244,81 @@ impl GpuContext {
             enc.setBuffer_offset_atIndex(Some(cached.raw()), 0, 0);
             enc.setBuffer_offset_atIndex(Some(grad.raw()), 0, 1);
             enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 2);
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch a unary element-wise op with one scalar parameter: out[i] = op(a[i], param).
+    /// Used for leaky_relu, elu forward kernels.
+    pub fn dispatch_unary_param(
+        &self,
+        kernel: &str,
+        a: &GpuBuffer<f32>,
+        out: &GpuBuffer<f32>,
+        param: f32,
+    ) {
+        let n = a.len();
+        assert_eq!(n, out.len());
+
+        let pipeline = &self.pipelines[kernel];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(a.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&param as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<f32>(),
+                2,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch a backward unary op with one scalar parameter: out[i] = kernel(cached[i], grad[i], param).
+    /// Used for leaky_relu_backward, elu_backward.
+    pub fn dispatch_backward_unary_param(
+        &self,
+        kernel: &str,
+        cached: &GpuBuffer<f32>,
+        grad: &GpuBuffer<f32>,
+        out: &GpuBuffer<f32>,
+        param: f32,
+    ) {
+        let n = cached.len();
+        assert_eq!(n, grad.len());
+        assert_eq!(n, out.len());
+
+        let pipeline = &self.pipelines[kernel];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(cached.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(grad.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 2);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&param as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<f32>(),
+                3,
+            );
         }
 
         let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;

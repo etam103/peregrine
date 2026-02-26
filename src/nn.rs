@@ -35,6 +35,61 @@ impl Linear {
 }
 
 // ---------------------------------------------------------------------------
+// PReLU: Parametric ReLU with learnable slope for negative inputs
+// ---------------------------------------------------------------------------
+
+pub struct PReLU {
+    pub weight: Tensor, // learnable slope for negative inputs
+}
+
+impl PReLU {
+    /// Create a PReLU with `num_parameters` learnable slopes, initialized to 0.25.
+    pub fn new(num_parameters: usize) -> Self {
+        PReLU {
+            weight: Tensor::full(&[num_parameters], 0.25, true),
+        }
+    }
+
+    /// Forward pass: x if x > 0, weight * x otherwise.
+    /// If weight has one element, it broadcasts to all channels.
+    /// Otherwise weight should match the channel dimension.
+    pub fn forward(&self, x: &Tensor) -> Tensor {
+        // Compose as: relu(x) + weight * (-relu(-x))
+        // which equals: relu(x) - weight * relu(-x)
+        let pos = x.relu();
+        let neg = x.neg().relu();
+        let w_shape = self.weight.shape();
+        if w_shape.len() == 1 && w_shape[0] == 1 {
+            // Single parameter: broadcast as scalar
+            let w_data = self.weight.data();
+            pos.sub(&neg.scale(w_data[0]))
+        } else {
+            // Multi-parameter: need to match shape for element-wise mul
+            // For [batch, channels] input with [channels] weight:
+            let x_shape = x.shape();
+            if x_shape.len() == 2 && w_shape[0] == x_shape[1] {
+                // Reshape weight to [1, channels] for broadcasting
+                let w_reshaped = self.weight.reshape(vec![1, w_shape[0]]);
+                pos.sub(&neg.mul(&w_reshaped))
+            } else {
+                // Fallback: element-wise with broadcast
+                pos.sub(&neg.mul(&self.weight))
+            }
+        }
+    }
+
+    pub fn params(&self) -> Vec<&Tensor> {
+        vec![&self.weight]
+    }
+
+    pub fn named_params(&self, prefix: &str) -> Vec<(String, &Tensor)> {
+        vec![
+            (format!("{}.weight", prefix), &self.weight),
+        ]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Embedding: lookup table for token embeddings
 // ---------------------------------------------------------------------------
 

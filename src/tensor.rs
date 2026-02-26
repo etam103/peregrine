@@ -175,6 +175,12 @@ pub enum Op {
     // Phase 1C
     Clip { input: Tensor, min_val: f32, max_val: f32 },
     Where { cond: Tensor, x: Tensor, y: Tensor },
+    // Phase 2: Activations
+    LeakyRelu { input: Tensor, alpha: f32 },
+    Elu { input: Tensor, alpha: f32 },
+    HardTanh { input: Tensor, min_val: f32, max_val: f32 },
+    HardShrink { input: Tensor, lambda: f32 },
+    SoftShrink { input: Tensor, lambda: f32 },
 }
 
 /// Compute flat index for a 4D tensor with shape [N, C, H, W].
@@ -3512,6 +3518,242 @@ impl Tensor {
         Tensor::from_op(vec![s / n as f32], vec![1], Op::Mean(self.clone()))
     }
 
+    /// Create a tensor of ones with the same shape as `other`.
+    pub fn ones_like(other: &Tensor) -> Tensor {
+        let shape = other.shape();
+        Tensor::ones(&shape, false)
+    }
+
+    // ---- Part B: Dedicated Kernel Activations ----
+
+    /// Leaky ReLU: x if x > 0, alpha * x otherwise.
+    pub fn leaky_relu(&self, alpha: f32) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary_param("leaky_relu_f32", buf, &out, alpha);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::LeakyRelu { input: self.clone(), alpha });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| if x > 0.0 { x } else { alpha * x }).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::LeakyRelu { input: self.clone(), alpha })
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = if inner.data[i] > 0.0 { inner.data[i] } else { alpha * inner.data[i] }; }
+            Tensor::from_op(data, inner.shape.clone(), Op::LeakyRelu { input: self.clone(), alpha })
+        }
+    }
+
+    /// ELU: x if x > 0, alpha * (exp(x) - 1) otherwise.
+    pub fn elu(&self, alpha: f32) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary_param("elu_f32", buf, &out, alpha);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Elu { input: self.clone(), alpha });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| if x > 0.0 { x } else { alpha * (x.exp() - 1.0) }).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Elu { input: self.clone(), alpha })
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len {
+                let x = inner.data[i];
+                data[i] = if x > 0.0 { x } else { alpha * (x.exp() - 1.0) };
+            }
+            Tensor::from_op(data, inner.shape.clone(), Op::Elu { input: self.clone(), alpha })
+        }
+    }
+
+    /// Hard tanh: clamp(x, min_val, max_val).
+    pub fn hard_tanh(&self, min_val: f32, max_val: f32) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.max(min_val).min(max_val)).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::HardTanh { input: self.clone(), min_val, max_val })
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].max(min_val).min(max_val); }
+            Tensor::from_op(data, inner.shape.clone(), Op::HardTanh { input: self.clone(), min_val, max_val })
+        }
+    }
+
+    /// Hard shrink: x if |x| > lambda, 0 otherwise.
+    pub fn hard_shrink(&self, lambda: f32) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| if x.abs() > lambda { x } else { 0.0 }).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::HardShrink { input: self.clone(), lambda })
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len {
+                let x = inner.data[i];
+                data[i] = if x.abs() > lambda { x } else { 0.0 };
+            }
+            Tensor::from_op(data, inner.shape.clone(), Op::HardShrink { input: self.clone(), lambda })
+        }
+    }
+
+    /// Soft shrink: x - lambda if x > lambda, x + lambda if x < -lambda, 0 otherwise.
+    pub fn soft_shrink(&self, lambda: f32) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| {
+                if x > lambda { x - lambda } else if x < -lambda { x + lambda } else { 0.0 }
+            }).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::SoftShrink { input: self.clone(), lambda })
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len {
+                let x = inner.data[i];
+                data[i] = if x > lambda { x - lambda } else if x < -lambda { x + lambda } else { 0.0 };
+            }
+            Tensor::from_op(data, inner.shape.clone(), Op::SoftShrink { input: self.clone(), lambda })
+        }
+    }
+
+    // ---- Part A: Composable Activations ----
+
+    /// SiLU (Swish): x * sigmoid(x).
+    pub fn silu(&self) -> Tensor {
+        self.mul(&self.sigmoid())
+    }
+
+    /// Softplus: log(1 + exp(beta * x)) / beta.
+    pub fn softplus(&self, beta: f32) -> Tensor {
+        let bx = self.scale(beta);
+        bx.exp().add(&Tensor::ones(&self.shape(), false)).log().scale(1.0 / beta)
+    }
+
+    /// Mish: x * tanh(softplus(x)).
+    pub fn mish(&self) -> Tensor {
+        self.mul(&self.softplus(1.0).tanh())
+    }
+
+    /// Softsign: x / (1 + |x|).
+    pub fn softsign(&self) -> Tensor {
+        self.div(&self.abs().add(&Tensor::ones(&self.shape(), false)))
+    }
+
+    /// Log-sigmoid: -softplus(-x) = -log(1 + exp(-x)).
+    pub fn log_sigmoid(&self) -> Tensor {
+        self.neg().softplus(1.0).neg()
+    }
+
+    /// Softmin: softmax(-x).
+    pub fn softmin(&self) -> Tensor {
+        self.neg().softmax(-1)
+    }
+
+    /// ReLU6: min(max(x, 0), 6). Clamps between 0 and 6.
+    pub fn relu6(&self) -> Tensor {
+        self.hard_tanh(0.0, 6.0)
+    }
+
+    /// Hard swish: x * relu6(x + 3) / 6.
+    pub fn hardswish(&self) -> Tensor {
+        self.mul(
+            &self.add(&Tensor::full(&self.shape(), 3.0, false))
+                .relu6()
+                .scale(1.0 / 6.0)
+        )
+    }
+
+    /// Fast approximate GELU: sigmoid(1.702 * x) * x.
+    pub fn gelu_fast_approx(&self) -> Tensor {
+        self.scale(1.702).sigmoid().mul(self)
+    }
+
+    /// CELU: max(0, x) + min(0, alpha * (exp(x/alpha) - 1)).
+    pub fn celu(&self, alpha: f32) -> Tensor {
+        self.relu().add(&self.scale(1.0 / alpha).exp().add(&Tensor::full(&self.shape(), -1.0, false)).scale(alpha).neg().relu().neg())
+    }
+
+    /// SELU: scale * (max(0,x) + min(0, alpha*(exp(x)-1))) with fixed constants.
+    pub fn selu(&self) -> Tensor {
+        let alpha: f32 = 1.6732632;
+        let scale: f32 = 1.0507010;
+        self.elu(alpha).scale(scale)
+    }
+
+    /// Step function: 1.0 if x > threshold, 0.0 otherwise. Not differentiable (no grad).
+    pub fn step(&self, threshold: f32) -> Tensor {
+        let inner = self.0.borrow();
+        let data: Vec<f32> = inner.data.iter().map(|&x| if x > threshold { 1.0 } else { 0.0 }).collect();
+        Tensor::new(data, inner.shape.clone(), false)
+    }
+
+    /// GLU: split tensor in half along last axis, return first_half * sigmoid(second_half).
+    pub fn glu(&self, dim: isize) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let dim = if dim < 0 { (ndim as isize + dim) as usize } else { dim as usize };
+        assert!(dim < ndim, "glu dim out of range");
+        assert!(shape[dim] % 2 == 0, "glu requires even size along dim");
+        let half = shape[dim] / 2;
+
+        let inner = self.0.borrow();
+        let outer: usize = shape[..dim].iter().product();
+        let inner_size: usize = shape[dim + 1..].iter().product();
+        let full_dim = shape[dim];
+
+        let mut first_data = Vec::with_capacity(outer * half * inner_size);
+        let mut second_data = Vec::with_capacity(outer * half * inner_size);
+
+        for o in 0..outer {
+            for d in 0..half {
+                let base = o * full_dim * inner_size + d * inner_size;
+                first_data.extend_from_slice(&inner.data[base..base + inner_size]);
+            }
+            for d in half..full_dim {
+                let base = o * full_dim * inner_size + d * inner_size;
+                second_data.extend_from_slice(&inner.data[base..base + inner_size]);
+            }
+        }
+        let mut new_shape = shape.clone();
+        new_shape[dim] = half;
+        drop(inner);
+
+        let first = Tensor::new(first_data, new_shape.clone(), self.0.borrow().requires_grad);
+        let second = Tensor::new(second_data, new_shape, self.0.borrow().requires_grad);
+        first.mul(&second.sigmoid())
+    }
+
     /// Remove dimensions of size 1. If `dim` is None, removes all size-1 dims.
     pub fn squeeze(&self, dim: Option<usize>) -> Tensor {
         let inner = self.0.borrow();
@@ -3717,6 +3959,10 @@ impl Tensor {
                 | Op::Arcsin(a) | Op::Arccos(a) | Op::Arctan(a)
                 | Op::Arcsinh(a) | Op::Arccosh(a) | Op::Arctanh(a) => vec![a],
                 Op::Clip { input, .. } => vec![input],
+                Op::LeakyRelu { input: a, .. } | Op::Elu { input: a, .. }
+                | Op::HardTanh { input: a, .. }
+                | Op::HardShrink { input: a, .. }
+                | Op::SoftShrink { input: a, .. } => vec![a],
                 Op::Conv2d(a, b, c) | Op::MatMulBiasRelu(a, b, c) => vec![a, b, c],
                 Op::Where { cond, x, y } => vec![cond, x, y],
                 Op::Conv2dReluPool { input, kernel, bias, .. } => vec![input, kernel, bias],
@@ -3833,6 +4079,12 @@ impl Tensor {
                 cond.sync_gpu_to_cpu();
                 x.sync_gpu_to_cpu();
                 y.sync_gpu_to_cpu();
+            }
+            Op::LeakyRelu { input: ref a, .. } | Op::Elu { input: ref a, .. }
+            | Op::HardTanh { input: ref a, .. }
+            | Op::HardShrink { input: ref a, .. }
+            | Op::SoftShrink { input: ref a, .. } => {
+                a.sync_gpu_to_cpu();
             }
             Op::Conv2d(a, b, c)
             | Op::Conv2dReluPool { input: a, kernel: b, bias: c, .. }
@@ -5274,6 +5526,98 @@ impl Tensor {
                     dim_offset += t_dim;
                 }
             }
+            Op::LeakyRelu { ref input, alpha } => {
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter()
+                        .zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| if x > 0.0 { *g } else { alpha * g })
+                        .collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        gi[i] = if in_inner.data[i] > 0.0 { grad[i] } else { alpha * grad[i] };
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Elu { ref input, alpha } => {
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter()
+                        .zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| if x > 0.0 { *g } else { g * alpha * x.exp() })
+                        .collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
+                        gi[i] = if x > 0.0 { grad[i] } else { grad[i] * alpha * x.exp() };
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::HardTanh { ref input, min_val, max_val } => {
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter()
+                        .zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| if x > min_val && x < max_val { *g } else { 0.0 })
+                        .collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        gi[i] = if in_inner.data[i] > min_val && in_inner.data[i] < max_val { grad[i] } else { 0.0 };
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::HardShrink { ref input, lambda } => {
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter()
+                        .zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| if x.abs() > lambda { *g } else { 0.0 })
+                        .collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        gi[i] = if in_inner.data[i].abs() > lambda { grad[i] } else { 0.0 };
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::SoftShrink { ref input, lambda } => {
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter()
+                        .zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| if x > lambda || x < -lambda { *g } else { 0.0 })
+                        .collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
+                        gi[i] = if x > lambda || x < -lambda { grad[i] } else { 0.0 };
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
             Op::BatchNorm { ref input, ref gamma, ref beta, ref normalized, mean: _, ref inv_std } => {
                 let in_shape = input.shape();
                 let (n, c, h, w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
@@ -5464,6 +5808,48 @@ impl Tensor {
                     let in_buf = in_inner.gpu_data.as_ref().unwrap();
                     let out = gpu.alloc(in_buf.len());
                     gpu.dispatch_backward_unary("relu_backward_f32", in_buf, &gpu_grad, &out);
+                    out
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::LeakyRelu { ref input, alpha } => {
+                let has_gpu = input.0.borrow().gpu_data.is_some();
+                if !has_gpu {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let in_inner = input.0.borrow();
+                    let in_buf = in_inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(in_buf.len());
+                    gpu.dispatch_backward_unary_param("leaky_relu_backward_f32", in_buf, &gpu_grad, &out, alpha);
+                    out
+                });
+                if let Some(gi) = handled {
+                    self.0.borrow_mut().op = Op::None;
+                    gpu_accumulate_grad(input, gi);
+                } else {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+            }
+            Op::Elu { ref input, alpha } => {
+                let has_gpu = input.0.borrow().gpu_data.is_some();
+                if !has_gpu {
+                    self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                    return false;
+                }
+                let handled = crate::metal::with_gpu(|gpu| {
+                    let in_inner = input.0.borrow();
+                    let in_buf = in_inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(in_buf.len());
+                    gpu.dispatch_backward_unary_param("elu_backward_f32", in_buf, &gpu_grad, &out, alpha);
                     out
                 });
                 if let Some(gi) = handled {
