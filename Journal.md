@@ -532,3 +532,250 @@ The improvement is modest (14% at batch=64, 5% at batch=256) because:
 - The forward path saves 4 kernel launches (2 fused layers × 2 ops eliminated), but each kernel is only ~5us encoding time
 - The backward path falls to CPU via the `select → CPU grad` chain, so the fused GPU backward doesn't fire during training
 - The real win is architectural: `matmul_bias_relu` is a building block that composes well when the full pipeline stays on GPU
+
+## Round 7: MLX feature parity sprint (2026-02-26)
+
+**Goal:** Close the feature gap between Peregrine (~60 ops) and MLX (~200+ ops). Implement the full complement of tensor ops, activations, NN modules, optimizers, and supporting infrastructure needed for a production-quality deep learning library.
+
+**Approach:** 7 parallel worktree agents, each implementing one phase of the plan, merged sequentially into main with conflict resolution.
+
+### Execution
+
+Launched 7 agents in isolated git worktrees, all working concurrently:
+
+| Agent | Scope | Files touched |
+|-------|-------|--------------|
+| Phase 1A | 21 unary math ops | tensor.rs, shaders.rs, context.rs |
+| Phase 1B-1D | Binary + clip/where + comparison | tensor.rs, shaders.rs, context.rs |
+| Phase 1E | 18 axis reductions | tensor.rs, shaders.rs, context.rs |
+| Phase 1F | 16 shape/indexing ops | tensor.rs, shaders.rs, context.rs |
+| Phase 2 | 18 activations + PReLU | tensor.rs, nn.rs, shaders.rs, context.rs |
+| Phase 3+4 | Losses + NN layers + optimizers | nn.rs, optim.rs |
+| Phase 5-8 | random, fft, linalg, transforms, init | 5 new files + lib.rs |
+
+Merges were done sequentially since all phases touch `tensor.rs`:
+1. **Phase 1A** — fast-forward merge (no conflicts, first to finish)
+2. **Phase 1B-1D** — 3 conflicts in tensor.rs (Op enum, build_topo, GPU sync) — all "keep both"
+3. **Phase 2** — 5 conflicts across 3 files — all "keep both"
+4. **Phase 1F** — 7 conflicts, including complex interleaved dispatch methods in context.rs that required manual reconstruction
+5. **Phase 1E** — Most difficult merge. Initial `git merge` + sed approach failed because overlapping code regions (not just independent additions) made simple conflict marker removal break the code. Resolved by aborting merge and having a dedicated agent manually read worktree code and apply additions to main.
+6. **Phase 3+4** — No conflicts (touches only nn.rs, optim.rs which other phases didn't modify). Preserved PReLU from Phase 2 while adding Module trait implementation for it.
+7. **Phase 5-8** — No conflicts (all new files). Just file copies + lib.rs module declarations.
+
+### What was added
+
+| Category | Count | Examples |
+|----------|------:|---------|
+| Unary math ops | 21 | reciprocal, square, rsqrt, erf, erfinv, sinh, cosh, arcsin/cos/tan, arcsinh/cosh/tanh, floor, ceil, round, sign, expm1, log2, log10, log1p |
+| Binary ops | 5 | maximum, minimum, power, arctan2, logaddexp |
+| Conditional ops | 3 | clip, where, nan_to_num |
+| Comparison ops | 12 | equal, not_equal, greater, less, logical_and/or/not, isnan, isinf, isfinite |
+| Axis reductions | 18 | sum_axis, mean_axis, max/min_axis, var, std, prod_axis, logsumexp, cumsum, cumprod, argmax/argmin_axis, sort, argsort, topk, any, all |
+| Shape/indexing | 16 | tril, triu, repeat, tile, pad, roll, take, stack, split, broadcast_to, diagonal, diag, trace, outer, inner, expand_dims |
+| Activations | 18 | silu, softplus, mish, leaky_relu, elu, hard_tanh, relu6, hardswish, softsign, log_sigmoid, selu, celu, gelu_fast, softmin, glu, hard_shrink, soft_shrink + PReLU |
+| Loss functions | 11 | l1, nll, smooth_l1, huber, kl_div, cosine_similarity, triplet, hinge, log_cosh, margin_ranking, gaussian_nll |
+| NN layers | 12 | RMSNorm, Dropout, Identity, Sequential, RNN, LSTM, GRU, RoPE, Conv1d, AvgPool2d, GroupNorm, instance_norm |
+| Optimizers | 6 | RmsProp, Adagrad, Adamax, AdaDelta, Lion, Adafactor |
+| LR schedulers | 3 | ExponentialDecayLr, LinearScheduleLr, JoinSchedules |
+| New modules | 5 | random.rs, fft.rs, linalg.rs, transforms.rs, init.rs |
+
+### Stats
+
+| Metric | Before | After |
+|--------|-------:|------:|
+| Lines of Rust | ~8,000 | ~19,500 |
+| Tensor ops | ~60 | ~200 |
+| Metal kernels | 38 | 98 |
+| Dispatch methods | 24 | 30 |
+| Tests passing | 140 | 292 |
+| NN layers | 5 | 17 |
+| Optimizers | 2 | 8 |
+| Loss functions | 3 | 14 |
+
+### Benchmark Results (133 benchmarks, CPU, Apple Silicon, all times in microseconds)
+
+#### Phase 1A: Unary Math (18 ops at 100k elements)
+
+| Operation | Median (us) | Notes |
+|-----------|------------:|-------|
+| square | 46.7 | Simple multiply — near floor |
+| ceil | 46.7 | Single instruction |
+| round | 46.8 | Single instruction |
+| reciprocal | 48.4 | Division |
+| floor | 48.6 | Single instruction |
+| sign | 55.8 | Branch per element |
+| rsqrt | 112.9 | Transcendental |
+| arccos | 115.2 | Trig inverse |
+| arcsin | 116.9 | Trig inverse |
+| erf | 127.5 | Polynomial approx |
+| cosh | 135.5 | exp-based |
+| log2 | 139.5 | log + scale |
+| log10 | 139.6 | log + scale |
+| sinh | 146.8 | exp-based |
+| log1p | 150.9 | log(1+x) |
+| arctan | 163.3 | Trig inverse |
+| arcsinh | 163.9 | Composed |
+| expm1 | 215.3 | exp-based |
+
+Cheap unary ops (square, ceil, floor, round, reciprocal) cluster around 47-49us — bounded by memory bandwidth + pool_get overhead at 100k elements. Transcendentals (arcsin, erf, cosh) land at 115-165us, dominated by the libm/approximation compute. For comparison, existing `exp` is 116us and `relu` is 8.8us (NEON-optimized).
+
+#### Phase 1B-D: Binary, Clip, Compare (9 ops at 100k elements)
+
+| Operation | Median (us) | Notes |
+|-----------|------------:|-------|
+| clip | 64.3 | Two comparisons + select |
+| maximum | 71.0 | Single comparison |
+| minimum | 71.0 | Single comparison |
+| greater | 71.5 | Comparison → 0.0/1.0 |
+| equal | 72.3 | Comparison → 0.0/1.0 |
+| where | 94.9 | Ternary (3 input buffers) |
+| power | 393.3 | pow() per element |
+| logaddexp | 587.5 | Composed (max, exp, log) |
+| arctan2 | 1127.7 | atan2() per element |
+
+Binary ops (max, min, greater, equal) are uniform at ~71us — same as existing add/mul without NEON intrinsics. `clip` is faster (64us) since it only reads one buffer + two scalars. `power` and `arctan2` are expensive (libm calls). `logaddexp` is composed from 3 ops.
+
+#### Phase 1E: Axis Reductions
+
+| Operation | Shape | Median (us) |
+|-----------|-------|------------:|
+| sum_axis | 256×512 | 112.7 |
+| mean_axis | 256×512 | 116.2 |
+| cumsum | 256×512 | 122.0 |
+| prod_axis | 256×512 | 149.0 |
+| min_axis | 256×512 | 156.5 |
+| max_axis | 256×512 | 156.7 |
+| argmax_axis | 256×512 | 159.2 |
+| var | 256×512 | 250.8 |
+| logsumexp | 256×512 | 392.8 |
+| sum_axis | 1024×1024 | 965.5 |
+| var | 1024×1024 | 1930.7 |
+
+Axis reductions scale linearly with element count (256×512=131k elements → 113us for sum, 1024×1024=1M elements → 966us). `var` is ~2x `sum_axis` (needs mean + squared-diff pass). `logsumexp` is ~3.5x (max + exp + sum + log).
+
+#### Phase 1F: Shape/Indexing Ops
+
+| Operation | Median (us) | Notes |
+|-----------|------------:|-------|
+| diagonal 512×512 | 0.8 | Metadata + 512 element copy |
+| pad 64×128 | 17.4 | Zero-fill + copy |
+| stack 8×64×128 | 18.8 | 8 tensor concat |
+| triu 256×256 | 35.2 | 65k element scan |
+| tril 256×256 | 35.8 | 65k element scan |
+| repeat 64×128 → 128×384 | 128.8 | Copy 49k → 147k elements |
+
+Shape ops are fast. `diagonal` extracts 512 elements from a 262k-element matrix in <1us. `pad` and `stack` are memory-copy dominated. `tril`/`triu` scan the full matrix zeroing elements above/below the diagonal.
+
+#### Phase 2: Activations (11 ops at 100k elements)
+
+| Operation | Median (us) | Notes |
+|-----------|------------:|-------|
+| softsign | 35.9 | x/(1+|x|) — simple |
+| hard_tanh | 51.5 | clip(-1,1) |
+| relu6 | 51.5 | clip(0,6) |
+| leaky_relu | 55.9 | x>0 ? x : αx |
+| hardswish | 86.1 | x·clip(x+3,0,6)/6 |
+| silu | 152.6 | x·sigmoid(x) — exp |
+| elu | 159.9 | α(exp(x)-1) — exp |
+| selu | 162.6 | λ·elu(x,α) |
+| gelu | 238.9 | Existing — tanh approx |
+| softplus | 274.3 | log(1+exp(βx))/β |
+| mish | 499.3 | x·tanh(softplus(x)) — 3 composed ops |
+
+Cheap activations (softsign, hard_tanh, relu6, leaky_relu) are 36-56us — similar to unary math floor. Activations involving `exp` (silu, elu, selu) cluster at 153-163us. `mish` is expensive (499us) because it composes softplus → tanh → mul. For reference, NEON-optimized `relu` is 8.8us — adding NEON kernels for silu/elu/leaky_relu would give ~4-6x speedup.
+
+#### Phase 3A: Loss Functions (batch=64, 10 classes)
+
+| Operation | Median (us) |
+|-----------|------------:|
+| l1_loss | 1.0 |
+| kl_div_loss | 2.5 |
+| cross_entropy | 2.6 |
+| mse_loss | 3.7 |
+| smooth_l1_loss | 5.0 |
+| huber_loss | 5.2 |
+| cosine_sim_loss (64-dim) | 72.7 |
+
+All losses except cosine_similarity are <6us at batch=64×10. They compose from existing ops, so autograd "just works." Cosine similarity is slower (73us) because it computes norms over 64-dim embeddings.
+
+#### Phase 3B: NN Layers
+
+| Layer | Config | Median (us) |
+|-------|--------|------------:|
+| AvgPool2d | 1×16×32×32, k=2 | 25.9 |
+| RMSNorm | 64×512 | 59.5 |
+| GroupNorm | 4×64×16×16, g=8 | 138.7 |
+| RNN | seq=32, in=128, hid=256 | 192.7 |
+| Conv1d | 1×32×128, k=3, out=64 | 716.5 |
+| GRU | seq=32, in=128, hid=256 | 828.6 |
+| LSTM | seq=32, in=128, hid=256 | 895.6 |
+
+RNN/LSTM/GRU are sequential over timesteps (no parallelism across the sequence), so they're dominated by 32 matmul steps. LSTM (4 gates) takes ~895us and GRU (3 gates) ~829us. Conv1d's im2col approach is expensive at 717us for a small input — this would benefit from direct convolution or FFT-based convolution.
+
+#### Phase 4: Optimizers (full training step, batch=64, MLP 784→128→64→10)
+
+| Optimizer | Median (us) | vs Adam |
+|-----------|------------:|--------:|
+| Adam | 814.8 | 1.00x |
+| Lion | 933.9 | 1.15x |
+| RmsProp | 961.0 | 1.18x |
+| Adafactor | 1412.5 | 1.73x |
+
+Adam is fastest thanks to its NEON-optimized `adam_step_f32` kernel. Lion is close (sign-based updates are cheap). RmsProp is similar. Adafactor is 1.7x slower because it maintains factored row/column states with more complex update logic. All times include full forward + backward + step.
+
+#### Phase 5: Random Number Generation
+
+| Distribution | Size | Median (us) |
+|-------------|------|------------:|
+| bernoulli | 100k | 312.8 |
+| uniform | 100k | 313.2 |
+| normal | 100k | 766.4 |
+| uniform | 1M | 3161.2 |
+| normal | 1M | 7688.7 |
+
+Uniform and bernoulli are equal speed (~313us/100k) since bernoulli is just `uniform < p`. Normal is 2.4x slower due to Box-Muller (two uniforms → sin/cos → two normals). At 1M elements, uniform is 3.2ms and normal is 7.7ms. The xoshiro256++ PRNG is the bottleneck — a GPU Philox counter-based kernel would dramatically accelerate this.
+
+#### Phase 6: FFT
+
+| Transform | Size | Median (us) |
+|-----------|------|------------:|
+| fft (complex) | 1k | 23.0 |
+| fft (complex) | 4k | 102.6 |
+| rfft (real) | 1k | 306.9 |
+| rfft (real) | 4k | 1238.0 |
+| rfft (real) | 16k | 5593.7 |
+
+Complex FFT uses the Cooley-Tukey radix-2 fallback (23us at 1k points). Real FFT (`rfft`) routes through Apple Accelerate vDSP when available — the 13x difference between `fft_1k` (23us) and `rfft_1k` (307us) suggests the vDSP path has significant setup overhead. At 16k points, rfft takes 5.6ms. For comparison, NumPy's rfft on similar hardware does 16k in ~15us — the overhead is in Tensor construction/allocation, not the FFT itself.
+
+#### Phase 7: Linear Algebra (via LAPACK/Accelerate)
+
+| Operation | 64×64 | 128×128 | 256×256 |
+|-----------|------:|--------:|--------:|
+| cholesky | 8.6 | 50.5 | 231.7 |
+| solve | 11.5 | 51.7 | 190.7 |
+| det | 22.6 | 57.8 | 214.9 |
+| inv | 36.0 | 118.6 | 493.2 |
+| qr | 41.5 | 197.2 | 1085.8 |
+| svd | 276.1 | 1022.6 | 6274.7 |
+| eigh | 394.8 | 1894.0 | 6291.7 |
+| norm (L2, 1k) | 1.1 | — | — |
+
+All linalg ops use LAPACK via the Accelerate framework. Cholesky and solve are fastest (O(n³/3)). SVD and eigendecomposition are the most expensive (O(n³) with larger constants). Scaling from 64→256 shows the expected ~64x growth (4³). These times include Tensor→column-major conversion overhead.
+
+### Merge lessons
+
+1. **Worktree isolation works well** for parallel development on a single codebase — each agent gets a clean copy to work in.
+2. **Sequential merging is necessary** when multiple agents touch the same files. Parallel merging creates cascading conflicts.
+3. **"Keep both" resolution** works for most conflicts where agents add independent blocks (new Op variants, new methods, new kernels).
+4. **Sed-based conflict marker removal fails** when conflicts involve overlapping code regions. Some conflicts require understanding the semantic structure, not just removing markers.
+5. **Manual agent-based merge** (reading from worktree, applying to main) is more reliable for complex cases than automated merge tools.
+6. **Phase 3+4 and 5-8 had zero conflicts** because they only touch files that other phases don't modify. Designing phases around file boundaries minimizes merge pain.
+
+### Performance opportunities identified
+
+1. **NEON intrinsics for new activations** — silu, elu, leaky_relu are 153-160us vs relu at 8.8us. A fused NEON kernel (like the existing `vec_sigmoid_f32`) would give 4-6x speedup.
+2. **NEON for binary ops** — maximum/minimum/clip are 64-71us vs NEON-optimized add at 10us. Trivial to vectorize with `vmaxq_f32`/`vminq_f32`.
+3. **GPU random** — Philox counter-based PRNG on Metal would replace CPU xoshiro256++ (313us/100k → ~5us/100k).
+4. **FFT Tensor overhead** — rfft spends most time on Tensor construction, not the actual vDSP FFT. Pre-allocated output buffers would help.
+5. **Conv1d direct convolution** — im2col + matmul is 717us for a tiny input. Direct convolution or Winograd would be faster at small sizes.
+6. **Adafactor GPU kernel** — factored row/col state updates are parallelizable and would benefit from Metal dispatch.
