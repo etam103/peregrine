@@ -121,6 +121,23 @@ pub enum Op {
     Sin(Tensor),
     Cos(Tensor),
     Tanh(Tensor),
+    Reciprocal(Tensor),
+    Square(Tensor),
+    Rsqrt(Tensor),
+    Expm1(Tensor),
+    Log2(Tensor),
+    Log10(Tensor),
+    Log1p(Tensor),
+    Erf(Tensor),
+    ErfInv(Tensor),
+    Sinh(Tensor),
+    Cosh(Tensor),
+    Arcsin(Tensor),
+    Arccos(Tensor),
+    Arctan(Tensor),
+    Arcsinh(Tensor),
+    Arccosh(Tensor),
+    Arctanh(Tensor),
     Mean(Tensor),
     Squeeze {
         input: Tensor,
@@ -235,6 +252,49 @@ fn reduce_grad_for_broadcast(grad: &[f32], grad_shape: &[usize], target_shape: &
 }
 
 /// Apply a binary op element-wise with NumPy broadcasting.
+/// CPU approximation of erf(x) using Abramowitz & Stegun formula.
+fn erf_approx(x: f32) -> f32 {
+    let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-x * x).exp();
+    y.copysign(x)
+}
+
+/// CPU approximation of erfinv(x) using rational polynomial approximation.
+fn erfinv_approx(x: f32) -> f32 {
+    let w = -((1.0 - x) * (1.0 + x)).ln();
+    let p;
+    if w < 5.0 {
+        let w = w - 2.5;
+        let mut p_val = 2.81022636e-08_f32;
+        p_val = 3.43273939e-07 + p_val * w;
+        p_val = -3.5233877e-06 + p_val * w;
+        p_val = -4.39150654e-06 + p_val * w;
+        p_val = 0.00021858087 + p_val * w;
+        p_val = -0.00125372503 + p_val * w;
+        p_val = -0.00417768164 + p_val * w;
+        p_val = 0.246640727 + p_val * w;
+        p_val = 1.50140941 + p_val * w;
+        p = p_val;
+    } else {
+        let w = w.sqrt() - 3.0;
+        let mut p_val = -0.000200214257_f32;
+        p_val = 0.000100950558 + p_val * w;
+        p_val = 0.00134934322 + p_val * w;
+        p_val = -0.00367342844 + p_val * w;
+        p_val = 0.00573950773 + p_val * w;
+        p_val = -0.0076224613 + p_val * w;
+        p_val = 0.00943887047 + p_val * w;
+        p_val = 1.00167406 + p_val * w;
+        p_val = 2.83297682 + p_val * w;
+        p = p_val;
+    }
+    p * x
+}
+
 fn broadcast_binary_op(
     a_data: &[f32], a_shape: &[usize],
     b_data: &[f32], b_shape: &[usize],
@@ -2058,6 +2118,649 @@ impl Tensor {
         }
     }
 
+    pub fn reciprocal(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("reciprocal_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Reciprocal(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.recip()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Reciprocal(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].recip(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Reciprocal(self.clone()))
+        }
+    }
+
+    pub fn square(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("square_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Square(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x * x).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Square(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i] * inner.data[i]; }
+            Tensor::from_op(data, inner.shape.clone(), Op::Square(self.clone()))
+        }
+    }
+
+    pub fn rsqrt(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("rsqrt_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Rsqrt(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| 1.0 / x.sqrt()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Rsqrt(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = 1.0 / inner.data[i].sqrt(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Rsqrt(self.clone()))
+        }
+    }
+
+    pub fn floor(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("floor_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.floor()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::None)
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].floor(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::None)
+        }
+    }
+
+    pub fn ceil(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("ceil_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.ceil()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::None)
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].ceil(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::None)
+        }
+    }
+
+    pub fn round(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("round_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.round()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::None)
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].round(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::None)
+        }
+    }
+
+    pub fn sign(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("sign_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        let sign_fn = |x: f32| -> f32 {
+            if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+        };
+        if len >= PAR_THRESHOLD_CHEAP {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| sign_fn(x)).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::None)
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = sign_fn(inner.data[i]); }
+            Tensor::from_op(data, inner.shape.clone(), Op::None)
+        }
+    }
+
+    pub fn expm1(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("expm1_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Expm1(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.exp_m1()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Expm1(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].exp_m1(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Expm1(self.clone()))
+        }
+    }
+
+    pub fn log2(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("log2_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Log2(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.log2()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Log2(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].log2(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Log2(self.clone()))
+        }
+    }
+
+    pub fn log10(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("log10_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Log10(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.log10()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Log10(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].log10(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Log10(self.clone()))
+        }
+    }
+
+    pub fn log1p(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("log1p_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Log1p(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.ln_1p()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Log1p(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].ln_1p(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Log1p(self.clone()))
+        }
+    }
+
+    pub fn erf(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("erf_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Erf(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| erf_approx(x)).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Erf(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = erf_approx(inner.data[i]); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Erf(self.clone()))
+        }
+    }
+
+    pub fn erfinv(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("erfinv_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::ErfInv(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| erfinv_approx(x)).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::ErfInv(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = erfinv_approx(inner.data[i]); }
+            Tensor::from_op(data, inner.shape.clone(), Op::ErfInv(self.clone()))
+        }
+    }
+
+    pub fn sinh(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("sinh_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Sinh(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.sinh()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Sinh(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].sinh(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Sinh(self.clone()))
+        }
+    }
+
+    pub fn cosh(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("cosh_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Cosh(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.cosh()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Cosh(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].cosh(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Cosh(self.clone()))
+        }
+    }
+
+    pub fn arcsin(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("arcsin_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Arcsin(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.asin()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Arcsin(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].asin(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Arcsin(self.clone()))
+        }
+    }
+
+    pub fn arccos(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("arccos_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Arccos(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.acos()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Arccos(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].acos(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Arccos(self.clone()))
+        }
+    }
+
+    pub fn arctan(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("arctan_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Arctan(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.atan()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Arctan(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].atan(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Arctan(self.clone()))
+        }
+    }
+
+    pub fn arcsinh(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("arcsinh_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Arcsinh(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.asinh()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Arcsinh(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].asinh(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Arcsinh(self.clone()))
+        }
+    }
+
+    pub fn arccosh(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("arccosh_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Arccosh(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.acosh()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Arccosh(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].acosh(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Arccosh(self.clone()))
+        }
+    }
+
+    pub fn arctanh(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("arctanh_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Arctanh(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        if len >= PAR_THRESHOLD_EXPENSIVE {
+            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.atanh()).collect();
+            Tensor::from_op(data, inner.shape.clone(), Op::Arctanh(self.clone()))
+        } else {
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = inner.data[i].atanh(); }
+            Tensor::from_op(data, inner.shape.clone(), Op::Arctanh(self.clone()))
+        }
+    }
+
+    /// Convert radians to degrees: `self * (180 / PI)`.
+    pub fn degrees(&self) -> Tensor {
+        self.scale(180.0 / std::f32::consts::PI)
+    }
+
+    /// Convert degrees to radians: `self * (PI / 180)`.
+    pub fn radians(&self) -> Tensor {
+        self.scale(std::f32::consts::PI / 180.0)
+    }
+
     /// Scalar mean of all elements (differentiable).
     pub fn mean(&self) -> Tensor {
         #[cfg(feature = "metal")]
@@ -2282,7 +2985,13 @@ impl Tensor {
                 | Op::Scale(a, _) | Op::Select(a, _) | Op::BceLoss(a, _)
                 | Op::Neg(a) | Op::Exp(a) | Op::Log(a) | Op::Sqrt(a)
                 | Op::Abs(a) | Op::Pow(a, _) | Op::Sin(a) | Op::Cos(a)
-                | Op::Tanh(a) | Op::Mean(a) => vec![a],
+                | Op::Tanh(a) | Op::Mean(a)
+                | Op::Reciprocal(a) | Op::Square(a) | Op::Rsqrt(a)
+                | Op::Expm1(a) | Op::Log2(a) | Op::Log10(a) | Op::Log1p(a)
+                | Op::Erf(a) | Op::ErfInv(a)
+                | Op::Sinh(a) | Op::Cosh(a)
+                | Op::Arcsin(a) | Op::Arccos(a) | Op::Arctan(a)
+                | Op::Arcsinh(a) | Op::Arccosh(a) | Op::Arctanh(a) => vec![a],
                 Op::Conv2d(a, b, c) | Op::MatMulBiasRelu(a, b, c) => vec![a, b, c],
                 Op::Conv2dReluPool { input, kernel, bias, .. } => vec![input, kernel, bias],
                 Op::MaxPool2d { input, .. } | Op::Flatten { input, .. }
@@ -2382,7 +3091,13 @@ impl Tensor {
                 a.sync_gpu_to_cpu();
                 b.sync_gpu_to_cpu();
             }
-            Op::Relu(a) | Op::Gelu(a) | Op::Pow(a, _) | Op::BceLoss(a, _) => {
+            Op::Relu(a) | Op::Gelu(a) | Op::Pow(a, _) | Op::BceLoss(a, _)
+            | Op::Reciprocal(a) | Op::Square(a) | Op::Rsqrt(a)
+            | Op::Expm1(a) | Op::Log2(a) | Op::Log10(a) | Op::Log1p(a)
+            | Op::Erf(a) | Op::ErfInv(a)
+            | Op::Sinh(a) | Op::Cosh(a)
+            | Op::Arcsin(a) | Op::Arccos(a) | Op::Arctan(a)
+            | Op::Arcsinh(a) | Op::Arccosh(a) | Op::Arctanh(a) => {
                 a.sync_gpu_to_cpu();
             }
             Op::Conv2d(a, b, c)
@@ -3282,6 +3997,292 @@ impl Tensor {
                     gi
                 };
                 drop(self_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Reciprocal(ref input) => {
+                // d/dx (1/x) = -1/x^2 = -grad / (x*x)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| -g / (x * x)).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = -grad[i] / (in_inner.data[i] * in_inner.data[i]); }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Square(ref input) => {
+                // d/dx (x^2) = 2*x
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g * 2.0 * x).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] * 2.0 * in_inner.data[i]; }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Rsqrt(ref input) => {
+                // d/dx (x^-0.5) = -0.5 * x^-1.5
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| -0.5 * g * x.powf(-1.5)).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = -0.5 * grad[i] * in_inner.data[i].powf(-1.5); }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Expm1(ref input) => {
+                // d/dx (exp(x)-1) = exp(x)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g * x.exp()).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] * in_inner.data[i].exp(); }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Log2(ref input) => {
+                // d/dx log2(x) = 1 / (x * ln(2))
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let ln2 = std::f32::consts::LN_2;
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g / (x * ln2)).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] / (in_inner.data[i] * ln2); }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Log10(ref input) => {
+                // d/dx log10(x) = 1 / (x * ln(10))
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let ln10 = std::f32::consts::LN_10;
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g / (x * ln10)).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] / (in_inner.data[i] * ln10); }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Log1p(ref input) => {
+                // d/dx ln(1+x) = 1 / (1+x)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g / (1.0 + x)).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] / (1.0 + in_inner.data[i]); }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Erf(ref input) => {
+                // d/dx erf(x) = (2/sqrt(pi)) * exp(-x^2)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let two_over_sqrt_pi = 1.1283791671_f32; // 2/sqrt(pi)
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g * two_over_sqrt_pi * (-x * x).exp()).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
+                        gi[i] = grad[i] * two_over_sqrt_pi * (-x * x).exp();
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::ErfInv(ref input) => {
+                // d/dx erfinv(x) = (sqrt(pi)/2) * exp(erfinv(x)^2)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let sqrt_pi_over_2 = 0.8862269255_f32; // sqrt(pi)/2
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| {
+                            let y = erfinv_approx(x);
+                            g * sqrt_pi_over_2 * (y * y).exp()
+                        }).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let y = erfinv_approx(in_inner.data[i]);
+                        gi[i] = grad[i] * sqrt_pi_over_2 * (y * y).exp();
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Sinh(ref input) => {
+                // d/dx sinh(x) = cosh(x)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g * x.cosh()).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] * in_inner.data[i].cosh(); }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Cosh(ref input) => {
+                // d/dx cosh(x) = sinh(x)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g * x.sinh()).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len { gi[i] = grad[i] * in_inner.data[i].sinh(); }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Arcsin(ref input) => {
+                // d/dx asin(x) = 1/sqrt(1-x^2)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g / (1.0 - x * x).sqrt()).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
+                        gi[i] = grad[i] / (1.0 - x * x).sqrt();
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Arccos(ref input) => {
+                // d/dx acos(x) = -1/sqrt(1-x^2)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| -g / (1.0 - x * x).sqrt()).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
+                        gi[i] = -grad[i] / (1.0 - x * x).sqrt();
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Arctan(ref input) => {
+                // d/dx atan(x) = 1/(1+x^2)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g / (1.0 + x * x)).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
+                        gi[i] = grad[i] / (1.0 + x * x);
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Arcsinh(ref input) => {
+                // d/dx asinh(x) = 1/sqrt(x^2+1)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g / (x * x + 1.0).sqrt()).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
+                        gi[i] = grad[i] / (x * x + 1.0).sqrt();
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Arccosh(ref input) => {
+                // d/dx acosh(x) = 1/sqrt(x^2-1)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_EXPENSIVE {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g / (x * x - 1.0).sqrt()).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
+                        gi[i] = grad[i] / (x * x - 1.0).sqrt();
+                    }
+                    gi
+                };
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Arctanh(ref input) => {
+                // d/dx atanh(x) = 1/(1-x^2)
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let grad_input = if len >= PAR_THRESHOLD_CHEAP {
+                    grad.par_iter().zip(in_inner.data.par_iter())
+                        .map(|(g, &x)| g / (1.0 - x * x)).collect()
+                } else {
+                    let mut gi = pool_get(len);
+                    for i in 0..len {
+                        let x = in_inner.data[i];
+                        gi[i] = grad[i] / (1.0 - x * x);
+                    }
+                    gi
+                };
+                drop(in_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Mean(ref input) => {
@@ -4498,5 +5499,191 @@ mod tests {
                 idx, analytical_grad[idx], numerical, diff
             );
         }
+    }
+
+    #[test]
+    fn test_reciprocal() {
+        let a = Tensor::new(vec![2.0, 4.0, 0.5], vec![3], true);
+        let b = a.reciprocal();
+        let d = b.data();
+        assert!((d[0] - 0.5).abs() < 1e-5);
+        assert!((d[1] - 0.25).abs() < 1e-5);
+        assert!((d[2] - 2.0).abs() < 1e-5);
+        let loss = b.sum();
+        loss.backward();
+        // grad = -1/x^2
+        let ga = a.grad().unwrap();
+        assert!((ga[0] - (-0.25)).abs() < 1e-5);
+        assert!((ga[1] - (-0.0625)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_square() {
+        let a = Tensor::new(vec![2.0, 3.0, -1.0], vec![3], true);
+        let b = a.square();
+        assert_eq!(b.data(), vec![4.0, 9.0, 1.0]);
+        let loss = b.sum();
+        loss.backward();
+        // grad = 2*x
+        let ga = a.grad().unwrap();
+        assert!((ga[0] - 4.0).abs() < 1e-5);
+        assert!((ga[1] - 6.0).abs() < 1e-5);
+        assert!((ga[2] - (-2.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rsqrt() {
+        let a = Tensor::new(vec![4.0, 9.0, 16.0], vec![3], true);
+        let b = a.rsqrt();
+        let d = b.data();
+        assert!((d[0] - 0.5).abs() < 1e-5);
+        assert!((d[1] - 1.0 / 3.0).abs() < 1e-5);
+        assert!((d[2] - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_floor_ceil_round() {
+        let a = Tensor::new(vec![1.3, 2.7, -0.5, 3.5], vec![4], false);
+        let f = a.floor();
+        assert_eq!(f.data(), vec![1.0, 2.0, -1.0, 3.0]);
+        let c = a.ceil();
+        assert_eq!(c.data(), vec![2.0, 3.0, 0.0, 4.0]);
+        let r = a.round();
+        let rd = r.data();
+        assert!((rd[0] - 1.0).abs() < 1e-5);
+        assert!((rd[1] - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_sign() {
+        let a = Tensor::new(vec![3.0, 0.0, -2.0], vec![3], false);
+        let s = a.sign();
+        assert_eq!(s.data(), vec![1.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn test_expm1() {
+        let a = Tensor::new(vec![0.0, 1.0], vec![2], true);
+        let b = a.expm1();
+        let d = b.data();
+        assert!((d[0]).abs() < 1e-5, "expm1(0) = 0");
+        assert!((d[1] - (std::f32::consts::E - 1.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_log2() {
+        let a = Tensor::new(vec![1.0, 2.0, 8.0], vec![3], true);
+        let b = a.log2();
+        let d = b.data();
+        assert!((d[0]).abs() < 1e-5, "log2(1) = 0");
+        assert!((d[1] - 1.0).abs() < 1e-5, "log2(2) = 1");
+        assert!((d[2] - 3.0).abs() < 1e-5, "log2(8) = 3");
+    }
+
+    #[test]
+    fn test_log10() {
+        let a = Tensor::new(vec![1.0, 10.0, 100.0], vec![3], true);
+        let b = a.log10();
+        let d = b.data();
+        assert!((d[0]).abs() < 1e-5, "log10(1) = 0");
+        assert!((d[1] - 1.0).abs() < 1e-5, "log10(10) = 1");
+        assert!((d[2] - 2.0).abs() < 1e-5, "log10(100) = 2");
+    }
+
+    #[test]
+    fn test_log1p() {
+        let a = Tensor::new(vec![0.0, 1.0], vec![2], true);
+        let b = a.log1p();
+        let d = b.data();
+        assert!((d[0]).abs() < 1e-5, "log1p(0) = 0");
+        assert!((d[1] - 2.0_f32.ln()).abs() < 1e-5, "log1p(1) = ln(2)");
+    }
+
+    #[test]
+    fn test_erf() {
+        let a = Tensor::new(vec![0.0, 1.0, -1.0], vec![3], true);
+        let b = a.erf();
+        let d = b.data();
+        assert!((d[0]).abs() < 1e-5, "erf(0) = 0");
+        assert!((d[1] - 0.8427008).abs() < 1e-4, "erf(1) ~ 0.8427");
+        assert!((d[2] + 0.8427008).abs() < 1e-4, "erf(-1) ~ -0.8427");
+    }
+
+    #[test]
+    fn test_erfinv() {
+        let a = Tensor::new(vec![0.0, 0.5, -0.5], vec![3], true);
+        let b = a.erfinv();
+        let d = b.data();
+        assert!((d[0]).abs() < 1e-5, "erfinv(0) = 0");
+        assert!((d[1] - 0.4769363).abs() < 1e-3, "erfinv(0.5) ~ 0.4769");
+        assert!((d[2] + 0.4769363).abs() < 1e-3, "erfinv(-0.5) ~ -0.4769");
+    }
+
+    #[test]
+    fn test_sinh_cosh() {
+        let a = Tensor::new(vec![0.0, 1.0], vec![2], true);
+        let s = a.sinh();
+        let sd = s.data();
+        assert!((sd[0]).abs() < 1e-5, "sinh(0) = 0");
+        assert!((sd[1] - 1.0_f32.sinh()).abs() < 1e-5);
+
+        let c = a.cosh();
+        let cd = c.data();
+        assert!((cd[0] - 1.0).abs() < 1e-5, "cosh(0) = 1");
+        assert!((cd[1] - 1.0_f32.cosh()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_arcsin_arccos_arctan() {
+        let a = Tensor::new(vec![0.0, 0.5, -0.5], vec![3], true);
+        let as_ = a.arcsin();
+        let asd = as_.data();
+        assert!((asd[0]).abs() < 1e-5, "asin(0) = 0");
+        assert!((asd[1] - 0.5_f32.asin()).abs() < 1e-5);
+
+        let ac = a.arccos();
+        let acd = ac.data();
+        assert!((acd[0] - std::f32::consts::FRAC_PI_2).abs() < 1e-5, "acos(0) = pi/2");
+
+        let at = a.arctan();
+        let atd = at.data();
+        assert!((atd[0]).abs() < 1e-5, "atan(0) = 0");
+        assert!((atd[1] - 0.5_f32.atan()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_arcsinh_arccosh_arctanh() {
+        let a = Tensor::new(vec![0.0, 1.0, -1.0], vec![3], false);
+        let s = a.arcsinh();
+        let sd = s.data();
+        assert!((sd[0]).abs() < 1e-5, "asinh(0) = 0");
+        assert!((sd[1] - 1.0_f32.asinh()).abs() < 1e-5);
+
+        let b = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], false);
+        let c = b.arccosh();
+        let cd = c.data();
+        assert!((cd[0]).abs() < 1e-5, "acosh(1) = 0");
+        assert!((cd[1] - 2.0_f32.acosh()).abs() < 1e-5);
+
+        let d = Tensor::new(vec![0.0, 0.5, -0.5], vec![3], false);
+        let t = d.arctanh();
+        let td = t.data();
+        assert!((td[0]).abs() < 1e-5, "atanh(0) = 0");
+        assert!((td[1] - 0.5_f32.atanh()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_degrees_radians() {
+        let a = Tensor::new(vec![std::f32::consts::PI, std::f32::consts::FRAC_PI_2], vec![2], false);
+        let d = a.degrees();
+        let dd = d.data();
+        assert!((dd[0] - 180.0).abs() < 1e-3);
+        assert!((dd[1] - 90.0).abs() < 1e-3);
+
+        let b = Tensor::new(vec![180.0, 90.0], vec![2], false);
+        let r = b.radians();
+        let rd = r.data();
+        assert!((rd[0] - std::f32::consts::PI).abs() < 1e-3);
+        assert!((rd[1] - std::f32::consts::FRAC_PI_2).abs() < 1e-3);
     }
 }

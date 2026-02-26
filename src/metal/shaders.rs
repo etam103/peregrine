@@ -127,6 +127,203 @@ kernel void abs_f32(
     out[idx] = abs(a[idx]);
 }
 
+kernel void reciprocal_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = 1.0f / a[idx];
+}
+
+kernel void square_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = a[idx] * a[idx];
+}
+
+kernel void rsqrt_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = rsqrt(a[idx]);
+}
+
+kernel void floor_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = floor(a[idx]);
+}
+
+kernel void ceil_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = ceil(a[idx]);
+}
+
+kernel void round_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = rint(a[idx]);
+}
+
+kernel void sign_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] > 0.0f) ? 1.0f : (a[idx] < 0.0f) ? -1.0f : 0.0f;
+}
+
+kernel void expm1_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = exp(a[idx]) - 1.0f;
+}
+
+kernel void log2_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = log2(a[idx]);
+}
+
+kernel void log10_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = log10(a[idx]);
+}
+
+kernel void log1p_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = log(1.0f + a[idx]);
+}
+
+kernel void erf_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = erf(a[idx]);
+}
+
+float erfinv_approx(float x) {
+    float w = -log((1.0f - x) * (1.0f + x));
+    float p;
+    if (w < 5.0f) {
+        w = w - 2.5f;
+        p = 2.81022636e-08f;
+        p = 3.43273939e-07f + p * w;
+        p = -3.5233877e-06f + p * w;
+        p = -4.39150654e-06f + p * w;
+        p = 0.00021858087f + p * w;
+        p = -0.00125372503f + p * w;
+        p = -0.00417768164f + p * w;
+        p = 0.246640727f + p * w;
+        p = 1.50140941f + p * w;
+    } else {
+        w = sqrt(w) - 3.0f;
+        p = -0.000200214257f;
+        p = 0.000100950558f + p * w;
+        p = 0.00134934322f + p * w;
+        p = -0.00367342844f + p * w;
+        p = 0.00573950773f + p * w;
+        p = -0.0076224613f + p * w;
+        p = 0.00943887047f + p * w;
+        p = 1.00167406f + p * w;
+        p = 2.83297682f + p * w;
+    }
+    return p * x;
+}
+
+kernel void erfinv_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = erfinv_approx(a[idx]);
+}
+
+kernel void sinh_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = sinh(a[idx]);
+}
+
+kernel void cosh_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = cosh(a[idx]);
+}
+
+kernel void arcsin_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = asin(a[idx]);
+}
+
+kernel void arccos_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = acos(a[idx]);
+}
+
+kernel void arctan_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = atan(a[idx]);
+}
+
+kernel void arcsinh_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = asinh(a[idx]);
+}
+
+kernel void arccosh_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = acosh(a[idx]);
+}
+
+kernel void arctanh_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = atanh(a[idx]);
+}
+
 // ---------------------------------------------------------------------------
 // Scale: out = a * scalar
 // ---------------------------------------------------------------------------

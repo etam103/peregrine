@@ -50,6 +50,13 @@ impl GpuContext {
             "neg_f32", "exp_f32", "log_f32", "sqrt_f32",
             "relu_f32", "sigmoid_f32", "tanh_f32",
             "sin_f32", "cos_f32", "abs_f32",
+            "reciprocal_f32", "square_f32", "rsqrt_f32",
+            "floor_f32", "ceil_f32", "round_f32", "sign_f32",
+            "expm1_f32", "log2_f32", "log10_f32", "log1p_f32",
+            "erf_f32", "erfinv_f32",
+            "sinh_f32", "cosh_f32",
+            "arcsin_f32", "arccos_f32", "arctan_f32",
+            "arcsinh_f32", "arccosh_f32", "arctanh_f32",
             // Other
             "scale_f32", "matmul_f32", "sum_f32", "max_f32", "min_f32",
             "softmax_f32", "transpose_f32", "layernorm_f32",
