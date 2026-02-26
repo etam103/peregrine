@@ -190,6 +190,16 @@ pub enum Op {
     Take { input: Tensor, indices: Vec<usize>, axis: usize },
     Diagonal { input: Tensor, offset: i32 },
     BroadcastTo { input: Tensor, original_shape: Vec<usize> },
+    // Phase 1E: Axis-aware reductions
+    SumAxis { input: Tensor, axis: usize, keepdim: bool },
+    MeanAxis { input: Tensor, axis: usize, keepdim: bool },
+    MaxAxis { input: Tensor, axis: usize, keepdim: bool },
+    MinAxis { input: Tensor, axis: usize, keepdim: bool },
+    Var { input: Tensor, axis: usize, keepdim: bool, ddof: usize },
+    ProdAxis { input: Tensor, axis: usize, keepdim: bool },
+    Logsumexp { input: Tensor, axis: usize, keepdim: bool },
+    Cumsum { input: Tensor, axis: usize },
+    Cumprod { input: Tensor, axis: usize },
 }
 
 /// Compute flat index for a 4D tensor with shape [N, C, H, W].
@@ -675,6 +685,13 @@ impl Tensor {
     fn sync_gpu_to_cpu(&self) {
         let mut inner = self.0.borrow_mut();
         Self::ensure_cpu_data(&mut inner);
+    }
+
+    /// Ensure CPU data is available for backward ops that need input data.
+    /// No-op when metal feature is disabled.
+    fn sync_gpu_to_cpu_if_needed(&self) {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
     }
 
     pub fn data(&self) -> Vec<f32> {
@@ -3527,6 +3544,695 @@ impl Tensor {
         Tensor::from_op(vec![s / n as f32], vec![1], Op::Mean(self.clone()))
     }
 
+    // --- Axis-aware reduction helpers ---
+
+    /// Normalize a possibly-negative axis index.
+    fn resolve_axis(axis: i32, ndim: usize) -> usize {
+        if axis < 0 {
+            (ndim as i32 + axis) as usize
+        } else {
+            axis as usize
+        }
+    }
+
+    /// Compute (outer_size, reduce_size, inner_size) for a given axis.
+    fn axis_params(shape: &[usize], axis: usize) -> (usize, usize, usize) {
+        let outer_size: usize = shape[..axis].iter().product();
+        let reduce_size = shape[axis];
+        let inner_size: usize = shape[axis + 1..].iter().product();
+        (outer_size, reduce_size, inner_size)
+    }
+
+    /// Compute the output shape after reducing along an axis.
+    fn reduced_shape(shape: &[usize], axis: usize, keepdim: bool) -> Vec<usize> {
+        if keepdim {
+            let mut s = shape.to_vec();
+            s[axis] = 1;
+            s
+        } else {
+            shape.iter().enumerate()
+                .filter(|&(i, _)| i != axis)
+                .map(|(_, &d)| d)
+                .collect()
+        }
+    }
+
+    // --- Axis-aware reduction forward methods ---
+
+    /// Sum along a given axis (differentiable).
+    pub fn sum_axis(&self, axis: i32, keepdim: bool) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, keepdim);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(out_len);
+                    gpu.dispatch_reduce_axis("sum_axis_f32", buf, &out,
+                        outer_size as u32, reduce_size as u32, inner_size as u32);
+                    out
+                }) {
+                    return Tensor::from_gpu_op(result, out_shape,
+                        Op::SumAxis { input: self.clone(), axis, keepdim });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut acc = 0.0f32;
+                for r in 0..reduce_size {
+                    acc += data[o * reduce_size * inner_size + r * inner_size + i];
+                }
+                out_data[o * inner_size + i] = acc;
+            }
+        }
+        Tensor::from_op(out_data, out_shape,
+            Op::SumAxis { input: self.clone(), axis, keepdim })
+    }
+
+    /// Mean along a given axis (differentiable).
+    pub fn mean_axis(&self, axis: i32, keepdim: bool) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, keepdim);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(out_len);
+                    gpu.dispatch_reduce_axis("mean_axis_f32", buf, &out,
+                        outer_size as u32, reduce_size as u32, inner_size as u32);
+                    out
+                }) {
+                    return Tensor::from_gpu_op(result, out_shape,
+                        Op::MeanAxis { input: self.clone(), axis, keepdim });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut acc = 0.0f32;
+                for r in 0..reduce_size {
+                    acc += data[o * reduce_size * inner_size + r * inner_size + i];
+                }
+                out_data[o * inner_size + i] = acc / reduce_size as f32;
+            }
+        }
+        Tensor::from_op(out_data, out_shape,
+            Op::MeanAxis { input: self.clone(), axis, keepdim })
+    }
+
+    /// Max along a given axis (differentiable). Returns the max values tensor.
+    pub fn max_axis(&self, axis: i32, keepdim: bool) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, keepdim);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(out_len);
+                    gpu.dispatch_reduce_axis("max_axis_f32", buf, &out,
+                        outer_size as u32, reduce_size as u32, inner_size as u32);
+                    out
+                }) {
+                    return Tensor::from_gpu_op(result, out_shape,
+                        Op::MaxAxis { input: self.clone(), axis, keepdim });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![f32::NEG_INFINITY; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut acc = f32::NEG_INFINITY;
+                for r in 0..reduce_size {
+                    let val = data[o * reduce_size * inner_size + r * inner_size + i];
+                    if val > acc { acc = val; }
+                }
+                out_data[o * inner_size + i] = acc;
+            }
+        }
+        Tensor::from_op(out_data, out_shape,
+            Op::MaxAxis { input: self.clone(), axis, keepdim })
+    }
+
+    /// Min along a given axis (differentiable). Returns the min values tensor.
+    pub fn min_axis(&self, axis: i32, keepdim: bool) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, keepdim);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(out_len);
+                    gpu.dispatch_reduce_axis("min_axis_f32", buf, &out,
+                        outer_size as u32, reduce_size as u32, inner_size as u32);
+                    out
+                }) {
+                    return Tensor::from_gpu_op(result, out_shape,
+                        Op::MinAxis { input: self.clone(), axis, keepdim });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![f32::INFINITY; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut acc = f32::INFINITY;
+                for r in 0..reduce_size {
+                    let val = data[o * reduce_size * inner_size + r * inner_size + i];
+                    if val < acc { acc = val; }
+                }
+                out_data[o * inner_size + i] = acc;
+            }
+        }
+        Tensor::from_op(out_data, out_shape,
+            Op::MinAxis { input: self.clone(), axis, keepdim })
+    }
+
+    /// Variance along a given axis (differentiable).
+    pub fn var(&self, axis: i32, keepdim: bool, ddof: usize) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        assert!(reduce_size > ddof, "reduce_size must be > ddof");
+        let out_shape = Self::reduced_shape(&shape, axis, keepdim);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(out_len);
+                    gpu.dispatch_var_axis(buf, &out,
+                        outer_size as u32, reduce_size as u32, inner_size as u32, ddof as u32);
+                    out
+                }) {
+                    return Tensor::from_gpu_op(result, out_shape,
+                        Op::Var { input: self.clone(), axis, keepdim, ddof });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                // Compute mean
+                let mut sum = 0.0f32;
+                for r in 0..reduce_size {
+                    sum += data[o * reduce_size * inner_size + r * inner_size + i];
+                }
+                let mean = sum / reduce_size as f32;
+                // Compute variance
+                let mut var_acc = 0.0f32;
+                for r in 0..reduce_size {
+                    let diff = data[o * reduce_size * inner_size + r * inner_size + i] - mean;
+                    var_acc += diff * diff;
+                }
+                out_data[o * inner_size + i] = var_acc / (reduce_size - ddof) as f32;
+            }
+        }
+        Tensor::from_op(out_data, out_shape,
+            Op::Var { input: self.clone(), axis, keepdim, ddof })
+    }
+
+    /// Standard deviation along a given axis (differentiable, composed from var).
+    pub fn std_axis(&self, axis: i32, keepdim: bool, ddof: usize) -> Tensor {
+        self.var(axis, keepdim, ddof).sqrt()
+    }
+
+    /// Product along a given axis (differentiable).
+    pub fn prod_axis(&self, axis: i32, keepdim: bool) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, keepdim);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(out_len);
+                    gpu.dispatch_reduce_axis("prod_axis_f32", buf, &out,
+                        outer_size as u32, reduce_size as u32, inner_size as u32);
+                    out
+                }) {
+                    return Tensor::from_gpu_op(result, out_shape,
+                        Op::ProdAxis { input: self.clone(), axis, keepdim });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![1.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut acc = 1.0f32;
+                for r in 0..reduce_size {
+                    acc *= data[o * reduce_size * inner_size + r * inner_size + i];
+                }
+                out_data[o * inner_size + i] = acc;
+            }
+        }
+        Tensor::from_op(out_data, out_shape,
+            Op::ProdAxis { input: self.clone(), axis, keepdim })
+    }
+
+    /// Log-sum-exp along a given axis (differentiable, numerically stable).
+    pub fn logsumexp(&self, axis: i32, keepdim: bool) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, keepdim);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(out_len);
+                    gpu.dispatch_reduce_axis("logsumexp_axis_f32", buf, &out,
+                        outer_size as u32, reduce_size as u32, inner_size as u32);
+                    out
+                }) {
+                    return Tensor::from_gpu_op(result, out_shape,
+                        Op::Logsumexp { input: self.clone(), axis, keepdim });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                // Find max for numerical stability
+                let mut mx = f32::NEG_INFINITY;
+                for r in 0..reduce_size {
+                    let val = data[o * reduce_size * inner_size + r * inner_size + i];
+                    if val > mx { mx = val; }
+                }
+                let mut acc = 0.0f32;
+                for r in 0..reduce_size {
+                    acc += (data[o * reduce_size * inner_size + r * inner_size + i] - mx).exp();
+                }
+                out_data[o * inner_size + i] = mx + acc.ln();
+            }
+        }
+        Tensor::from_op(out_data, out_shape,
+            Op::Logsumexp { input: self.clone(), axis, keepdim })
+    }
+
+    /// Cumulative sum along a given axis (differentiable). Output has same shape as input.
+    pub fn cumsum(&self, axis: i32) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_reduce_axis("cumsum_f32", buf, &out,
+                        outer_size as u32, reduce_size as u32, inner_size as u32);
+                    out
+                }) {
+                    return Tensor::from_gpu_op(result, shape.clone(),
+                        Op::Cumsum { input: self.clone(), axis });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; data.len()];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut acc = 0.0f32;
+                for r in 0..reduce_size {
+                    let pos = o * reduce_size * inner_size + r * inner_size + i;
+                    acc += data[pos];
+                    out_data[pos] = acc;
+                }
+            }
+        }
+        Tensor::from_op(out_data, shape.clone(),
+            Op::Cumsum { input: self.clone(), axis })
+    }
+
+    /// Cumulative product along a given axis (differentiable). Output has same shape as input.
+    pub fn cumprod(&self, axis: i32) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_reduce_axis("cumprod_f32", buf, &out,
+                        outer_size as u32, reduce_size as u32, inner_size as u32);
+                    out
+                }) {
+                    return Tensor::from_gpu_op(result, shape.clone(),
+                        Op::Cumprod { input: self.clone(), axis });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; data.len()];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut acc = 1.0f32;
+                for r in 0..reduce_size {
+                    let pos = o * reduce_size * inner_size + r * inner_size + i;
+                    acc *= data[pos];
+                    out_data[pos] = acc;
+                }
+            }
+        }
+        Tensor::from_op(out_data, shape.clone(),
+            Op::Cumprod { input: self.clone(), axis })
+    }
+
+    // --- No-grad axis reductions ---
+
+    /// Returns a boolean-like tensor (1.0/0.0) indicating whether any element along axis is non-zero.
+    pub fn any(&self, axis: i32) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, false);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut found = false;
+                for r in 0..reduce_size {
+                    if data[o * reduce_size * inner_size + r * inner_size + i] != 0.0 {
+                        found = true;
+                        break;
+                    }
+                }
+                out_data[o * inner_size + i] = if found { 1.0 } else { 0.0 };
+            }
+        }
+        Tensor::new(out_data, out_shape, false)
+    }
+
+    /// Returns a boolean-like tensor (1.0/0.0) indicating whether all elements along axis are non-zero.
+    pub fn all(&self, axis: i32) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, false);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut all_nonzero = true;
+                for r in 0..reduce_size {
+                    if data[o * reduce_size * inner_size + r * inner_size + i] == 0.0 {
+                        all_nonzero = false;
+                        break;
+                    }
+                }
+                out_data[o * inner_size + i] = if all_nonzero { 1.0 } else { 0.0 };
+            }
+        }
+        Tensor::new(out_data, out_shape, false)
+    }
+
+    /// Returns the indices of the maximum values along an axis.
+    pub fn argmax_axis(&self, axis: i32) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, false);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut best = f32::NEG_INFINITY;
+                let mut best_r = 0usize;
+                for r in 0..reduce_size {
+                    let val = data[o * reduce_size * inner_size + r * inner_size + i];
+                    if val > best {
+                        best = val;
+                        best_r = r;
+                    }
+                }
+                out_data[o * inner_size + i] = best_r as f32;
+            }
+        }
+        Tensor::new(out_data, out_shape, false)
+    }
+
+    /// Returns the indices of the minimum values along an axis.
+    pub fn argmin_axis(&self, axis: i32) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        let out_shape = Self::reduced_shape(&shape, axis, false);
+        let out_len = outer_size * inner_size;
+
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut best = f32::INFINITY;
+                let mut best_r = 0usize;
+                for r in 0..reduce_size {
+                    let val = data[o * reduce_size * inner_size + r * inner_size + i];
+                    if val < best {
+                        best = val;
+                        best_r = r;
+                    }
+                }
+                out_data[o * inner_size + i] = best_r as f32;
+            }
+        }
+        Tensor::new(out_data, out_shape, false)
+    }
+
+    /// Sort along a given axis (CPU only, not differentiable).
+    pub fn sort(&self, axis: i32, descending: bool) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = data.clone();
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut slice: Vec<f32> = (0..reduce_size)
+                    .map(|r| data[o * reduce_size * inner_size + r * inner_size + i])
+                    .collect();
+                if descending {
+                    slice.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                } else {
+                    slice.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                }
+                for r in 0..reduce_size {
+                    out_data[o * reduce_size * inner_size + r * inner_size + i] = slice[r];
+                }
+            }
+        }
+        Tensor::new(out_data, shape.clone(), false)
+    }
+
+    /// Return sort indices along a given axis (CPU only, not differentiable).
+    pub fn argsort(&self, axis: i32, descending: bool) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let mut out_data = vec![0.0f32; data.len()];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut indices: Vec<usize> = (0..reduce_size).collect();
+                if descending {
+                    indices.sort_by(|&a, &b| {
+                        let va = data[o * reduce_size * inner_size + a * inner_size + i];
+                        let vb = data[o * reduce_size * inner_size + b * inner_size + i];
+                        vb.partial_cmp(&va).unwrap()
+                    });
+                } else {
+                    indices.sort_by(|&a, &b| {
+                        let va = data[o * reduce_size * inner_size + a * inner_size + i];
+                        let vb = data[o * reduce_size * inner_size + b * inner_size + i];
+                        va.partial_cmp(&vb).unwrap()
+                    });
+                }
+                for r in 0..reduce_size {
+                    out_data[o * reduce_size * inner_size + r * inner_size + i] = indices[r] as f32;
+                }
+            }
+        }
+        Tensor::new(out_data, shape.clone(), false)
+    }
+
+    /// Top-k values and indices along a given axis (CPU only, not differentiable).
+    /// Returns (values, indices) tensors.
+    pub fn topk(&self, k: usize, axis: i32, descending: bool) -> (Tensor, Tensor) {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = Self::resolve_axis(axis, ndim);
+        assert!(axis < ndim, "axis {} out of range for {} dims", axis, ndim);
+        let (outer_size, reduce_size, inner_size) = Self::axis_params(&shape, axis);
+        assert!(k <= reduce_size, "k={} exceeds axis size={}", k, reduce_size);
+
+        // Output shape: same but with axis dim = k
+        let mut out_shape = shape.clone();
+        out_shape[axis] = k;
+
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+
+        let data = &self.0.borrow().data;
+        let out_len = outer_size * k * inner_size;
+        let mut val_data = vec![0.0f32; out_len];
+        let mut idx_data = vec![0.0f32; out_len];
+        for o in 0..outer_size {
+            for i in 0..inner_size {
+                let mut indexed: Vec<(usize, f32)> = (0..reduce_size)
+                    .map(|r| (r, data[o * reduce_size * inner_size + r * inner_size + i]))
+                    .collect();
+                if descending {
+                    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                } else {
+                    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                }
+                for r in 0..k {
+                    let pos = o * k * inner_size + r * inner_size + i;
+                    val_data[pos] = indexed[r].1;
+                    idx_data[pos] = indexed[r].0 as f32;
+                }
+            }
+        }
+        (
+            Tensor::new(val_data, out_shape.clone(), false),
+            Tensor::new(idx_data, out_shape, false),
+        )
+    }
+
     /// Create a tensor of ones with the same shape as `other`.
     pub fn ones_like(other: &Tensor) -> Tensor {
         let shape = other.shape();
@@ -4393,6 +5099,11 @@ impl Tensor {
                 | Op::Roll { input, .. } | Op::Take { input, .. }
                 | Op::Diagonal { input, .. }
                 | Op::BroadcastTo { input, .. } => vec![input],
+                Op::SumAxis { ref input, .. } | Op::MeanAxis { ref input, .. }
+                | Op::MaxAxis { ref input, .. } | Op::MinAxis { ref input, .. }
+                | Op::Var { ref input, .. } | Op::ProdAxis { ref input, .. }
+                | Op::Logsumexp { ref input, .. }
+                | Op::Cumsum { ref input, .. } | Op::Cumprod { ref input, .. } => vec![input.clone()],
             }
         };
         for input in &inputs {
@@ -4514,6 +5225,11 @@ impl Tensor {
             }
             Op::LayerNorm { gamma, .. } => {
                 gamma.sync_gpu_to_cpu();
+            }
+            Op::MaxAxis { ref input, .. } | Op::MinAxis { ref input, .. }
+            | Op::Var { ref input, .. } | Op::ProdAxis { ref input, .. }
+            | Op::Logsumexp { ref input, .. } | Op::Cumprod { ref input, .. } => {
+                input.sync_gpu_to_cpu();
             }
             _ => {}
         }
@@ -5693,6 +6409,270 @@ impl Tensor {
             Op::Mean(ref input) => {
                 let n = input.size();
                 let grad_input = vec![grad[0] / n as f32; n];
+                accumulate_grad(input, &grad_input);
+            }
+            Op::SumAxis { ref input, axis, keepdim: _ } => {
+                // Backward: broadcast grad back to input shape
+                let in_shape = input.shape();
+                let (outer_size, reduce_size, inner_size) = Self::axis_params(&in_shape, axis);
+                let in_len = input.size();
+                let mut grad_input = vec![0.0f32; in_len];
+                // grad is shaped [outer, inner] (if !keepdim) or [outer, 1, inner]
+                for o in 0..outer_size {
+                    for i in 0..inner_size {
+                        let g = grad[o * inner_size + i];
+                        for r in 0..reduce_size {
+                            grad_input[o * reduce_size * inner_size + r * inner_size + i] = g;
+                        }
+                    }
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::MeanAxis { ref input, axis, keepdim: _ } => {
+                let in_shape = input.shape();
+                let (outer_size, reduce_size, inner_size) = Self::axis_params(&in_shape, axis);
+                let in_len = input.size();
+                let mut grad_input = vec![0.0f32; in_len];
+                let scale = 1.0 / reduce_size as f32;
+                for o in 0..outer_size {
+                    for i in 0..inner_size {
+                        let g = grad[o * inner_size + i] * scale;
+                        for r in 0..reduce_size {
+                            grad_input[o * reduce_size * inner_size + r * inner_size + i] = g;
+                        }
+                    }
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::MaxAxis { ref input, axis, keepdim: _ } => {
+                // Backward: scatter grad to argmax positions
+                input.sync_gpu_to_cpu_if_needed();
+                let in_inner = input.0.borrow();
+                let in_shape = in_inner.shape.clone();
+                let in_data = &in_inner.data;
+                let (outer_size, reduce_size, inner_size) = Self::axis_params(&in_shape, axis);
+                let in_len = in_data.len();
+                let mut grad_input = vec![0.0f32; in_len];
+                for o in 0..outer_size {
+                    for i in 0..inner_size {
+                        // Find argmax
+                        let mut best = f32::NEG_INFINITY;
+                        let mut best_r = 0;
+                        for r in 0..reduce_size {
+                            let val = in_data[o * reduce_size * inner_size + r * inner_size + i];
+                            if val > best { best = val; best_r = r; }
+                        }
+                        grad_input[o * reduce_size * inner_size + best_r * inner_size + i] =
+                            grad[o * inner_size + i];
+                    }
+                }
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::MinAxis { ref input, axis, keepdim: _ } => {
+                input.sync_gpu_to_cpu_if_needed();
+                let in_inner = input.0.borrow();
+                let in_shape = in_inner.shape.clone();
+                let in_data = &in_inner.data;
+                let (outer_size, reduce_size, inner_size) = Self::axis_params(&in_shape, axis);
+                let in_len = in_data.len();
+                let mut grad_input = vec![0.0f32; in_len];
+                for o in 0..outer_size {
+                    for i in 0..inner_size {
+                        let mut best = f32::INFINITY;
+                        let mut best_r = 0;
+                        for r in 0..reduce_size {
+                            let val = in_data[o * reduce_size * inner_size + r * inner_size + i];
+                            if val < best { best = val; best_r = r; }
+                        }
+                        grad_input[o * reduce_size * inner_size + best_r * inner_size + i] =
+                            grad[o * inner_size + i];
+                    }
+                }
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Var { ref input, axis, keepdim: _, ddof } => {
+                // Backward: d/dx_i var = 2*(x_i - mean) / (N - ddof) * grad
+                input.sync_gpu_to_cpu_if_needed();
+                let in_inner = input.0.borrow();
+                let in_shape = in_inner.shape.clone();
+                let in_data = &in_inner.data;
+                let (outer_size, reduce_size, inner_size) = Self::axis_params(&in_shape, axis);
+                let in_len = in_data.len();
+                let mut grad_input = vec![0.0f32; in_len];
+                let denom = (reduce_size - ddof) as f32;
+                for o in 0..outer_size {
+                    for i in 0..inner_size {
+                        // Compute mean
+                        let mut sum = 0.0f32;
+                        for r in 0..reduce_size {
+                            sum += in_data[o * reduce_size * inner_size + r * inner_size + i];
+                        }
+                        let mean = sum / reduce_size as f32;
+                        let g = grad[o * inner_size + i];
+                        for r in 0..reduce_size {
+                            let idx = o * reduce_size * inner_size + r * inner_size + i;
+                            grad_input[idx] = g * 2.0 * (in_data[idx] - mean) / denom;
+                        }
+                    }
+                }
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::ProdAxis { ref input, axis, keepdim: _ } => {
+                // Backward: grad_x_i = grad * prod / x_i  (handle zeros carefully)
+                input.sync_gpu_to_cpu_if_needed();
+                let in_inner = input.0.borrow();
+                let in_shape = in_inner.shape.clone();
+                let in_data = &in_inner.data;
+                let (outer_size, reduce_size, inner_size) = Self::axis_params(&in_shape, axis);
+                let in_len = in_data.len();
+                let mut grad_input = vec![0.0f32; in_len];
+                for o in 0..outer_size {
+                    for i in 0..inner_size {
+                        let g = grad[o * inner_size + i];
+                        // Count zeros and compute product excluding zeros
+                        let mut zero_count = 0usize;
+                        let mut prod_no_zero = 1.0f32;
+                        for r in 0..reduce_size {
+                            let val = in_data[o * reduce_size * inner_size + r * inner_size + i];
+                            if val == 0.0 {
+                                zero_count += 1;
+                            } else {
+                                prod_no_zero *= val;
+                            }
+                        }
+                        for r in 0..reduce_size {
+                            let idx = o * reduce_size * inner_size + r * inner_size + i;
+                            let val = in_data[idx];
+                            if zero_count == 0 {
+                                // No zeros: grad * prod / x_i
+                                grad_input[idx] = g * prod_no_zero / val;
+                            } else if zero_count == 1 && val == 0.0 {
+                                // Exactly one zero and this is it
+                                grad_input[idx] = g * prod_no_zero;
+                            } else {
+                                // Multiple zeros or this is not the zero
+                                grad_input[idx] = 0.0;
+                            }
+                        }
+                    }
+                }
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Logsumexp { ref input, axis, keepdim: _ } => {
+                // Backward: grad * softmax(x along axis)
+                input.sync_gpu_to_cpu_if_needed();
+                let in_inner = input.0.borrow();
+                let in_shape = in_inner.shape.clone();
+                let in_data = &in_inner.data;
+                let (outer_size, reduce_size, inner_size) = Self::axis_params(&in_shape, axis);
+                let in_len = in_data.len();
+                let mut grad_input = vec![0.0f32; in_len];
+                for o in 0..outer_size {
+                    for i in 0..inner_size {
+                        let g = grad[o * inner_size + i];
+                        // Find max
+                        let mut mx = f32::NEG_INFINITY;
+                        for r in 0..reduce_size {
+                            let val = in_data[o * reduce_size * inner_size + r * inner_size + i];
+                            if val > mx { mx = val; }
+                        }
+                        // Compute sum of exp(x - max)
+                        let mut sum_exp = 0.0f32;
+                        for r in 0..reduce_size {
+                            sum_exp += (in_data[o * reduce_size * inner_size + r * inner_size + i] - mx).exp();
+                        }
+                        // softmax = exp(x - max) / sum_exp, grad_input = g * softmax
+                        for r in 0..reduce_size {
+                            let idx = o * reduce_size * inner_size + r * inner_size + i;
+                            let softmax_val = (in_data[idx] - mx).exp() / sum_exp;
+                            grad_input[idx] = g * softmax_val;
+                        }
+                    }
+                }
+                drop(in_inner);
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Cumsum { ref input, axis } => {
+                // Backward of cumsum is reverse cumsum of grad
+                let in_shape = input.shape();
+                let (outer_size, reduce_size, inner_size) = Self::axis_params(&in_shape, axis);
+                let in_len = input.size();
+                let mut grad_input = vec![0.0f32; in_len];
+                for o in 0..outer_size {
+                    for i in 0..inner_size {
+                        let mut acc = 0.0f32;
+                        for r in (0..reduce_size).rev() {
+                            let pos = o * reduce_size * inner_size + r * inner_size + i;
+                            acc += grad[pos];
+                            grad_input[pos] = acc;
+                        }
+                    }
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Cumprod { ref input, axis } => {
+                // Backward of cumprod: uses exclusive cumprod trick
+                input.sync_gpu_to_cpu_if_needed();
+                let in_inner = input.0.borrow();
+                let in_shape = in_inner.shape.clone();
+                let in_data = &in_inner.data;
+                let (outer_size, reduce_size, inner_size) = Self::axis_params(&in_shape, axis);
+                let in_len = in_data.len();
+                let mut grad_input = vec![0.0f32; in_len];
+                for o in 0..outer_size {
+                    for i in 0..inner_size {
+                        // Compute forward cumprod
+                        let mut fwd_cumprod = vec![0.0f32; reduce_size];
+                        let mut acc = 1.0f32;
+                        for r in 0..reduce_size {
+                            let idx = o * reduce_size * inner_size + r * inner_size + i;
+                            acc *= in_data[idx];
+                            fwd_cumprod[r] = acc;
+                        }
+
+                        // Compute grad * cumprod
+                        let mut gc = vec![0.0f32; reduce_size];
+                        for r in 0..reduce_size {
+                            let idx = o * reduce_size * inner_size + r * inner_size + i;
+                            gc[r] = grad[idx] * fwd_cumprod[r];
+                        }
+                        // Reverse cumsum
+                        let mut rev_cs = vec![0.0f32; reduce_size];
+                        let mut acc2 = 0.0f32;
+                        for r in (0..reduce_size).rev() {
+                            acc2 += gc[r];
+                            rev_cs[r] = acc2;
+                        }
+                        // Divide by x[r]
+                        for r in 0..reduce_size {
+                            let idx = o * reduce_size * inner_size + r * inner_size + i;
+                            let x_r = in_data[idx];
+                            if x_r != 0.0 {
+                                grad_input[idx] = rev_cs[r] / x_r;
+                            } else {
+                                // Handle zero: compute directly
+                                let mut g_sum = 0.0f32;
+                                for j in r..reduce_size {
+                                    let j_idx = o * reduce_size * inner_size + j * inner_size + i;
+                                    // Product of x[0..r-1] * x[r+1..j]
+                                    let mut prod = 1.0f32;
+                                    for k in 0..=j {
+                                        if k != r {
+                                            prod *= in_data[o * reduce_size * inner_size + k * inner_size + i];
+                                        }
+                                    }
+                                    g_sum += grad[j_idx] * prod;
+                                }
+                                grad_input[idx] = g_sum;
+                            }
+                        }
+                    }
+                }
+                drop(in_inner);
                 accumulate_grad(input, &grad_input);
             }
             Op::Squeeze { ref input, .. } | Op::Unsqueeze { ref input, .. } => {
@@ -8293,5 +9273,419 @@ mod tests {
                 idx, analytical[idx], numerical
             );
         }
+    }
+
+    // ======================================================================
+    // Axis-aware reduction tests
+    // ======================================================================
+
+    #[test]
+    fn test_sum_axis() {
+        // [2, 3] tensor
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+
+        // Sum along axis 0 -> shape [3]
+        let s0 = x.sum_axis(0, false);
+        assert_eq!(s0.shape(), vec![3]);
+        assert_eq!(s0.data(), vec![5.0, 7.0, 9.0]);
+
+        // Sum along axis 1 -> shape [2]
+        let s1 = x.sum_axis(1, false);
+        assert_eq!(s1.shape(), vec![2]);
+        assert_eq!(s1.data(), vec![6.0, 15.0]);
+
+        // keepdim=true
+        let s0k = x.sum_axis(0, true);
+        assert_eq!(s0k.shape(), vec![1, 3]);
+        assert_eq!(s0k.data(), vec![5.0, 7.0, 9.0]);
+
+        let s1k = x.sum_axis(1, true);
+        assert_eq!(s1k.shape(), vec![2, 1]);
+        assert_eq!(s1k.data(), vec![6.0, 15.0]);
+
+        // Negative axis
+        let s_neg = x.sum_axis(-1, false);
+        assert_eq!(s_neg.shape(), vec![2]);
+        assert_eq!(s_neg.data(), vec![6.0, 15.0]);
+    }
+
+    #[test]
+    fn test_sum_axis_3d() {
+        // [2, 3, 4] tensor
+        let data: Vec<f32> = (1..=24).map(|x| x as f32).collect();
+        let x = Tensor::new(data, vec![2, 3, 4], false);
+
+        // Sum along axis 1 -> [2, 4]
+        let s = x.sum_axis(1, false);
+        assert_eq!(s.shape(), vec![2, 4]);
+        // First batch: [1,2,3,4] + [5,6,7,8] + [9,10,11,12] = [15,18,21,24]
+        assert_eq!(&s.data()[..4], &[15.0, 18.0, 21.0, 24.0]);
+    }
+
+    #[test]
+    fn test_sum_axis_backward() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let s = x.sum_axis(0, false);
+        let loss = s.sum();
+        loss.backward();
+        let grad = x.grad().unwrap();
+        // Sum along axis 0: grad should be all 1s (broadcast back)
+        assert_eq!(grad, vec![1.0; 6]);
+    }
+
+    #[test]
+    fn test_mean_axis() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+
+        let m0 = x.mean_axis(0, false);
+        assert_eq!(m0.shape(), vec![3]);
+        assert_eq!(m0.data(), vec![2.5, 3.5, 4.5]);
+
+        let m1 = x.mean_axis(1, false);
+        assert_eq!(m1.shape(), vec![2]);
+        assert_eq!(m1.data(), vec![2.0, 5.0]);
+    }
+
+    #[test]
+    fn test_mean_axis_backward() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let m = x.mean_axis(0, false);
+        let loss = m.sum();
+        loss.backward();
+        let grad = x.grad().unwrap();
+        // mean along axis 0: N=2, so grad = 1/2 for all
+        for g in &grad {
+            assert!((g - 0.5).abs() < 1e-6, "expected 0.5, got {}", g);
+        }
+    }
+
+    #[test]
+    fn test_max_axis() {
+        let x = Tensor::new(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], false);
+
+        let m0 = x.max_axis(0, false);
+        assert_eq!(m0.shape(), vec![3]);
+        assert_eq!(m0.data(), vec![4.0, 5.0, 6.0]);
+
+        let m1 = x.max_axis(1, false);
+        assert_eq!(m1.shape(), vec![2]);
+        assert_eq!(m1.data(), vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_max_axis_backward() {
+        let x = Tensor::new(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true);
+        let m = x.max_axis(1, false);
+        let loss = m.sum();
+        loss.backward();
+        let grad = x.grad().unwrap();
+        // Max along axis 1: row 0 max is idx 1 (5.0), row 1 max is idx 2 (6.0)
+        assert_eq!(grad, vec![0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_min_axis() {
+        let x = Tensor::new(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], false);
+
+        let m0 = x.min_axis(0, false);
+        assert_eq!(m0.shape(), vec![3]);
+        assert_eq!(m0.data(), vec![1.0, 2.0, 3.0]);
+
+        let m1 = x.min_axis(1, false);
+        assert_eq!(m1.shape(), vec![2]);
+        assert_eq!(m1.data(), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_var() {
+        // [2, 3] tensor, var along axis 1, ddof=0
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+        let v = x.var(1, false, 0);
+        assert_eq!(v.shape(), vec![2]);
+        let d = v.data();
+        // Row 0: mean=2, var = ((1-2)^2+(2-2)^2+(3-2)^2)/3 = 2/3
+        assert!((d[0] - 2.0 / 3.0).abs() < 1e-5, "expected ~0.667, got {}", d[0]);
+        // Row 1: mean=5, var = ((4-5)^2+(5-5)^2+(6-5)^2)/3 = 2/3
+        assert!((d[1] - 2.0 / 3.0).abs() < 1e-5, "expected ~0.667, got {}", d[1]);
+    }
+
+    #[test]
+    fn test_var_ddof1() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+        let v = x.var(1, false, 1);
+        assert_eq!(v.shape(), vec![2]);
+        let d = v.data();
+        // Row 0: mean=2, var = ((1-2)^2+(2-2)^2+(3-2)^2)/2 = 1.0
+        assert!((d[0] - 1.0).abs() < 1e-5);
+        assert!((d[1] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_var_backward() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let v = x.var(1, false, 0);
+        let loss = v.sum();
+        loss.backward();
+        let grad = x.grad().unwrap();
+        // d/dx_i var = 2*(x_i - mean) / N
+        // Row 0: mean=2, N=3: grad = 2*[-1,0,1]/3 = [-2/3, 0, 2/3]
+        assert!((grad[0] - (-2.0 / 3.0)).abs() < 1e-5, "got {}", grad[0]);
+        assert!((grad[1] - 0.0).abs() < 1e-5);
+        assert!((grad[2] - (2.0 / 3.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_std_axis() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+        let s = x.std_axis(1, false, 0);
+        assert_eq!(s.shape(), vec![2]);
+        let d = s.data();
+        let expected = (2.0f32 / 3.0).sqrt();
+        assert!((d[0] - expected).abs() < 1e-5);
+        assert!((d[1] - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_prod_axis() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+
+        let p1 = x.prod_axis(1, false);
+        assert_eq!(p1.shape(), vec![2]);
+        assert_eq!(p1.data(), vec![6.0, 120.0]);
+
+        let p0 = x.prod_axis(0, false);
+        assert_eq!(p0.shape(), vec![3]);
+        assert_eq!(p0.data(), vec![4.0, 10.0, 18.0]);
+    }
+
+    #[test]
+    fn test_prod_axis_backward() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let p = x.prod_axis(1, false);
+        let loss = p.sum();
+        loss.backward();
+        let grad = x.grad().unwrap();
+        // Row 0: prod=6, grads = [6/1, 6/2, 6/3] = [6, 3, 2]
+        assert!((grad[0] - 6.0).abs() < 1e-5);
+        assert!((grad[1] - 3.0).abs() < 1e-5);
+        assert!((grad[2] - 2.0).abs() < 1e-5);
+        // Row 1: prod=120, grads = [120/4, 120/5, 120/6] = [30, 24, 20]
+        assert!((grad[3] - 30.0).abs() < 1e-5);
+        assert!((grad[4] - 24.0).abs() < 1e-5);
+        assert!((grad[5] - 20.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_logsumexp() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+        let lse = x.logsumexp(1, false);
+        assert_eq!(lse.shape(), vec![2]);
+        let d = lse.data();
+        // Row 0: log(exp(1)+exp(2)+exp(3))
+        let expected0 = (1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp()).ln();
+        assert!((d[0] - expected0).abs() < 1e-4, "expected {}, got {}", expected0, d[0]);
+    }
+
+    #[test]
+    fn test_logsumexp_backward() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let lse = x.logsumexp(1, false);
+        let loss = lse.sum();
+        loss.backward();
+        let grad = x.grad().unwrap();
+        // Backward should be softmax of x along axis
+        let sum_exp_0 = 1.0f32.exp() + 2.0f32.exp() + 3.0f32.exp();
+        assert!((grad[0] - 1.0f32.exp() / sum_exp_0).abs() < 1e-5);
+        assert!((grad[1] - 2.0f32.exp() / sum_exp_0).abs() < 1e-5);
+        assert!((grad[2] - 3.0f32.exp() / sum_exp_0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cumsum() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+
+        // Cumsum along axis 1
+        let cs1 = x.cumsum(1);
+        assert_eq!(cs1.shape(), vec![2, 3]);
+        assert_eq!(cs1.data(), vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]);
+
+        // Cumsum along axis 0
+        let cs0 = x.cumsum(0);
+        assert_eq!(cs0.shape(), vec![2, 3]);
+        assert_eq!(cs0.data(), vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn test_cumsum_backward() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let cs = x.cumsum(1);
+        let loss = cs.sum();
+        loss.backward();
+        let grad = x.grad().unwrap();
+        // Backward of cumsum is reverse cumsum of ones
+        // grad of cumsum(1) when all output grads are 1:
+        // Row 0: reverse cumsum of [1,1,1] = [3,2,1]
+        // Row 1: same
+        assert_eq!(grad, vec![3.0, 2.0, 1.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_cumprod() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+
+        let cp = x.cumprod(1);
+        assert_eq!(cp.shape(), vec![2, 3]);
+        assert_eq!(cp.data(), vec![1.0, 2.0, 6.0, 4.0, 20.0, 120.0]);
+    }
+
+    #[test]
+    fn test_cumprod_backward() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let cp = x.cumprod(1);
+        let loss = cp.sum();
+        loss.backward();
+        let grad = x.grad().unwrap();
+        // Verify with numerical gradient
+        let eps = 1e-3;
+        let x_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        for idx in 0..6 {
+            let mut x_plus = x_data.clone();
+            x_plus[idx] += eps;
+            let t_plus = Tensor::new(x_plus, vec![2, 3], false);
+            let l_plus = t_plus.cumprod(1).sum().data()[0];
+
+            let mut x_minus = x_data.clone();
+            x_minus[idx] -= eps;
+            let t_minus = Tensor::new(x_minus, vec![2, 3], false);
+            let l_minus = t_minus.cumprod(1).sum().data()[0];
+
+            let numerical = (l_plus - l_minus) / (2.0 * eps);
+            let diff = (grad[idx] - numerical).abs();
+            assert!(diff < 0.05, "cumprod grad mismatch at {}: analytical={}, numerical={}", idx, grad[idx], numerical);
+        }
+    }
+
+    #[test]
+    fn test_any_all() {
+        let x = Tensor::new(vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0], vec![2, 3], false);
+
+        let any_0 = x.any(0);
+        assert_eq!(any_0.shape(), vec![3]);
+        // col 0: has 2.0, col 1: has 1.0, col 2: has 3.0
+        assert_eq!(any_0.data(), vec![1.0, 1.0, 1.0]);
+
+        let any_1 = x.any(1);
+        assert_eq!(any_1.shape(), vec![2]);
+        assert_eq!(any_1.data(), vec![1.0, 1.0]);
+
+        let all_1 = x.all(1);
+        assert_eq!(all_1.shape(), vec![2]);
+        // Row 0: [0,1,0] - not all nonzero, Row 1: [2,0,3] - not all nonzero
+        assert_eq!(all_1.data(), vec![0.0, 0.0]);
+
+        let y = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+        let all_y = y.all(1);
+        assert_eq!(all_y.data(), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_argmax_argmin_axis() {
+        let x = Tensor::new(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], false);
+
+        let am1 = x.argmax_axis(1);
+        assert_eq!(am1.shape(), vec![2]);
+        assert_eq!(am1.data(), vec![1.0, 2.0]); // idx 1 (5.0), idx 2 (6.0)
+
+        let am0 = x.argmax_axis(0);
+        assert_eq!(am0.shape(), vec![3]);
+        assert_eq!(am0.data(), vec![1.0, 0.0, 1.0]); // 4>1, 5>2, 6>3
+
+        let ami1 = x.argmin_axis(1);
+        assert_eq!(ami1.shape(), vec![2]);
+        assert_eq!(ami1.data(), vec![0.0, 1.0]); // 1.0, 2.0
+
+        let ami0 = x.argmin_axis(0);
+        assert_eq!(ami0.shape(), vec![3]);
+        assert_eq!(ami0.data(), vec![0.0, 1.0, 0.0]); // 1<4, 2<5, 3<6
+    }
+
+    #[test]
+    fn test_sort() {
+        let x = Tensor::new(vec![3.0, 1.0, 2.0, 6.0, 4.0, 5.0], vec![2, 3], false);
+
+        let sorted = x.sort(1, false);
+        assert_eq!(sorted.shape(), vec![2, 3]);
+        assert_eq!(sorted.data(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        let sorted_desc = x.sort(1, true);
+        assert_eq!(sorted_desc.data(), vec![3.0, 2.0, 1.0, 6.0, 5.0, 4.0]);
+    }
+
+    #[test]
+    fn test_argsort() {
+        let x = Tensor::new(vec![3.0, 1.0, 2.0, 6.0, 4.0, 5.0], vec![2, 3], false);
+
+        let indices = x.argsort(1, false);
+        assert_eq!(indices.shape(), vec![2, 3]);
+        assert_eq!(indices.data(), vec![1.0, 2.0, 0.0, 1.0, 2.0, 0.0]);
+    }
+
+    #[test]
+    fn test_topk() {
+        let x = Tensor::new(vec![3.0, 1.0, 5.0, 2.0, 6.0, 4.0, 8.0, 7.0, 9.0], vec![3, 3], false);
+
+        let (vals, indices) = x.topk(2, 1, true);
+        assert_eq!(vals.shape(), vec![3, 2]);
+        // Row 0: [3,1,5] -> top 2 desc: [5,3]
+        assert_eq!(&vals.data()[..2], &[5.0, 3.0]);
+        assert_eq!(&indices.data()[..2], &[2.0, 0.0]);
+        // Row 1: [2,6,4] -> top 2 desc: [6,4]
+        assert_eq!(&vals.data()[2..4], &[6.0, 4.0]);
+        assert_eq!(&indices.data()[2..4], &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_axis_reduction_finite_diff() {
+        // Comprehensive finite-difference gradient check for all differentiable axis reductions
+        let eps = 1e-3;
+        let x_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let shape = vec![2, 3];
+
+        // Helper closure
+        let check_grad = |op_name: &str, compute: Box<dyn Fn(&Tensor) -> Tensor>| {
+            let x = Tensor::new(x_data.clone(), shape.clone(), true);
+            let out = compute(&x);
+            let loss = out.sum();
+            loss.backward();
+            let grad = x.grad().unwrap();
+
+            for idx in 0..x_data.len() {
+                let mut x_plus = x_data.clone();
+                x_plus[idx] += eps;
+                let t_plus = Tensor::new(x_plus, shape.clone(), false);
+                let l_plus = compute(&t_plus).sum().data()[0];
+
+                let mut x_minus = x_data.clone();
+                x_minus[idx] -= eps;
+                let t_minus = Tensor::new(x_minus, shape.clone(), false);
+                let l_minus = compute(&t_minus).sum().data()[0];
+
+                let numerical = (l_plus - l_minus) / (2.0 * eps);
+                let diff = (grad[idx] - numerical).abs();
+                assert!(diff < 0.05,
+                    "{}: gradient mismatch at idx {}: analytical={}, numerical={}, diff={}",
+                    op_name, idx, grad[idx], numerical, diff);
+            }
+        };
+
+        check_grad("sum_axis", Box::new(|x: &Tensor| x.sum_axis(1, false)));
+        check_grad("mean_axis", Box::new(|x: &Tensor| x.mean_axis(1, false)));
+        check_grad("max_axis", Box::new(|x: &Tensor| x.max_axis(1, false)));
+        check_grad("min_axis", Box::new(|x: &Tensor| x.min_axis(1, false)));
+        check_grad("var_ddof0", Box::new(|x: &Tensor| x.var(1, false, 0)));
+        check_grad("var_ddof1", Box::new(|x: &Tensor| x.var(1, false, 1)));
+        check_grad("prod_axis", Box::new(|x: &Tensor| x.prod_axis(1, false)));
+        check_grad("logsumexp", Box::new(|x: &Tensor| x.logsumexp(1, false)));
+        check_grad("std_axis", Box::new(|x: &Tensor| x.std_axis(1, false, 0)));
     }
 }

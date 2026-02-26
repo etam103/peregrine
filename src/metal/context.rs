@@ -83,6 +83,11 @@ impl GpuContext {
             "elu_f32", "elu_backward_f32",
             // Shape manipulation kernels
             "tril_f32", "triu_f32", "pad_f32", "repeat_f32",
+            // Axis-aware reduction kernels
+            "sum_axis_f32", "mean_axis_f32", "max_axis_f32", "min_axis_f32",
+            "prod_axis_f32", "argmax_axis_f32", "argmin_axis_f32",
+            "cumsum_f32", "cumprod_f32",
+            "logsumexp_axis_f32", "var_axis_f32",
         ];
 
         let mut pipelines = HashMap::new();
@@ -999,6 +1004,104 @@ impl GpuContext {
         let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
         let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
         let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch an axis-aware reduction: one thread per output element.
+    /// Kernels: sum_axis_f32, mean_axis_f32, max_axis_f32, min_axis_f32,
+    /// prod_axis_f32, argmax_axis_f32, argmin_axis_f32, logsumexp_axis_f32,
+    /// cumsum_f32, cumprod_f32.
+    pub fn dispatch_reduce_axis(
+        &self,
+        kernel: &str,
+        input: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        outer_size: u32,
+        reduce_size: u32,
+        inner_size: u32,
+    ) {
+        #[repr(C)]
+        struct ReduceAxisParams {
+            outer_size: u32,
+            reduce_size: u32,
+            inner_size: u32,
+        }
+
+        let params = ReduceAxisParams { outer_size, reduce_size, inner_size };
+
+        // For cumsum/cumprod, output has same size as input (not reduced)
+        let grid_n = if kernel == "cumsum_f32" || kernel == "cumprod_f32" {
+            (outer_size * inner_size) as usize
+        } else {
+            output.len()
+        };
+
+        let pipeline = &self.pipelines[kernel];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<ReduceAxisParams>(),
+                2,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(grid_n.max(1)), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: grid_n.max(1), height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch variance along axis with ddof parameter.
+    pub fn dispatch_var_axis(
+        &self,
+        input: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        outer_size: u32,
+        reduce_size: u32,
+        inner_size: u32,
+        ddof: u32,
+    ) {
+        #[repr(C)]
+        struct VarAxisParams {
+            outer_size: u32,
+            reduce_size: u32,
+            inner_size: u32,
+            ddof: u32,
+        }
+
+        let params = VarAxisParams { outer_size, reduce_size, inner_size, ddof };
+
+        let pipeline = &self.pipelines["var_axis_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<VarAxisParams>(),
+                2,
+            );
+        }
+
+        let n = output.len();
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n.max(1)), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n.max(1), height: 1, depth: 1 };
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
         enc.endEncoding();

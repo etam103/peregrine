@@ -1440,4 +1440,234 @@ kernel void repeat_f32(
 
     output[idx] = input[in_flat];
 }
+
+// ---------------------------------------------------------------------------
+// Axis-aware reduction kernels
+// ---------------------------------------------------------------------------
+
+struct ReduceAxisParams {
+    uint outer_size;
+    uint reduce_size;
+    uint inner_size;
+};
+
+// Sum along axis
+kernel void sum_axis_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    float acc = 0.0f;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        acc += input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+    }
+    output[idx] = acc;
+}
+
+// Mean along axis
+kernel void mean_axis_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    float acc = 0.0f;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        acc += input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+    }
+    output[idx] = acc / float(p.reduce_size);
+}
+
+// Max along axis
+kernel void max_axis_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    float acc = -INFINITY;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        acc = max(acc, input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner]);
+    }
+    output[idx] = acc;
+}
+
+// Min along axis
+kernel void min_axis_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    float acc = INFINITY;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        acc = min(acc, input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner]);
+    }
+    output[idx] = acc;
+}
+
+// Product along axis
+kernel void prod_axis_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    float acc = 1.0f;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        acc *= input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+    }
+    output[idx] = acc;
+}
+
+// Argmax along axis (returns float indices)
+kernel void argmax_axis_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    float best = -INFINITY;
+    uint best_r = 0;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        float val = input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+        if (val > best) {
+            best = val;
+            best_r = r;
+        }
+    }
+    output[idx] = float(best_r);
+}
+
+// Argmin along axis (returns float indices)
+kernel void argmin_axis_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    float best = INFINITY;
+    uint best_r = 0;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        float val = input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+        if (val < best) {
+            best = val;
+            best_r = r;
+        }
+    }
+    output[idx] = float(best_r);
+}
+
+// Cumulative sum along axis
+// Each thread handles one (outer, inner) pair and writes reduce_size outputs
+kernel void cumsum_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    float acc = 0.0f;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        uint pos = outer * p.reduce_size * p.inner_size + r * p.inner_size + inner;
+        acc += input[pos];
+        output[pos] = acc;
+    }
+}
+
+// Cumulative product along axis
+kernel void cumprod_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    float acc = 1.0f;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        uint pos = outer * p.reduce_size * p.inner_size + r * p.inner_size + inner;
+        acc *= input[pos];
+        output[pos] = acc;
+    }
+}
+
+// Log-sum-exp along axis (numerically stable)
+kernel void logsumexp_axis_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant ReduceAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    // Find max for numerical stability
+    float mx = -INFINITY;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        mx = max(mx, input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner]);
+    }
+    float acc = 0.0f;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        acc += exp(input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner] - mx);
+    }
+    output[idx] = mx + log(acc);
+}
+
+// Variance along axis
+struct VarAxisParams {
+    uint outer_size;
+    uint reduce_size;
+    uint inner_size;
+    uint ddof;
+};
+
+kernel void var_axis_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant VarAxisParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.outer_size * p.inner_size) return;
+    uint outer = idx / p.inner_size;
+    uint inner = idx % p.inner_size;
+    // Compute mean
+    float sum = 0.0f;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        sum += input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+    }
+    float mean = sum / float(p.reduce_size);
+    // Compute variance
+    float var_acc = 0.0f;
+    for (uint r = 0; r < p.reduce_size; r++) {
+        float diff = input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner] - mean;
+        var_acc += diff * diff;
+    }
+    output[idx] = var_acc / float(p.reduce_size - p.ddof);
+}
 "#;
