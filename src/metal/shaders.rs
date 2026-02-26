@@ -864,4 +864,128 @@ kernel void adam_step_f32(
 
     data[idx] -= p.lr * m_hat / (sqrt(v_hat) + p.eps);
 }
+
+// ---------------------------------------------------------------------------
+// Tril: zero elements above the k-th diagonal
+// Treats tensor as batch of 2D matrices (last two dims are rows/cols)
+// ---------------------------------------------------------------------------
+
+struct TrilTriuParams {
+    uint rows;
+    uint cols;
+    int k;
+};
+
+kernel void tril_f32(
+    device const float* a [[buffer(0)]],
+    device float* out     [[buffer(1)]],
+    constant TrilTriuParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint mat_size = p.rows * p.cols;
+    uint local_idx = idx % mat_size;
+    uint row = local_idx / p.cols;
+    uint col = local_idx % p.cols;
+    out[idx] = ((int)col <= (int)row + p.k) ? a[idx] : 0.0f;
+}
+
+kernel void triu_f32(
+    device const float* a [[buffer(0)]],
+    device float* out     [[buffer(1)]],
+    constant TrilTriuParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint mat_size = p.rows * p.cols;
+    uint local_idx = idx % mat_size;
+    uint row = local_idx / p.cols;
+    uint col = local_idx % p.cols;
+    out[idx] = ((int)col - (int)row >= p.k) ? a[idx] : 0.0f;
+}
+
+// ---------------------------------------------------------------------------
+// Pad: map output indices to input indices, fill value for padding
+// ---------------------------------------------------------------------------
+
+struct PadParams {
+    uint ndim;
+    uint in_total;
+    uint out_total;
+};
+
+kernel void pad_f32(
+    device const float* input  [[buffer(0)]],
+    device float* output       [[buffer(1)]],
+    constant PadParams& p      [[buffer(2)]],
+    constant uint* in_shape    [[buffer(3)]],
+    constant uint* out_shape   [[buffer(4)]],
+    constant uint* pad_before  [[buffer(5)]],
+    constant float& pad_value  [[buffer(6)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.out_total) return;
+
+    // Decompose output flat index into coordinates
+    uint rem = idx;
+    bool in_bounds = true;
+    uint in_flat = 0;
+    uint in_stride = 1;
+    uint out_stride = 1;
+
+    // Pre-compute strides from the end
+    // We compute on-the-fly from the last dimension
+    for (uint d = p.ndim; d > 0; d--) {
+        uint di = d - 1;
+        uint out_s = 1;
+        uint in_s = 1;
+        for (uint j = di + 1; j < p.ndim; j++) {
+            out_s *= out_shape[j];
+            in_s *= in_shape[j];
+        }
+        uint coord = (idx / out_s) % out_shape[di];
+        int in_coord = (int)coord - (int)pad_before[di];
+        if (in_coord < 0 || (uint)in_coord >= in_shape[di]) {
+            in_bounds = false;
+            break;
+        }
+        in_flat += (uint)in_coord * in_s;
+    }
+
+    output[idx] = in_bounds ? input[in_flat] : pad_value;
+}
+
+// ---------------------------------------------------------------------------
+// Repeat: map output index back to input index via modulo
+// ---------------------------------------------------------------------------
+
+struct RepeatParams {
+    uint ndim;
+    uint total;
+};
+
+kernel void repeat_f32(
+    device const float* input   [[buffer(0)]],
+    device float* output        [[buffer(1)]],
+    constant RepeatParams& p    [[buffer(2)]],
+    constant uint* in_shape     [[buffer(3)]],
+    constant uint* out_shape    [[buffer(4)]],
+    uint idx [[thread_position_in_grid]])
+{
+    if (idx >= p.total) return;
+
+    uint in_flat = 0;
+    for (uint d = p.ndim; d > 0; d--) {
+        uint di = d - 1;
+        uint out_s = 1;
+        uint in_s = 1;
+        for (uint j = di + 1; j < p.ndim; j++) {
+            out_s *= out_shape[j];
+            in_s *= in_shape[j];
+        }
+        uint coord = (idx / out_s) % out_shape[di];
+        uint in_coord = coord % in_shape[di];
+        in_flat += in_coord * in_s;
+    }
+
+    output[idx] = input[in_flat];
+}
 "#;

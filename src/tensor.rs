@@ -149,6 +149,14 @@ pub enum Op {
         dim: usize,
     },
     MatMulBiasRelu(Tensor, Tensor, Tensor), // input, weight, bias — fused matmul+bias+relu
+    Tril { input: Tensor, k: i32 },
+    Triu { input: Tensor, k: i32 },
+    Repeat { input: Tensor, repeats: Vec<usize> },
+    Pad { input: Tensor, widths: Vec<(usize, usize)>, value: f32 },
+    Roll { input: Tensor, shift: i32, axis: usize },
+    Take { input: Tensor, indices: Vec<usize>, axis: usize },
+    Diagonal { input: Tensor, offset: i32 },
+    BroadcastTo { input: Tensor, original_shape: Vec<usize> },
 }
 
 /// Compute flat index for a 4D tensor with shape [N, C, H, W].
@@ -2124,6 +2132,411 @@ impl Tensor {
         )
     }
 
+    /// Alias for unsqueeze. Insert a dimension of size 1 at position `axis`.
+    pub fn expand_dims(&self, axis: usize) -> Tensor {
+        self.unsqueeze(axis)
+    }
+
+    /// Logically broadcast tensor to target shape without copying data.
+    /// The tensor must be broadcastable to the target shape.
+    pub fn broadcast_to(&self, target_shape: &[usize]) -> Tensor {
+        let inner = self.0.borrow();
+        let src_shape = &inner.shape;
+        let ndim = target_shape.len();
+        assert!(src_shape.len() <= ndim,
+            "broadcast_to: input has more dims ({}) than target ({})", src_shape.len(), ndim);
+
+        // Validate broadcastability
+        let offset = ndim - src_shape.len();
+        for i in 0..src_shape.len() {
+            let s = src_shape[i];
+            let t = target_shape[i + offset];
+            assert!(s == t || s == 1,
+                "broadcast_to: cannot broadcast dim {} from {} to {}", i, s, t);
+        }
+
+        let original_shape = inner.shape.clone();
+        // Materialize the broadcast using broadcast_gather
+        let data = broadcast_gather(&inner.data, &inner.shape, target_shape);
+        Tensor::from_op(data, target_shape.to_vec(),
+            Op::BroadcastTo { input: self.clone(), original_shape })
+    }
+
+    /// Lower triangular: zero elements above the k-th diagonal.
+    /// Treats tensor as batch of 2D matrices (last two dims are rows/cols).
+    pub fn tril(&self, k: i32) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let shape = &inner.shape;
+        assert!(shape.len() >= 2, "tril requires at least 2D tensor");
+        let rows = shape[shape.len() - 2];
+        let cols = shape[shape.len() - 1];
+        let batch: usize = shape[..shape.len() - 2].iter().product::<usize>().max(1);
+        let mut data = inner.data.clone();
+        for b in 0..batch {
+            for r in 0..rows {
+                for c in 0..cols {
+                    let idx = b * rows * cols + r * cols + c;
+                    // Keep if row >= col - k, i.e., col <= row + k
+                    if (c as i32) > (r as i32) + k {
+                        data[idx] = 0.0;
+                    }
+                }
+            }
+        }
+        Tensor::from_op(data, inner.shape.clone(), Op::Tril { input: self.clone(), k })
+    }
+
+    /// Upper triangular: zero elements below the k-th diagonal.
+    /// Uses numpy convention: k=0 keeps main diagonal and above,
+    /// k=1 keeps only strictly above diagonal, k=-1 keeps one below diagonal too.
+    /// Treats tensor as batch of 2D matrices (last two dims are rows/cols).
+    pub fn triu(&self, k: i32) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let shape = &inner.shape;
+        assert!(shape.len() >= 2, "triu requires at least 2D tensor");
+        let rows = shape[shape.len() - 2];
+        let cols = shape[shape.len() - 1];
+        let batch: usize = shape[..shape.len() - 2].iter().product::<usize>().max(1);
+        let mut data = inner.data.clone();
+        for b in 0..batch {
+            for r in 0..rows {
+                for c in 0..cols {
+                    let idx = b * rows * cols + r * cols + c;
+                    // Keep if col - row >= k, zero otherwise
+                    if (c as i32) - (r as i32) < k {
+                        data[idx] = 0.0;
+                    }
+                }
+            }
+        }
+        Tensor::from_op(data, inner.shape.clone(), Op::Triu { input: self.clone(), k })
+    }
+
+    /// Repeat tensor along each dimension.
+    /// `repeats` specifies the number of repetitions per dimension.
+    /// Length of `repeats` must match the number of dimensions.
+    pub fn repeat(&self, repeats: &[usize]) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let shape = &inner.shape;
+        assert_eq!(repeats.len(), shape.len(),
+            "repeat: repeats length ({}) must match ndim ({})", repeats.len(), shape.len());
+
+        let ndim = shape.len();
+        let out_shape: Vec<usize> = shape.iter().zip(repeats).map(|(&s, &r)| s * r).collect();
+        let total: usize = out_shape.iter().product();
+        let mut data = vec![0.0f32; total];
+
+        // Compute strides for input and output
+        let mut in_strides = vec![1usize; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            in_strides[i] = in_strides[i + 1] * shape[i + 1];
+        }
+        let mut out_strides = vec![1usize; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+        }
+
+        for flat in 0..total {
+            let mut in_idx = 0;
+            let mut rem = flat;
+            for d in 0..ndim {
+                let coord = rem / out_strides[d];
+                rem %= out_strides[d];
+                in_idx += (coord % shape[d]) * in_strides[d];
+            }
+            data[flat] = inner.data[in_idx];
+        }
+
+        Tensor::from_op(data, out_shape, Op::Repeat { input: self.clone(), repeats: repeats.to_vec() })
+    }
+
+    /// Tile tensor (like numpy.tile). `reps` specifies number of tiles per dimension.
+    /// If `reps` is shorter than ndim, it is padded with 1s on the left.
+    /// If `reps` is longer than ndim, the tensor is unsqueezed on the left.
+    pub fn tile(&self, reps: &[usize]) -> Tensor {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let reps_len = reps.len();
+
+        // Pad shape or reps to match length
+        let (padded_shape, padded_reps) = if reps_len > ndim {
+            let mut s = vec![1usize; reps_len - ndim];
+            s.extend_from_slice(&shape);
+            (s, reps.to_vec())
+        } else {
+            let mut r = vec![1usize; ndim - reps_len];
+            r.extend_from_slice(reps);
+            (shape.clone(), r)
+        };
+
+        // Reshape if needed, then repeat
+        if padded_shape != shape {
+            let reshaped = self.reshape(padded_shape.clone());
+            reshaped.repeat(&padded_reps)
+        } else {
+            self.repeat(&padded_reps)
+        }
+    }
+
+    /// Pad tensor with constant value.
+    /// `widths` is (before, after) padding for each dimension.
+    pub fn pad(&self, widths: &[(usize, usize)], value: f32) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let shape = &inner.shape;
+        let ndim = shape.len();
+        assert_eq!(widths.len(), ndim,
+            "pad: widths length ({}) must match ndim ({})", widths.len(), ndim);
+
+        let out_shape: Vec<usize> = shape.iter().zip(widths)
+            .map(|(&s, &(before, after))| s + before + after)
+            .collect();
+        let total: usize = out_shape.iter().product();
+        let mut data = vec![value; total];
+
+        // Compute strides
+        let mut in_strides = vec![1usize; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            in_strides[i] = in_strides[i + 1] * shape[i + 1];
+        }
+        let mut out_strides = vec![1usize; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+        }
+
+        let in_total: usize = shape.iter().product();
+        for flat in 0..in_total {
+            let mut out_flat = 0;
+            let mut rem = flat;
+            for d in 0..ndim {
+                let coord = rem / in_strides[d];
+                rem %= in_strides[d];
+                out_flat += (coord + widths[d].0) * out_strides[d];
+            }
+            data[out_flat] = inner.data[flat];
+        }
+
+        Tensor::from_op(data, out_shape,
+            Op::Pad { input: self.clone(), widths: widths.to_vec(), value })
+    }
+
+    /// Circular shift along axis.
+    pub fn roll(&self, shift: i32, axis: usize) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let shape = &inner.shape;
+        let ndim = shape.len();
+        assert!(axis < ndim, "roll: axis {} out of range for ndim {}", axis, ndim);
+
+        let dim_size = shape[axis] as i32;
+        let total: usize = shape.iter().product();
+        let mut data = vec![0.0f32; total];
+
+        let mut strides = vec![1usize; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+
+        for flat in 0..total {
+            let mut coords = vec![0usize; ndim];
+            let mut rem = flat;
+            for d in 0..ndim {
+                coords[d] = rem / strides[d];
+                rem %= strides[d];
+            }
+            // Compute shifted coordinate
+            let old_coord = coords[axis] as i32;
+            let new_coord = ((old_coord + shift) % dim_size + dim_size) % dim_size;
+            let mut out_flat = 0;
+            for d in 0..ndim {
+                let c = if d == axis { new_coord as usize } else { coords[d] };
+                out_flat += c * strides[d];
+            }
+            data[out_flat] = inner.data[flat];
+        }
+
+        Tensor::from_op(data, inner.shape.clone(),
+            Op::Roll { input: self.clone(), shift, axis })
+    }
+
+    /// Gather elements along axis by indices.
+    pub fn take(&self, indices: &[usize], axis: i32) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let shape = &inner.shape;
+        let ndim = shape.len();
+        let axis = if axis < 0 { (ndim as i32 + axis) as usize } else { axis as usize };
+        assert!(axis < ndim, "take: axis out of range");
+
+        let mut out_shape = shape.to_vec();
+        out_shape[axis] = indices.len();
+        let total: usize = out_shape.iter().product();
+        let mut data = vec![0.0f32; total];
+
+        let mut in_strides = vec![1usize; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            in_strides[i] = in_strides[i + 1] * shape[i + 1];
+        }
+        let mut out_strides = vec![1usize; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+        }
+
+        for flat in 0..total {
+            let mut in_flat = 0;
+            let mut rem = flat;
+            for d in 0..ndim {
+                let coord = rem / out_strides[d];
+                rem %= out_strides[d];
+                let in_coord = if d == axis { indices[coord] } else { coord };
+                in_flat += in_coord * in_strides[d];
+            }
+            data[flat] = inner.data[in_flat];
+        }
+
+        Tensor::from_op(data, out_shape,
+            Op::Take { input: self.clone(), indices: indices.to_vec(), axis })
+    }
+
+    /// Stack tensors along a new dimension.
+    /// Each tensor is unsqueezed at `axis`, then concatenated.
+    pub fn stack(tensors: &[Tensor], axis: i32) -> Tensor {
+        assert!(!tensors.is_empty(), "stack requires at least one tensor");
+        let ndim = tensors[0].shape().len();
+        let axis = if axis < 0 { (ndim as i32 + 1 + axis) as usize } else { axis as usize };
+        let expanded: Vec<Tensor> = tensors.iter().map(|t| t.unsqueeze(axis)).collect();
+        let refs: Vec<&Tensor> = expanded.iter().collect();
+        Tensor::concat(&refs, axis)
+    }
+
+    /// Split tensor into equal-sized chunks along `axis`.
+    /// If the dimension is not evenly divisible, the last chunk is smaller.
+    pub fn split(&self, sections: usize, axis: i32) -> Vec<Tensor> {
+        let shape = self.shape();
+        let ndim = shape.len();
+        let axis = if axis < 0 { (ndim as i32 + axis) as usize } else { axis as usize };
+        assert!(axis < ndim, "split: axis out of range");
+        assert!(sections > 0, "split: sections must be > 0");
+
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let dim_size = shape[axis];
+
+        let outer: usize = shape[..axis].iter().product();
+        let inner_size: usize = shape[axis + 1..].iter().product();
+
+        let mut result = Vec::new();
+        let mut offset = 0;
+        while offset < dim_size {
+            let chunk_size = sections.min(dim_size - offset);
+            let mut chunk_shape = shape.clone();
+            chunk_shape[axis] = chunk_size;
+            let chunk_total = chunk_shape.iter().product::<usize>();
+            let mut data = vec![0.0f32; chunk_total];
+
+            for o in 0..outer {
+                for d in 0..chunk_size {
+                    let src_base = o * dim_size * inner_size + (offset + d) * inner_size;
+                    let dst_base = o * chunk_size * inner_size + d * inner_size;
+                    data[dst_base..dst_base + inner_size]
+                        .copy_from_slice(&inner.data[src_base..src_base + inner_size]);
+                }
+            }
+
+            result.push(Tensor::new(data, chunk_shape, inner.requires_grad));
+            offset += chunk_size;
+        }
+        result
+    }
+
+    /// Outer product of two 1D tensors.
+    pub fn outer(a: &Tensor, b: &Tensor) -> Tensor {
+        let a_shape = a.shape();
+        let b_shape = b.shape();
+        assert_eq!(a_shape.len(), 1, "outer: first tensor must be 1D");
+        assert_eq!(b_shape.len(), 1, "outer: second tensor must be 1D");
+        let a_col = a.reshape(vec![a_shape[0], 1]);
+        let b_row = b.reshape(vec![1, b_shape[0]]);
+        a_col.matmul(&b_row)
+    }
+
+    /// Inner product (dot product) of two tensors.
+    pub fn inner(a: &Tensor, b: &Tensor) -> Tensor {
+        a.mul(b).sum()
+    }
+
+    /// Extract diagonal from a 2D matrix.
+    pub fn diagonal(&self, offset: i32) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        assert_eq!(inner.shape.len(), 2, "diagonal requires a 2D tensor");
+        let rows = inner.shape[0];
+        let cols = inner.shape[1];
+
+        let mut diag_data = Vec::new();
+        if offset >= 0 {
+            let start_col = offset as usize;
+            let len = rows.min(cols.saturating_sub(start_col));
+            for i in 0..len {
+                diag_data.push(inner.data[i * cols + (i + start_col)]);
+            }
+        } else {
+            let start_row = (-offset) as usize;
+            let len = cols.min(rows.saturating_sub(start_row));
+            for i in 0..len {
+                diag_data.push(inner.data[(i + start_row) * cols + i]);
+            }
+        }
+
+        let n = diag_data.len();
+        Tensor::from_op(diag_data, vec![n],
+            Op::Diagonal { input: self.clone(), offset })
+    }
+
+    /// If 1D: create diagonal matrix. If 2D: extract diagonal.
+    pub fn diag(&self, k: i32) -> Tensor {
+        let shape = self.shape();
+        if shape.len() == 1 {
+            // Create diagonal matrix from 1D input
+            #[cfg(feature = "metal")]
+            self.sync_gpu_to_cpu();
+            let inner = self.0.borrow();
+            let n = inner.shape[0];
+            let offset = k.unsigned_abs() as usize;
+            let size = n + offset;
+            let mut data = vec![0.0f32; size * size];
+            if k >= 0 {
+                for i in 0..n {
+                    data[i * size + (i + offset)] = inner.data[i];
+                }
+            } else {
+                for i in 0..n {
+                    data[(i + offset) * size + i] = inner.data[i];
+                }
+            }
+            // Creating a diagonal matrix is not differentiable in this simple form
+            Tensor::new(data, vec![size, size], inner.requires_grad)
+        } else {
+            self.diagonal(k)
+        }
+    }
+
+    /// Sum of diagonal elements.
+    pub fn trace(&self) -> Tensor {
+        self.diagonal(0).sum()
+    }
+
     /// Returns the maximum value as a scalar (not differentiable).
     pub fn max(&self) -> f32 {
         let inner = self.0.borrow();
@@ -2293,6 +2706,11 @@ impl Tensor {
                 Op::LayerNorm { input, gamma, beta, .. }
                 | Op::BatchNorm { input, gamma, beta, .. } => vec![input, gamma, beta],
                 Op::Concat { inputs, .. } => inputs,
+                Op::Tril { input, .. } | Op::Triu { input, .. }
+                | Op::Repeat { input, .. } | Op::Pad { input, .. }
+                | Op::Roll { input, .. } | Op::Take { input, .. }
+                | Op::Diagonal { input, .. }
+                | Op::BroadcastTo { input, .. } => vec![input],
             }
         };
         for input in &inputs {
@@ -3387,6 +3805,198 @@ impl Tensor {
                 accumulate_grad(input, &grad_input);
                 accumulate_grad(gamma, &grad_gamma);
                 accumulate_grad(beta, &grad_beta);
+            }
+            Op::Tril { ref input, k } => {
+                // Backward: tril of the gradient with the same k
+                let in_shape = input.shape();
+                let ndim = in_shape.len();
+                let rows = in_shape[ndim - 2];
+                let cols = in_shape[ndim - 1];
+                let batch: usize = in_shape[..ndim - 2].iter().product::<usize>().max(1);
+                let mut grad_input = grad.clone();
+                for b in 0..batch {
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            let idx = b * rows * cols + r * cols + c;
+                            if (c as i32) > (r as i32) + k {
+                                grad_input[idx] = 0.0;
+                            }
+                        }
+                    }
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Triu { ref input, k } => {
+                // Backward: triu of the gradient with the same k
+                let in_shape = input.shape();
+                let ndim = in_shape.len();
+                let rows = in_shape[ndim - 2];
+                let cols = in_shape[ndim - 1];
+                let batch: usize = in_shape[..ndim - 2].iter().product::<usize>().max(1);
+                let mut grad_input = grad.clone();
+                for b in 0..batch {
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            let idx = b * rows * cols + r * cols + c;
+                            if (c as i32) - (r as i32) < k {
+                                grad_input[idx] = 0.0;
+                            }
+                        }
+                    }
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Repeat { ref input, repeats: _ } => {
+                // Backward: sum over repeated sections
+                let in_shape = input.shape();
+                let ndim = in_shape.len();
+                let in_total: usize = in_shape.iter().product();
+                let mut grad_input = vec![0.0f32; in_total];
+
+                let out_shape = self.shape();
+                let out_total: usize = out_shape.iter().product();
+
+                let mut in_strides = vec![1usize; ndim];
+                for i in (0..ndim.saturating_sub(1)).rev() {
+                    in_strides[i] = in_strides[i + 1] * in_shape[i + 1];
+                }
+                let mut out_strides = vec![1usize; ndim];
+                for i in (0..ndim.saturating_sub(1)).rev() {
+                    out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+                }
+
+                for flat in 0..out_total {
+                    let mut in_idx = 0;
+                    let mut rem = flat;
+                    for d in 0..ndim {
+                        let coord = rem / out_strides[d];
+                        rem %= out_strides[d];
+                        in_idx += (coord % in_shape[d]) * in_strides[d];
+                    }
+                    grad_input[in_idx] += grad[flat];
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Pad { ref input, ref widths, .. } => {
+                // Backward: slice out the non-padded region from grad
+                let in_shape = input.shape();
+                let ndim = in_shape.len();
+                let out_shape = self.shape();
+                let in_total: usize = in_shape.iter().product();
+                let mut grad_input = vec![0.0f32; in_total];
+
+                let mut in_strides = vec![1usize; ndim];
+                for i in (0..ndim.saturating_sub(1)).rev() {
+                    in_strides[i] = in_strides[i + 1] * in_shape[i + 1];
+                }
+                let mut out_strides = vec![1usize; ndim];
+                for i in (0..ndim.saturating_sub(1)).rev() {
+                    out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+                }
+
+                for flat in 0..in_total {
+                    let mut out_flat = 0;
+                    let mut rem = flat;
+                    for d in 0..ndim {
+                        let coord = rem / in_strides[d];
+                        rem %= in_strides[d];
+                        out_flat += (coord + widths[d].0) * out_strides[d];
+                    }
+                    grad_input[flat] = grad[out_flat];
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Roll { ref input, shift, axis } => {
+                // Backward: roll with negative shift
+                let in_shape = input.shape();
+                let ndim = in_shape.len();
+                let dim_size = in_shape[axis] as i32;
+                let total = grad.len();
+                let mut grad_input = vec![0.0f32; total];
+
+                let mut strides = vec![1usize; ndim];
+                for i in (0..ndim.saturating_sub(1)).rev() {
+                    strides[i] = strides[i + 1] * in_shape[i + 1];
+                }
+
+                for flat in 0..total {
+                    let mut coords = vec![0usize; ndim];
+                    let mut rem = flat;
+                    for d in 0..ndim {
+                        coords[d] = rem / strides[d];
+                        rem %= strides[d];
+                    }
+                    // Reverse the shift
+                    let old_coord = coords[axis] as i32;
+                    let new_coord = ((old_coord - shift) % dim_size + dim_size) % dim_size;
+                    let mut in_flat = 0;
+                    for d in 0..ndim {
+                        let c = if d == axis { new_coord as usize } else { coords[d] };
+                        in_flat += c * strides[d];
+                    }
+                    grad_input[in_flat] = grad[flat];
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Take { ref input, ref indices, axis } => {
+                // Backward: scatter_add grad to input positions
+                let in_shape = input.shape();
+                let ndim = in_shape.len();
+                let in_total: usize = in_shape.iter().product();
+                let mut grad_input = vec![0.0f32; in_total];
+
+                let out_shape = self.shape();
+                let out_total: usize = out_shape.iter().product();
+
+                let mut in_strides = vec![1usize; ndim];
+                for i in (0..ndim.saturating_sub(1)).rev() {
+                    in_strides[i] = in_strides[i + 1] * in_shape[i + 1];
+                }
+                let mut out_strides = vec![1usize; ndim];
+                for i in (0..ndim.saturating_sub(1)).rev() {
+                    out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
+                }
+
+                for flat in 0..out_total {
+                    let mut in_flat = 0;
+                    let mut rem = flat;
+                    for d in 0..ndim {
+                        let coord = rem / out_strides[d];
+                        rem %= out_strides[d];
+                        let in_coord = if d == axis { indices[coord] } else { coord };
+                        in_flat += in_coord * in_strides[d];
+                    }
+                    grad_input[in_flat] += grad[flat];
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::Diagonal { ref input, offset } => {
+                // Backward: scatter gradient to diagonal positions
+                let in_shape = input.shape();
+                let rows = in_shape[0];
+                let cols = in_shape[1];
+                let mut grad_input = vec![0.0f32; rows * cols];
+
+                if offset >= 0 {
+                    let start_col = offset as usize;
+                    let len = rows.min(cols.saturating_sub(start_col));
+                    for i in 0..len {
+                        grad_input[i * cols + (i + start_col)] = grad[i];
+                    }
+                } else {
+                    let start_row = (-offset) as usize;
+                    let len = cols.min(rows.saturating_sub(start_row));
+                    for i in 0..len {
+                        grad_input[(i + start_row) * cols + i] = grad[i];
+                    }
+                }
+                accumulate_grad(input, &grad_input);
+            }
+            Op::BroadcastTo { ref input, ref original_shape } => {
+                // Backward: reduce grad back to original shape by summing over broadcast dims
+                let out_shape = self.shape();
+                let grad_input = reduce_grad_for_broadcast(&grad, &out_shape, original_shape);
+                accumulate_grad(input, &grad_input);
             }
         }
     }
@@ -4496,6 +5106,465 @@ mod tests {
                 diff < 0.05,
                 "gradient mismatch at idx {}: analytical={}, numerical={}, diff={}",
                 idx, analytical_grad[idx], numerical, diff
+            );
+        }
+    }
+
+    // ---- Phase 1F: Shape manipulation and indexing ops ----
+
+    #[test]
+    fn test_expand_dims() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], false);
+        let y = x.expand_dims(0);
+        assert_eq!(y.shape(), vec![1, 3]);
+        assert_eq!(y.data(), vec![1.0, 2.0, 3.0]);
+        let z = x.expand_dims(1);
+        assert_eq!(z.shape(), vec![3, 1]);
+    }
+
+    #[test]
+    fn test_broadcast_to() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0], vec![1, 3], true);
+        let y = x.broadcast_to(&[4, 3]);
+        assert_eq!(y.shape(), vec![4, 3]);
+        let data = y.data();
+        assert_eq!(data.len(), 12);
+        // Each row should be [1, 2, 3]
+        for r in 0..4 {
+            assert_eq!(data[r * 3], 1.0);
+            assert_eq!(data[r * 3 + 1], 2.0);
+            assert_eq!(data[r * 3 + 2], 3.0);
+        }
+        // Test backward: gradient sums over broadcast dimension
+        let loss = y.sum();
+        loss.backward();
+        let g = x.grad().unwrap();
+        assert_eq!(g, vec![4.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn test_tril() {
+        let x = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            vec![3, 3], true,
+        );
+        let y = x.tril(0);
+        assert_eq!(y.shape(), vec![3, 3]);
+        assert_eq!(y.data(), vec![1.0, 0.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0, 9.0]);
+
+        // tril with k=1 (one diagonal above)
+        let z = x.tril(1);
+        assert_eq!(z.data(), vec![1.0, 2.0, 0.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+
+        // tril with k=-1 (one diagonal below)
+        let w = x.tril(-1);
+        assert_eq!(w.data(), vec![0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 7.0, 8.0, 0.0]);
+
+        // Backward
+        let loss = y.sum();
+        loss.backward();
+        let g = x.grad().unwrap();
+        assert_eq!(g, vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_triu() {
+        let x = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            vec![3, 3], true,
+        );
+        let y = x.triu(0);
+        assert_eq!(y.shape(), vec![3, 3]);
+        assert_eq!(y.data(), vec![1.0, 2.0, 3.0, 0.0, 5.0, 6.0, 0.0, 0.0, 9.0]);
+
+        // triu with k=1
+        let z = x.triu(1);
+        assert_eq!(z.data(), vec![0.0, 2.0, 3.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0]);
+
+        // Backward
+        let loss = y.sum();
+        loss.backward();
+        let g = x.grad().unwrap();
+        assert_eq!(g, vec![1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_tril_batched() {
+        // 2 x 2 x 2 - batch of 2D matrices
+        let x = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            vec![2, 2, 2], false,
+        );
+        let y = x.tril(0);
+        assert_eq!(y.data(), vec![1.0, 0.0, 3.0, 4.0, 5.0, 0.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_repeat() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
+        let y = x.repeat(&[2, 3]);
+        assert_eq!(y.shape(), vec![4, 6]);
+        let data = y.data();
+        // First row: [1, 2, 1, 2, 1, 2]
+        assert_eq!(&data[0..6], &[1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+        // Second row: [3, 4, 3, 4, 3, 4]
+        assert_eq!(&data[6..12], &[3.0, 4.0, 3.0, 4.0, 3.0, 4.0]);
+        // Third row = first row repeated
+        assert_eq!(&data[12..18], &[1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+
+        // Backward: gradient sums over repeated sections
+        let loss = y.sum();
+        loss.backward();
+        let g = x.grad().unwrap();
+        // Each element is repeated 2*3=6 times
+        assert_eq!(g, vec![6.0, 6.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn test_tile() {
+        let x = Tensor::new(vec![1.0, 2.0], vec![2], false);
+        let y = x.tile(&[3]);
+        assert_eq!(y.shape(), vec![6]);
+        assert_eq!(y.data(), vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+
+        // Tile 2D
+        let m = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false);
+        let tiled = m.tile(&[1, 2]);
+        assert_eq!(tiled.shape(), vec![2, 4]);
+        assert_eq!(tiled.data(), vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_pad() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
+        let y = x.pad(&[(1, 1), (1, 1)], 0.0);
+        assert_eq!(y.shape(), vec![4, 4]);
+        let data = y.data();
+        // Row 0: all zeros (padded)
+        assert_eq!(&data[0..4], &[0.0, 0.0, 0.0, 0.0]);
+        // Row 1: [0, 1, 2, 0]
+        assert_eq!(&data[4..8], &[0.0, 1.0, 2.0, 0.0]);
+        // Row 2: [0, 3, 4, 0]
+        assert_eq!(&data[8..12], &[0.0, 3.0, 4.0, 0.0]);
+        // Row 3: all zeros (padded)
+        assert_eq!(&data[12..16], &[0.0, 0.0, 0.0, 0.0]);
+
+        // Backward: gradient only passes through non-padded positions
+        let loss = y.sum();
+        loss.backward();
+        let g = x.grad().unwrap();
+        assert_eq!(g, vec![1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_pad_with_value() {
+        let x = Tensor::new(vec![5.0], vec![1], false);
+        let y = x.pad(&[(2, 2)], -1.0);
+        assert_eq!(y.shape(), vec![5]);
+        assert_eq!(y.data(), vec![-1.0, -1.0, 5.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn test_roll() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4], true);
+        let y = x.roll(1, 0);
+        assert_eq!(y.data(), vec![4.0, 1.0, 2.0, 3.0]);
+
+        let z = x.roll(-1, 0);
+        assert_eq!(z.data(), vec![2.0, 3.0, 4.0, 1.0]);
+
+        // Backward: roll with negative shift
+        let loss = y.sum();
+        loss.backward();
+        let g = x.grad().unwrap();
+        assert_eq!(g, vec![1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_roll_2d() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false);
+        let y = x.roll(1, 1);
+        // Each row shifted right by 1: [3,1,2] and [6,4,5]
+        assert_eq!(y.data(), vec![3.0, 1.0, 2.0, 6.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_take() {
+        let x = Tensor::new(vec![10.0, 20.0, 30.0, 40.0], vec![4], true);
+        let y = x.take(&[0, 2, 3], 0);
+        assert_eq!(y.shape(), vec![3]);
+        assert_eq!(y.data(), vec![10.0, 30.0, 40.0]);
+
+        // Backward
+        let loss = y.sum();
+        loss.backward();
+        let g = x.grad().unwrap();
+        // idx 0 -> 1, idx 1 -> 0, idx 2 -> 1, idx 3 -> 1
+        assert_eq!(g, vec![1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_take_2d() {
+        let x = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![3, 2], false,
+        );
+        // Take rows 0 and 2 along axis 0
+        let y = x.take(&[0, 2], 0);
+        assert_eq!(y.shape(), vec![2, 2]);
+        assert_eq!(y.data(), vec![1.0, 2.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_stack() {
+        let a = Tensor::new(vec![1.0, 2.0], vec![2], true);
+        let b = Tensor::new(vec![3.0, 4.0], vec![2], true);
+        let c = Tensor::new(vec![5.0, 6.0], vec![2], true);
+        let stacked = Tensor::stack(&[a.clone(), b.clone(), c.clone()], 0);
+        assert_eq!(stacked.shape(), vec![3, 2]);
+        assert_eq!(stacked.data(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // Stack along axis 1
+        let stacked1 = Tensor::stack(&[a.clone(), b.clone()], 1);
+        assert_eq!(stacked1.shape(), vec![2, 2]);
+        assert_eq!(stacked1.data(), vec![1.0, 3.0, 2.0, 4.0]);
+
+        // Backward flows through
+        let loss = stacked.sum();
+        loss.backward();
+        assert_eq!(a.grad().unwrap(), vec![1.0, 1.0]);
+        assert_eq!(b.grad().unwrap(), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_split() {
+        let x = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![6], false,
+        );
+        let chunks = x.split(2, 0);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].data(), vec![1.0, 2.0]);
+        assert_eq!(chunks[1].data(), vec![3.0, 4.0]);
+        assert_eq!(chunks[2].data(), vec![5.0, 6.0]);
+
+        // Split 2D along axis 0
+        let m = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![3, 2], false,
+        );
+        let parts = m.split(2, 0);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].shape(), vec![2, 2]);
+        assert_eq!(parts[0].data(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(parts[1].shape(), vec![1, 2]);
+        assert_eq!(parts[1].data(), vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_outer() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], true);
+        let b = Tensor::new(vec![4.0, 5.0], vec![2], true);
+        let c = Tensor::outer(&a, &b);
+        assert_eq!(c.shape(), vec![3, 2]);
+        assert_eq!(c.data(), vec![4.0, 5.0, 8.0, 10.0, 12.0, 15.0]);
+    }
+
+    #[test]
+    fn test_inner() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], true);
+        let b = Tensor::new(vec![4.0, 5.0, 6.0], vec![3], true);
+        let c = Tensor::inner(&a, &b);
+        assert_eq!(c.shape(), vec![1]);
+        // 1*4 + 2*5 + 3*6 = 32
+        assert!((c.data()[0] - 32.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_diagonal() {
+        let x = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            vec![3, 3], true,
+        );
+        let d0 = x.diagonal(0);
+        assert_eq!(d0.shape(), vec![3]);
+        assert_eq!(d0.data(), vec![1.0, 5.0, 9.0]);
+
+        let d1 = x.diagonal(1);
+        assert_eq!(d1.shape(), vec![2]);
+        assert_eq!(d1.data(), vec![2.0, 6.0]);
+
+        let dm1 = x.diagonal(-1);
+        assert_eq!(dm1.shape(), vec![2]);
+        assert_eq!(dm1.data(), vec![4.0, 8.0]);
+
+        // Backward
+        let loss = d0.sum();
+        loss.backward();
+        let g = x.grad().unwrap();
+        assert_eq!(g, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_diag_1d_to_2d() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], false);
+        let m = x.diag(0);
+        assert_eq!(m.shape(), vec![3, 3]);
+        assert_eq!(m.data(), vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0]);
+
+        // With offset
+        let m1 = x.diag(1);
+        assert_eq!(m1.shape(), vec![4, 4]);
+        let data = m1.data();
+        // Superdiagonal
+        assert_eq!(data[1], 1.0);
+        assert_eq!(data[6], 2.0);
+        assert_eq!(data[11], 3.0);
+    }
+
+    #[test]
+    fn test_diag_2d_to_1d() {
+        let x = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2, 2], false,
+        );
+        let d = x.diag(0);
+        assert_eq!(d.shape(), vec![2]);
+        assert_eq!(d.data(), vec![1.0, 4.0]);
+    }
+
+    #[test]
+    fn test_trace() {
+        let x = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            vec![3, 3], true,
+        );
+        let t = x.trace();
+        assert_eq!(t.shape(), vec![1]);
+        // trace = 1 + 5 + 9 = 15
+        assert!((t.data()[0] - 15.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_tril_gradient_check() {
+        // Numerical gradient check for tril
+        let x = Tensor::new(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            vec![3, 3], true,
+        );
+        let y = x.tril(0);
+        let loss = y.sum();
+        loss.backward();
+        let analytical = x.grad().unwrap();
+
+        let eps = 1e-4;
+        let x_data = x.data();
+        for idx in 0..9 {
+            let mut plus = x_data.clone();
+            plus[idx] += eps;
+            let tp = Tensor::new(plus, vec![3, 3], false);
+            let lp = tp.tril(0).sum().data()[0];
+
+            let mut minus = x_data.clone();
+            minus[idx] -= eps;
+            let tm = Tensor::new(minus, vec![3, 3], false);
+            let lm = tm.tril(0).sum().data()[0];
+
+            let numerical = (lp - lm) / (2.0 * eps);
+            assert!(
+                (analytical[idx] - numerical).abs() < 0.01,
+                "tril grad mismatch at idx {}: analytical={}, numerical={}",
+                idx, analytical[idx], numerical
+            );
+        }
+    }
+
+    #[test]
+    fn test_repeat_gradient_check() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
+        let y = x.repeat(&[2, 2]);
+        let loss = y.sum();
+        loss.backward();
+        let analytical = x.grad().unwrap();
+
+        let eps = 1e-3;
+        let x_data = x.data();
+        for idx in 0..4 {
+            let mut plus = x_data.clone();
+            plus[idx] += eps;
+            let tp = Tensor::new(plus, vec![2, 2], false);
+            let lp = tp.repeat(&[2, 2]).sum().data()[0];
+
+            let mut minus = x_data.clone();
+            minus[idx] -= eps;
+            let tm = Tensor::new(minus, vec![2, 2], false);
+            let lm = tm.repeat(&[2, 2]).sum().data()[0];
+
+            let numerical = (lp - lm) / (2.0 * eps);
+            assert!(
+                (analytical[idx] - numerical).abs() < 0.1,
+                "repeat grad mismatch at idx {}: analytical={}, numerical={}",
+                idx, analytical[idx], numerical
+            );
+        }
+    }
+
+    #[test]
+    fn test_pad_gradient_check() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true);
+        let y = x.pad(&[(1, 0), (0, 1)], 0.0);
+        let loss = y.sum();
+        loss.backward();
+        let analytical = x.grad().unwrap();
+
+        let eps = 1e-4;
+        let x_data = x.data();
+        for idx in 0..4 {
+            let mut plus = x_data.clone();
+            plus[idx] += eps;
+            let tp = Tensor::new(plus, vec![2, 2], false);
+            let lp = tp.pad(&[(1, 0), (0, 1)], 0.0).sum().data()[0];
+
+            let mut minus = x_data.clone();
+            minus[idx] -= eps;
+            let tm = Tensor::new(minus, vec![2, 2], false);
+            let lm = tm.pad(&[(1, 0), (0, 1)], 0.0).sum().data()[0];
+
+            let numerical = (lp - lm) / (2.0 * eps);
+            assert!(
+                (analytical[idx] - numerical).abs() < 0.01,
+                "pad grad mismatch at idx {}: analytical={}, numerical={}",
+                idx, analytical[idx], numerical
+            );
+        }
+    }
+
+    #[test]
+    fn test_roll_gradient_check() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true);
+        let y = x.roll(2, 1);
+        let loss = y.sum();
+        loss.backward();
+        let analytical = x.grad().unwrap();
+
+        let eps = 1e-4;
+        let x_data = x.data();
+        for idx in 0..6 {
+            let mut plus = x_data.clone();
+            plus[idx] += eps;
+            let tp = Tensor::new(plus, vec![2, 3], false);
+            let lp = tp.roll(2, 1).sum().data()[0];
+
+            let mut minus = x_data.clone();
+            minus[idx] -= eps;
+            let tm = Tensor::new(minus, vec![2, 3], false);
+            let lm = tm.roll(2, 1).sum().data()[0];
+
+            let numerical = (lp - lm) / (2.0 * eps);
+            assert!(
+                (analytical[idx] - numerical).abs() < 0.01,
+                "roll grad mismatch at idx {}: analytical={}, numerical={}",
+                idx, analytical[idx], numerical
             );
         }
     }

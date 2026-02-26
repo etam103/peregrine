@@ -62,6 +62,8 @@ impl GpuContext {
             "log_softmax_f32", "log_softmax_backward_f32",
             "scale_fill_f32",
             "gather_f32", "scatter_add_f32",
+            // Shape manipulation kernels
+            "tril_f32", "triu_f32", "pad_f32", "repeat_f32",
         ];
 
         let mut pipelines = HashMap::new();
@@ -936,6 +938,72 @@ impl GpuContext {
         let grid_size = MTLSize { width: n, height: 1, depth: 1 };
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
 
+        enc.endEncoding();
+    }
+
+    /// Dispatch tril: zero elements above the k-th diagonal.
+    pub fn dispatch_tril(
+        &self,
+        input: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        rows: u32, cols: u32, k: i32,
+    ) {
+        #[repr(C)]
+        struct TrilTriuParams { rows: u32, cols: u32, k: i32 }
+        let params = TrilTriuParams { rows, cols, k };
+        let n = input.len();
+
+        let pipeline = &self.pipelines["tril_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<TrilTriuParams>(), 2,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+        enc.endEncoding();
+    }
+
+    /// Dispatch triu: zero elements below the k-th diagonal.
+    pub fn dispatch_triu(
+        &self,
+        input: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        rows: u32, cols: u32, k: i32,
+    ) {
+        #[repr(C)]
+        struct TrilTriuParams { rows: u32, cols: u32, k: i32 }
+        let params = TrilTriuParams { rows, cols, k };
+        let n = input.len();
+
+        let pipeline = &self.pipelines["triu_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<TrilTriuParams>(), 2,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
         enc.endEncoding();
     }
 }
