@@ -1,3 +1,4 @@
+use crate::cpu_pool::{pool_get, pool_recycle};
 use crate::tensor::Tensor;
 
 // ===========================================================================
@@ -863,38 +864,55 @@ impl Adafactor {
                 AdafactorState::Factored { row_factor, col_factor, m } => {
                     let rows = row_factor.len();
                     let cols = col_factor.len();
+                    let n = rows * cols;
 
-                    // Update row and column factors
+                    // Precompute grad_sq[i] = grad[i]^2 + eps once
+                    let mut grad_sq = pool_get(n);
+                    for j in 0..n {
+                        grad_sq[j] = grad[j] * grad[j] + self.eps.0;
+                    }
+
+                    // Update row factors using precomputed grad_sq
+                    let one_minus_rho = 1.0 - rho;
+                    let inv_cols = 1.0 / cols as f32;
                     for r in 0..rows {
+                        let base = r * cols;
                         let mut row_sum = 0.0f32;
                         for c in 0..cols {
-                            row_sum += grad[r * cols + c] * grad[r * cols + c] + self.eps.0;
+                            row_sum += grad_sq[base + c];
                         }
-                        row_factor[r] = rho * row_factor[r] + (1.0 - rho) * row_sum / cols as f32;
+                        row_factor[r] = rho * row_factor[r] + one_minus_rho * row_sum * inv_cols;
                     }
+
+                    // Update column factors using precomputed grad_sq
+                    let inv_rows = 1.0 / rows as f32;
                     for c in 0..cols {
                         let mut col_sum = 0.0f32;
                         for r in 0..rows {
-                            col_sum += grad[r * cols + c] * grad[r * cols + c] + self.eps.0;
+                            col_sum += grad_sq[r * cols + c];
                         }
-                        col_factor[c] = rho * col_factor[c] + (1.0 - rho) * col_sum / rows as f32;
+                        col_factor[c] = rho * col_factor[c] + one_minus_rho * col_sum * inv_rows;
                     }
+                    pool_recycle(grad_sq);
 
                     // Reconstruct second moment estimate: v_hat = row * col / mean(row)
                     let row_mean: f32 = row_factor.iter().sum::<f32>() / rows as f32;
                     let row_mean = row_mean.max(self.eps.0);
+                    let inv_row_mean = 1.0 / row_mean;
 
-                    // Compute update
-                    let mut update = vec![0.0f32; data.len()];
+                    // Compute update using pool buffer
+                    let mut update = pool_get(n);
                     for r in 0..rows {
+                        let rf = row_factor[r];
+                        let base = r * cols;
                         for c in 0..cols {
-                            let v_hat = row_factor[r] * col_factor[c] / row_mean;
-                            update[r * cols + c] = grad[r * cols + c] / (v_hat.sqrt() + self.eps.0);
+                            let v_hat = rf * col_factor[c] * inv_row_mean;
+                            update[base + c] = grad[base + c] / (v_hat.sqrt() + self.eps.0);
                         }
                     }
 
                     // Clip update by RMS
-                    let update_rms = (update.iter().map(|x| x * x).sum::<f32>() / update.len() as f32).sqrt();
+                    let update_rms = (update.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
                     if update_rms > self.clip_threshold {
                         let scale = self.clip_threshold / update_rms;
                         for u in update.iter_mut() {
@@ -903,29 +921,35 @@ impl Adafactor {
                     }
 
                     // Apply momentum if beta1 > 0
+                    let lr_ps = self.lr * param_scale;
                     if let Some(ref mut m_vec) = m {
-                        for j in 0..data.len() {
-                            m_vec[j] = self.beta1 * m_vec[j] + (1.0 - self.beta1) * update[j];
-                            data[j] -= self.lr * param_scale * m_vec[j];
+                        let beta1 = self.beta1;
+                        let one_minus_beta1 = 1.0 - beta1;
+                        for j in 0..n {
+                            m_vec[j] = beta1 * m_vec[j] + one_minus_beta1 * update[j];
+                            data[j] -= lr_ps * m_vec[j];
                         }
                     } else {
-                        for j in 0..data.len() {
-                            data[j] -= self.lr * param_scale * update[j];
+                        for j in 0..n {
+                            data[j] -= lr_ps * update[j];
                         }
                     }
+                    pool_recycle(update);
                 }
                 AdafactorState::Full { v, m } => {
-                    for j in 0..data.len() {
-                        v[j] = rho * v[j] + (1.0 - rho) * (grad[j] * grad[j] + self.eps.0);
+                    let n = data.len();
+                    let one_minus_rho = 1.0 - rho;
+                    for j in 0..n {
+                        v[j] = rho * v[j] + one_minus_rho * (grad[j] * grad[j] + self.eps.0);
                     }
 
-                    let mut update = vec![0.0f32; data.len()];
-                    for j in 0..data.len() {
+                    let mut update = pool_get(n);
+                    for j in 0..n {
                         update[j] = grad[j] / (v[j].sqrt() + self.eps.0);
                     }
 
                     // Clip
-                    let update_rms = (update.iter().map(|x| x * x).sum::<f32>() / update.len() as f32).sqrt();
+                    let update_rms = (update.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
                     if update_rms > self.clip_threshold {
                         let scale = self.clip_threshold / update_rms;
                         for u in update.iter_mut() {
@@ -933,16 +957,20 @@ impl Adafactor {
                         }
                     }
 
+                    let lr_ps = self.lr * param_scale;
                     if let Some(ref mut m_vec) = m {
-                        for j in 0..data.len() {
-                            m_vec[j] = self.beta1 * m_vec[j] + (1.0 - self.beta1) * update[j];
-                            data[j] -= self.lr * param_scale * m_vec[j];
+                        let beta1 = self.beta1;
+                        let one_minus_beta1 = 1.0 - beta1;
+                        for j in 0..n {
+                            m_vec[j] = beta1 * m_vec[j] + one_minus_beta1 * update[j];
+                            data[j] -= lr_ps * m_vec[j];
                         }
                     } else {
-                        for j in 0..data.len() {
-                            data[j] -= self.lr * param_scale * update[j];
+                        for j in 0..n {
+                            data[j] -= lr_ps * update[j];
                         }
                     }
+                    pool_recycle(update);
                 }
                 AdafactorState::Uninitialized => unreachable!(),
             }

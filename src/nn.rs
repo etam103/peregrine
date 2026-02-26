@@ -915,27 +915,61 @@ impl Conv1d {
         let w_data = self.weight.data();
         let b_data = self.bias.data();
 
+        // im2col + BLAS path: reshape convolution as matrix multiply
+        // col matrix: [in_channels * kernel_size, out_len] per batch
+        // weight matrix: [out_channels, in_channels * kernel_size]
+        // output = weight * col + bias
+        let col_rows = in_c * self.kernel_size;
         let mut out_data = vec![0.0f32; batch * self.out_channels * out_len];
 
         for b in 0..batch {
-            for oc in 0..self.out_channels {
-                for ol in 0..out_len {
-                    let mut sum = b_data[oc];
-                    for ic in 0..self.in_channels {
-                        for k in 0..self.kernel_size {
-                            let il = ol * self.stride + k;
-                            let il = il as isize - self.padding as isize;
-                            if il >= 0 && (il as usize) < in_len {
-                                let x_idx =
-                                    b * in_c * in_len + ic * in_len + il as usize;
-                                let w_idx = oc * self.in_channels * self.kernel_size
-                                    + ic * self.kernel_size
-                                    + k;
-                                sum += x_data[x_idx] * w_data[w_idx];
-                            }
+            // Build im2col matrix for this batch element
+            let mut col = vec![0.0f32; col_rows * out_len];
+            for ic in 0..in_c {
+                for k in 0..self.kernel_size {
+                    let row = ic * self.kernel_size + k;
+                    for ol in 0..out_len {
+                        let il = (ol * self.stride + k) as isize - self.padding as isize;
+                        if il >= 0 && (il as usize) < in_len {
+                            col[row * out_len + ol] =
+                                x_data[b * in_c * in_len + ic * in_len + il as usize];
                         }
                     }
-                    out_data[b * self.out_channels * out_len + oc * out_len + ol] = sum;
+                }
+            }
+
+            // Matrix multiply: [out_channels, col_rows] x [col_rows, out_len] -> [out_channels, out_len]
+            #[cfg(target_os = "macos")]
+            {
+                crate::tensor::sgemm(
+                    false, false,
+                    self.out_channels, out_len, col_rows,
+                    1.0, &w_data, col_rows,
+                    &col, out_len,
+                    0.0, &mut out_data[b * self.out_channels * out_len..], out_len,
+                );
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                for oc in 0..self.out_channels {
+                    for ol in 0..out_len {
+                        let mut sum = 0.0f32;
+                        for k in 0..col_rows {
+                            sum += w_data[oc * col_rows + k] * col[k * out_len + ol];
+                        }
+                        out_data[b * self.out_channels * out_len + oc * out_len + ol] = sum;
+                    }
+                }
+            }
+        }
+
+        // Add bias
+        for b in 0..batch {
+            for oc in 0..self.out_channels {
+                let offset = b * self.out_channels * out_len + oc * out_len;
+                let bv = b_data[oc];
+                for v in &mut out_data[offset..offset + out_len] {
+                    *v += bv;
                 }
             }
         }

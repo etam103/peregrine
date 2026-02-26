@@ -1,3 +1,4 @@
+use crate::cpu_pool::{pool_get, pool_recycle};
 use crate::tensor::Tensor;
 
 // ---------------------------------------------------------------------------
@@ -115,18 +116,22 @@ pub fn rfft(input: &Tensor, n: Option<usize>) -> Tensor {
     {
         let log2n = fft_n.trailing_zeros() as u64;
 
-        let mut real = vec![0.0f32; fft_n / 2];
-        let mut imag_buf = vec![0.0f32; fft_n / 2];
+        let mut real = pool_get(fft_n / 2);
+        real.iter_mut().for_each(|v| *v = 0.0);
+        let mut imag_buf = pool_get(fft_n / 2);
+        imag_buf.iter_mut().for_each(|v| *v = 0.0);
 
         // Pack real input into split-complex format for vDSP_fft_zrip:
         // even-indexed samples go to real, odd-indexed go to imag.
         let copy_len = data.len().min(fft_n);
-        let mut padded = vec![0.0f32; fft_n];
+        let mut padded = pool_get(fft_n);
+        padded.iter_mut().for_each(|v| *v = 0.0);
         padded[..copy_len].copy_from_slice(&data[..copy_len]);
         for i in 0..fft_n / 2 {
             real[i] = padded[2 * i];
             imag_buf[i] = padded[2 * i + 1];
         }
+        pool_recycle(padded);
 
         unsafe {
             let setup = vDSP_create_fftsetup(log2n, 2);
@@ -143,7 +148,7 @@ pub fn rfft(input: &Tensor, n: Option<usize>) -> Tensor {
 
         // vDSP packs DC in real[0] and Nyquist in imag[0].
         let out_n = fft_n / 2 + 1;
-        let mut out = vec![0.0f32; out_n * 2];
+        let mut out = pool_get(out_n * 2);
         // DC
         out[0] = real[0] * 0.5;
         out[1] = 0.0;
@@ -155,25 +160,31 @@ pub fn rfft(input: &Tensor, n: Option<usize>) -> Tensor {
             out[i * 2] = real[i] * 0.5;
             out[i * 2 + 1] = imag_buf[i] * 0.5;
         }
+        pool_recycle(real);
+        pool_recycle(imag_buf);
 
         return Tensor::new(out, vec![out_n, 2], false);
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let mut real = vec![0.0f32; fft_n];
-        let mut imag = vec![0.0f32; fft_n];
+        let mut real = pool_get(fft_n);
+        real.iter_mut().for_each(|v| *v = 0.0);
+        let mut imag = pool_get(fft_n);
+        imag.iter_mut().for_each(|v| *v = 0.0);
         let copy_len = data.len().min(fft_n);
         real[..copy_len].copy_from_slice(&data[..copy_len]);
 
         cooley_tukey_inplace(&mut real, &mut imag, false);
 
         let out_n = fft_n / 2 + 1;
-        let mut out = vec![0.0f32; out_n * 2];
+        let mut out = pool_get(out_n * 2);
         for i in 0..out_n {
             out[i * 2] = real[i];
             out[i * 2 + 1] = imag[i];
         }
+        pool_recycle(real);
+        pool_recycle(imag);
         Tensor::new(out, vec![out_n, 2], false)
     }
 }
@@ -196,8 +207,10 @@ pub fn irfft(input: &Tensor, n: Option<usize>) -> Tensor {
     {
         let log2n = fft_n.trailing_zeros() as u64;
 
-        let mut real = vec![0.0f32; fft_n / 2];
-        let mut imag_buf = vec![0.0f32; fft_n / 2];
+        let mut real = pool_get(fft_n / 2);
+        real.iter_mut().for_each(|v| *v = 0.0);
+        let mut imag_buf = pool_get(fft_n / 2);
+        imag_buf.iter_mut().for_each(|v| *v = 0.0);
 
         // Pack back into vDSP split-complex format (reverse of rfft unpacking).
         // DC -> real[0], Nyquist -> imag[0]
@@ -228,12 +241,14 @@ pub fn irfft(input: &Tensor, n: Option<usize>) -> Tensor {
         }
 
         // Unpack: even from real, odd from imag
-        let mut out = vec![0.0f32; fft_n];
+        let mut out = pool_get(fft_n);
         let scale = 1.0 / (fft_n as f32);
         for i in 0..fft_n / 2 {
             out[2 * i] = real[i] * scale;
             out[2 * i + 1] = imag_buf[i] * scale;
         }
+        pool_recycle(real);
+        pool_recycle(imag_buf);
 
         let actual_n = n.unwrap_or(fft_n);
         out.truncate(actual_n);
@@ -243,8 +258,10 @@ pub fn irfft(input: &Tensor, n: Option<usize>) -> Tensor {
     #[cfg(not(target_os = "macos"))]
     {
         // Reconstruct full complex spectrum (Hermitian symmetry)
-        let mut real = vec![0.0f32; fft_n];
-        let mut imag = vec![0.0f32; fft_n];
+        let mut real = pool_get(fft_n);
+        real.iter_mut().for_each(|v| *v = 0.0);
+        let mut imag = pool_get(fft_n);
+        imag.iter_mut().for_each(|v| *v = 0.0);
         for i in 0..bins.min(fft_n / 2 + 1) {
             real[i] = data[i * 2];
             imag[i] = data[i * 2 + 1];
@@ -261,6 +278,7 @@ pub fn irfft(input: &Tensor, n: Option<usize>) -> Tensor {
 
         let actual_n = n.unwrap_or(fft_n);
         real.truncate(actual_n);
+        pool_recycle(imag);
         Tensor::new(real, vec![actual_n], false)
     }
 }
@@ -279,8 +297,10 @@ pub fn fft(input: &Tensor, n: Option<usize>) -> Tensor {
     let fft_n = next_pow2(n.unwrap_or(input_n));
     let data = input.data();
 
-    let mut real = vec![0.0f32; fft_n];
-    let mut imag = vec![0.0f32; fft_n];
+    let mut real = pool_get(fft_n);
+    real.iter_mut().for_each(|v| *v = 0.0);
+    let mut imag = pool_get(fft_n);
+    imag.iter_mut().for_each(|v| *v = 0.0);
     for i in 0..input_n.min(fft_n) {
         real[i] = data[i * 2];
         imag[i] = data[i * 2 + 1];
@@ -288,11 +308,13 @@ pub fn fft(input: &Tensor, n: Option<usize>) -> Tensor {
 
     cooley_tukey_inplace(&mut real, &mut imag, false);
 
-    let mut out = vec![0.0f32; fft_n * 2];
+    let mut out = pool_get(fft_n * 2);
     for i in 0..fft_n {
         out[i * 2] = real[i];
         out[i * 2 + 1] = imag[i];
     }
+    pool_recycle(real);
+    pool_recycle(imag);
     Tensor::new(out, vec![fft_n, 2], false)
 }
 
@@ -309,8 +331,10 @@ pub fn ifft(input: &Tensor, n: Option<usize>) -> Tensor {
     let fft_n = next_pow2(n.unwrap_or(input_n));
     let data = input.data();
 
-    let mut real = vec![0.0f32; fft_n];
-    let mut imag = vec![0.0f32; fft_n];
+    let mut real = pool_get(fft_n);
+    real.iter_mut().for_each(|v| *v = 0.0);
+    let mut imag = pool_get(fft_n);
+    imag.iter_mut().for_each(|v| *v = 0.0);
     for i in 0..input_n.min(fft_n) {
         real[i] = data[i * 2];
         imag[i] = data[i * 2 + 1];
@@ -318,11 +342,13 @@ pub fn ifft(input: &Tensor, n: Option<usize>) -> Tensor {
 
     cooley_tukey_inplace(&mut real, &mut imag, true);
 
-    let mut out = vec![0.0f32; fft_n * 2];
+    let mut out = pool_get(fft_n * 2);
     for i in 0..fft_n {
         out[i * 2] = real[i];
         out[i * 2 + 1] = imag[i];
     }
+    pool_recycle(real);
+    pool_recycle(imag);
     Tensor::new(out, vec![fft_n, 2], false)
 }
 

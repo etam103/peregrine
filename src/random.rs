@@ -1,3 +1,4 @@
+use crate::cpu_pool::pool_get;
 use crate::tensor::Tensor;
 use std::sync::Mutex;
 
@@ -73,10 +74,13 @@ pub fn seed(s: u64) {
 /// Uniform random tensor in `[low, high)`.
 pub fn uniform(shape: &[usize], low: f32, high: f32, requires_grad: bool) -> Tensor {
     let n: usize = shape.iter().product();
-    let data: Vec<f32> = with_rng(|rng| {
-        (0..n)
-            .map(|_| low + (high - low) * rng.next_f32())
-            .collect()
+    let data = with_rng(|rng| {
+        let mut buf = pool_get(n);
+        let range = high - low;
+        for i in 0..n {
+            buf[i] = low + range * rng.next_f32();
+        }
+        buf
     });
     Tensor::new(data, shape.to_vec(), requires_grad)
 }
@@ -84,18 +88,22 @@ pub fn uniform(shape: &[usize], low: f32, high: f32, requires_grad: bool) -> Ten
 /// Normal (Gaussian) random tensor via Box-Muller.
 pub fn normal(shape: &[usize], mean: f32, std: f32, requires_grad: bool) -> Tensor {
     let n: usize = shape.iter().product();
-    let data: Vec<f32> = with_rng(|rng| {
-        let mut v = Vec::with_capacity(n + 1);
-        for _ in 0..(n + 1) / 2 {
+    let data = with_rng(|rng| {
+        // Allocate for pairs (round up to even)
+        let alloc_n = n + (n & 1);
+        let mut buf = pool_get(alloc_n);
+        let mut i = 0;
+        while i < alloc_n {
             let u1 = rng.next_f32().max(1e-10);
             let u2 = rng.next_f32();
             let r = (-2.0 * u1.ln()).sqrt();
             let theta = 2.0 * std::f32::consts::PI * u2;
-            v.push(mean + std * r * theta.cos());
-            v.push(mean + std * r * theta.sin());
+            buf[i] = mean + std * r * theta.cos();
+            buf[i + 1] = mean + std * r * theta.sin();
+            i += 2;
         }
-        v.truncate(n);
-        v
+        buf.truncate(n);
+        buf
     });
     Tensor::new(data, shape.to_vec(), requires_grad)
 }

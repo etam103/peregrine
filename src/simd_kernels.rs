@@ -546,6 +546,241 @@ pub fn adam_step_f32(
 }
 
 // ========================================================================
+// Phase 6: Performance optimization kernels
+// ========================================================================
+
+/// leaky_relu: out[i] = if x > 0 { x } else { alpha * x }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_leaky_relu_f32(a: &[f32], alpha: f32, out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let valpha = vdupq_n_f32(alpha);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            let mask = vcgtq_f32(vx, zero); // x > 0
+            let scaled = vmulq_f32(valpha, vx);
+            vst1q_f32(out.as_mut_ptr().add(off), vbslq_f32(mask, vx, scaled));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = if a[i] > 0.0 { a[i] } else { alpha * a[i] };
+    }
+}
+
+/// leaky_relu backward: out[i] = if input > 0 { grad } else { alpha * grad }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_leaky_relu_backward_f32(input: &[f32], grad: &[f32], alpha: f32, out: &mut [f32]) {
+    let len = input.len();
+    debug_assert_eq!(len, grad.len());
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let valpha = vdupq_n_f32(alpha);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vi = vld1q_f32(input.as_ptr().add(off));
+            let vg = vld1q_f32(grad.as_ptr().add(off));
+            let mask = vcgtq_f32(vi, zero);
+            let scaled = vmulq_f32(valpha, vg);
+            vst1q_f32(out.as_mut_ptr().add(off), vbslq_f32(mask, vg, scaled));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = if input[i] > 0.0 { grad[i] } else { alpha * grad[i] };
+    }
+}
+
+/// elu: out[i] = if x > 0 { x } else { alpha * (exp(x) - 1) }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_elu_f32(a: &[f32], alpha: f32, out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let one = vdupq_n_f32(1.0);
+        let valpha = vdupq_n_f32(alpha);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            let mask = vcgtq_f32(vx, zero); // x > 0
+            let exp_x = fast_exp_f32x4(vx);
+            let neg_branch = vmulq_f32(valpha, vsubq_f32(exp_x, one));
+            vst1q_f32(out.as_mut_ptr().add(off), vbslq_f32(mask, vx, neg_branch));
+        }
+    }
+    for i in (chunks * 4)..len {
+        let x = a[i];
+        out[i] = if x > 0.0 { x } else { alpha * (x.exp() - 1.0) };
+    }
+}
+
+/// elu backward: out[i] = if x > 0 { grad } else { grad * alpha * exp(x) }
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_elu_backward_f32(input: &[f32], grad: &[f32], alpha: f32, out: &mut [f32]) {
+    let len = input.len();
+    debug_assert_eq!(len, grad.len());
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let valpha = vdupq_n_f32(alpha);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vi = vld1q_f32(input.as_ptr().add(off));
+            let vg = vld1q_f32(grad.as_ptr().add(off));
+            let mask = vcgtq_f32(vi, zero);
+            let exp_x = fast_exp_f32x4(vi);
+            let neg_branch = vmulq_f32(vg, vmulq_f32(valpha, exp_x));
+            vst1q_f32(out.as_mut_ptr().add(off), vbslq_f32(mask, vg, neg_branch));
+        }
+    }
+    for i in (chunks * 4)..len {
+        let x = input[i];
+        out[i] = if x > 0.0 { grad[i] } else { grad[i] * alpha * x.exp() };
+    }
+}
+
+/// silu: out[i] = x * sigmoid(x)
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_silu_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let one = vdupq_n_f32(1.0);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            let neg_x = vnegq_f32(vx);
+            let exp_neg_x = fast_exp_f32x4(neg_x);
+            let sigmoid = vdivq_f32(one, vaddq_f32(one, exp_neg_x));
+            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vx, sigmoid));
+        }
+    }
+    for i in (chunks * 4)..len {
+        let x = a[i];
+        let sig = 1.0 / (1.0 + (-x).exp());
+        out[i] = x * sig;
+    }
+}
+
+/// maximum: out[i] = max(a[i], b[i])
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_maximum_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, b.len());
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            let vb = vld1q_f32(b.as_ptr().add(off));
+            vst1q_f32(out.as_mut_ptr().add(off), vmaxq_f32(va, vb));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i].max(b[i]);
+    }
+}
+
+/// minimum: out[i] = min(a[i], b[i])
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_minimum_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, b.len());
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            let vb = vld1q_f32(b.as_ptr().add(off));
+            vst1q_f32(out.as_mut_ptr().add(off), vminq_f32(va, vb));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i].min(b[i]);
+    }
+}
+
+/// clip: out[i] = clamp(a[i], min, max)
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_clip_f32(a: &[f32], min_val: f32, max_val: f32, out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let vmin = vdupq_n_f32(min_val);
+        let vmax = vdupq_n_f32(max_val);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            let clamped = vmaxq_f32(vminq_f32(vx, vmax), vmin);
+            vst1q_f32(out.as_mut_ptr().add(off), clamped);
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i].clamp(min_val, max_val);
+    }
+}
+
+/// square: out[i] = a[i] * a[i]
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_square_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(va, va));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i] * a[i];
+    }
+}
+
+/// reciprocal: out[i] = 1.0 / a[i] (via vrecpeq + Newton refinement)
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_reciprocal_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            let est = vrecpeq_f32(va);
+            // One Newton-Raphson step: est = est * (2 - a * est)
+            let refined = vmulq_f32(est, vrecpsq_f32(va, est));
+            vst1q_f32(out.as_mut_ptr().add(off), refined);
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i].recip();
+    }
+}
+
+// ========================================================================
 // Tests
 // ========================================================================
 
@@ -805,5 +1040,118 @@ mod tests {
         assert_approx_eq(&data, &data_ref, 1e-3);
         assert_approx_eq(&m, &m_ref, 1e-5);
         assert_approx_eq(&v, &v_ref, 1e-5);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_leaky_relu() {
+        let (a, _) = make_test_data();
+        let alpha = 0.01;
+        let expected: Vec<f32> = a.iter().map(|&x| if x > 0.0 { x } else { alpha * x }).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_leaky_relu_f32(&a, alpha, &mut out);
+        assert_approx_eq(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_leaky_relu_backward() {
+        let (input, _) = make_test_data();
+        let grad: Vec<f32> = (0..TEST_LEN).map(|i| i as f32 * 0.3).collect();
+        let alpha = 0.01;
+        let expected: Vec<f32> = input.iter().zip(&grad)
+            .map(|(&x, &g)| if x > 0.0 { g } else { alpha * g }).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_leaky_relu_backward_f32(&input, &grad, alpha, &mut out);
+        assert_approx_eq(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_elu() {
+        let (a, _) = make_test_data();
+        let alpha = 1.0;
+        let expected: Vec<f32> = a.iter().map(|&x| if x > 0.0 { x } else { alpha * (x.exp() - 1.0) }).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_elu_f32(&a, alpha, &mut out);
+        assert_approx_eq(&out, &expected, 1e-5);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_elu_backward() {
+        let (input, _) = make_test_data();
+        let grad: Vec<f32> = (0..TEST_LEN).map(|i| i as f32 * 0.3).collect();
+        let alpha = 1.0;
+        let expected: Vec<f32> = input.iter().zip(&grad)
+            .map(|(&x, &g)| if x > 0.0 { g } else { g * alpha * x.exp() }).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_elu_backward_f32(&input, &grad, alpha, &mut out);
+        assert_approx_eq(&out, &expected, 1e-5);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_silu() {
+        let (a, _) = make_test_data();
+        let expected: Vec<f32> = a.iter().map(|&x| {
+            let sig = 1.0 / (1.0 + (-x).exp());
+            x * sig
+        }).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_silu_f32(&a, &mut out);
+        assert_approx_eq(&out, &expected, 1e-5);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_maximum() {
+        let (a, b) = make_test_data();
+        let expected: Vec<f32> = a.iter().zip(&b).map(|(&x, &y)| x.max(y)).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_maximum_f32(&a, &b, &mut out);
+        assert_approx_eq(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_minimum() {
+        let (a, b) = make_test_data();
+        let expected: Vec<f32> = a.iter().zip(&b).map(|(&x, &y)| x.min(y)).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_minimum_f32(&a, &b, &mut out);
+        assert_approx_eq(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_clip() {
+        let (a, _) = make_test_data();
+        let min_val = -1.0;
+        let max_val = 1.0;
+        let expected: Vec<f32> = a.iter().map(|&x| x.clamp(min_val, max_val)).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_clip_f32(&a, min_val, max_val, &mut out);
+        assert_approx_eq(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_square() {
+        let (a, _) = make_test_data();
+        let expected: Vec<f32> = a.iter().map(|&x| x * x).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_square_f32(&a, &mut out);
+        assert_approx_eq(&out, &expected, 1e-6);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_reciprocal() {
+        let (_, b) = make_test_data(); // b values are all positive
+        let expected: Vec<f32> = b.iter().map(|&x| x.recip()).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_reciprocal_f32(&b, &mut out);
+        assert_approx_eq(&out, &expected, 1e-3); // vrecpe + 1 Newton step ~1e-3 precision
     }
 }

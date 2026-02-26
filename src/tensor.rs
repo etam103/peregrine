@@ -38,7 +38,7 @@ extern "C" {
 
 /// Safe wrapper around cblas_sgemm. Computes C = alpha * op(A) * op(B) + beta * C.
 #[cfg(target_os = "macos")]
-fn sgemm(
+pub(crate) fn sgemm(
     trans_a: bool, trans_b: bool,
     m: usize, n: usize, k: usize,
     alpha: f32, a: &[f32], lda: usize,
@@ -1960,7 +1960,10 @@ impl Tensor {
         if a.shape == b.shape {
             let len = a.data.len();
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = a.data[i].max(b.data[i]); }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_maximum_f32(&a.data[..len], &b.data[..len], &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = a.data[i].max(b.data[i]); } }
             Tensor::from_op(data, a.shape.clone(), Op::Maximum(self.clone(), other.clone()))
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x.max(y));
@@ -1999,7 +2002,10 @@ impl Tensor {
         if a.shape == b.shape {
             let len = a.data.len();
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = a.data[i].min(b.data[i]); }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_minimum_f32(&a.data[..len], &b.data[..len], &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = a.data[i].min(b.data[i]); } }
             Tensor::from_op(data, a.shape.clone(), Op::Minimum(self.clone(), other.clone()))
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x.min(y));
@@ -2151,7 +2157,10 @@ impl Tensor {
         let inner = self.0.borrow();
         let len = inner.data.len();
         let mut data = pool_get(len);
-        for i in 0..len { data[i] = inner.data[i].clamp(min_val, max_val); }
+        #[cfg(target_arch = "aarch64")]
+        { simd_kernels::vec_clip_f32(&inner.data[..len], min_val, max_val, &mut data[..len]); }
+        #[cfg(not(target_arch = "aarch64"))]
+        { for i in 0..len { data[i] = inner.data[i].clamp(min_val, max_val); } }
         Tensor::from_op(data, inner.shape.clone(), Op::Clip { input: self.clone(), min_val, max_val })
     }
 
@@ -2897,7 +2906,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Reciprocal(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].recip(); }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_reciprocal_f32(&inner.data[..len], &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = inner.data[i].recip(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Reciprocal(self.clone()))
         }
     }
@@ -2927,7 +2939,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Square(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i] * inner.data[i]; }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_square_f32(&inner.data[..len], &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = inner.data[i] * inner.data[i]; } }
             Tensor::from_op(data, inner.shape.clone(), Op::Square(self.clone()))
         }
     }
@@ -4267,7 +4282,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::LeakyRelu { input: self.clone(), alpha })
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = if inner.data[i] > 0.0 { inner.data[i] } else { alpha * inner.data[i] }; }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_leaky_relu_f32(&inner.data[..len], alpha, &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = if inner.data[i] > 0.0 { inner.data[i] } else { alpha * inner.data[i] }; } }
             Tensor::from_op(data, inner.shape.clone(), Op::LeakyRelu { input: self.clone(), alpha })
         }
     }
@@ -4298,10 +4316,13 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Elu { input: self.clone(), alpha })
         } else {
             let mut data = pool_get(len);
-            for i in 0..len {
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_elu_f32(&inner.data[..len], alpha, &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len {
                 let x = inner.data[i];
                 data[i] = if x > 0.0 { x } else { alpha * (x.exp() - 1.0) };
-            }
+            } }
             Tensor::from_op(data, inner.shape.clone(), Op::Elu { input: self.clone(), alpha })
         }
     }
@@ -6935,9 +6956,12 @@ impl Tensor {
                         .collect()
                 } else {
                     let mut gi = pool_get(len);
-                    for i in 0..len {
+                    #[cfg(target_arch = "aarch64")]
+                    { simd_kernels::vec_leaky_relu_backward_f32(&in_inner.data[..len], &grad[..len], alpha, &mut gi[..len]); }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    { for i in 0..len {
                         gi[i] = if in_inner.data[i] > 0.0 { grad[i] } else { alpha * grad[i] };
-                    }
+                    } }
                     gi
                 };
                 drop(in_inner);
@@ -6953,10 +6977,13 @@ impl Tensor {
                         .collect()
                 } else {
                     let mut gi = pool_get(len);
-                    for i in 0..len {
+                    #[cfg(target_arch = "aarch64")]
+                    { simd_kernels::vec_elu_backward_f32(&in_inner.data[..len], &grad[..len], alpha, &mut gi[..len]); }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    { for i in 0..len {
                         let x = in_inner.data[i];
                         gi[i] = if x > 0.0 { grad[i] } else { grad[i] * alpha * x.exp() };
-                    }
+                    } }
                     gi
                 };
                 drop(in_inner);

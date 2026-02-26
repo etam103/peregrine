@@ -17,7 +17,7 @@ Tensors, reverse-mode autograd, neural network layers, optimizers, and working m
 
 ```
 cargo build --release                          # build the library
-cargo test                                     # 292 tests
+cargo test                                     # 302 tests
 cargo run --example mnist --release            # train MNIST digit classifier (97.5% accuracy)
 cargo run --example rt_detr --release          # train RT-DETR on COCO images
 ./scripts/bench_compare.sh                     # wall-clock benchmark vs PyTorch, MLX, TF, tinygrad, JAX
@@ -29,7 +29,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 
 | Module | What it does |
 |--------|-------------|
-| **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, ~120 ops, NumPy-style broadcasting, Apple Accelerate BLAS, NEON intrinsics, rayon parallelism |
+| **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, ~200 ops, NumPy-style broadcasting, Apple Accelerate BLAS, NEON intrinsics, rayon parallelism |
 | **`peregrine::nn`** | Linear, Embedding, MultiHeadAttention, Transformer, RNN/LSTM/GRU, Conv1d/2d, RMSNorm/GroupNorm/BatchNorm, Dropout, RoPE, Module trait, Sequential, 14 loss functions |
 | **`peregrine::optim`** | SGD, Adam/AdamW, RMSprop, Adagrad, Adamax, AdaDelta, Lion, Adafactor, LR schedulers (Step, Cosine, Warmup, Exponential, Linear, Join), gradient clipping |
 | **`peregrine::random`** | Xoshiro256++ PRNG — uniform, normal, bernoulli, categorical, gumbel, laplace, truncated normal, permutation |
@@ -101,11 +101,11 @@ Model: MLP (784 → 128 → 64 → 10) with ReLU, trained with CrossEntropyLoss 
 
 ## PyTorch numerical parity
 
-23 integration tests cross-validate Peregrine against PyTorch reference data, covering matmul, softmax, log_softmax, layernorm, cross_entropy_loss, 14 element-wise ops, Adam optimizer, and a full 10-step MLP training loop. All pass within 1e-4 to 1e-7 absolute error. 34 additional activation tests and 235 unit tests cover the full op suite.
+23 integration tests cross-validate Peregrine against PyTorch reference data, covering matmul, softmax, log_softmax, layernorm, cross_entropy_loss, 14 element-wise ops, Adam optimizer, and a full 10-step MLP training loop. All pass within 1e-4 to 1e-7 absolute error. 34 additional activation tests and 245 unit tests cover the full op suite.
 
 ```
 $ cargo test
-running 292 tests ... ok (235 unit + 34 activation + 23 parity)
+running 302 tests ... ok (245 unit + 34 activation + 23 parity)
 ```
 
 To regenerate reference data: `.venv/bin/python tests/generate_reference.py`
@@ -205,7 +205,7 @@ Geometric mean ratio (lower = Peregrine faster): **PyTorch 0.70x**, **MLX 0.57x*
 
 | Optimization | Impact |
 |-------------|--------|
-| Hand-tuned NEON intrinsics | 14 vectorized kernels — 4-6x speedup on elementwise ops |
+| Hand-tuned NEON intrinsics | 24 vectorized kernels — 4-6x speedup on elementwise ops |
 | Cephes-style polynomial exp | Fast exp/sigmoid/tanh/gelu via NEON float32x4_t |
 | NEON Adam optimizer | Vectorized Adam step with fast rsqrt approximation |
 | CPU buffer pool | Thread-local size-bucketed pool — eliminates malloc on elementwise ops |
@@ -222,8 +222,8 @@ Geometric mean ratio (lower = Peregrine faster): **PyTorch 0.70x**, **MLX 0.57x*
 src/
   lib.rs          public API surface
   cpu_pool.rs     thread-local buffer pool for allocation reuse
-  simd_kernels.rs hand-tuned NEON intrinsics for aarch64 (14 kernels + Adam step)
-  tensor.rs       tensor, autograd engine, ~120 ops, broadcasting (~9,700 lines)
+  simd_kernels.rs hand-tuned NEON intrinsics for aarch64 (24 kernels + Adam step)
+  tensor.rs       tensor, autograd engine, ~200 ops, broadcasting (~9,700 lines)
   nn.rs           Linear, Embedding, attention, transformer, RNN/LSTM/GRU, RoPE, Conv1d, AvgPool2d, RMSNorm, GroupNorm, Dropout, Module trait, 14 loss functions
   optim.rs        SGD, Adam/AdamW, RMSprop, Adagrad, Adamax, AdaDelta, Lion, Adafactor, LR schedulers, gradient clipping
   random.rs       Xoshiro256++ PRNG, 10 distribution functions

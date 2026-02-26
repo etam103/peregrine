@@ -73,10 +73,32 @@ Massive expansion of the tensor op library, NN modules, optimizers, and supporti
 - grad(f, inputs), value_and_grad(f, inputs), checkpoint (stub)
 - Weight init: glorot_uniform, glorot_normal, he_normal, he_uniform, lecun_normal, constant, orthogonal
 
+### Performance optimizations
+
+**10 new NEON SIMD kernels** (`src/simd_kernels.rs`)
+- `vec_leaky_relu_f32`, `vec_leaky_relu_backward_f32` — `vcgtq_f32` + `vbslq_f32` conditional select
+- `vec_elu_f32`, `vec_elu_backward_f32` — `fast_exp_f32x4` + conditional select
+- `vec_silu_f32` — fused `x * sigmoid(x)` via `fast_exp_f32x4`
+- `vec_maximum_f32`, `vec_minimum_f32` — `vmaxq_f32` / `vminq_f32`
+- `vec_clip_f32` — `vmaxq_f32` + `vminq_f32` clamp
+- `vec_square_f32` — `vmulq_f32(v, v)`
+- `vec_reciprocal_f32` — `vrecpeq_f32` + Newton refinement
+
+**NEON dispatch** (`src/tensor.rs`) — 8 forward ops (leaky_relu, elu, maximum, minimum, clip, square, reciprocal) and 2 backward ops (LeakyRelu, Elu) now dispatch to NEON kernels in the single-threaded path.
+
+**Conv1d im2col + BLAS** (`src/nn.rs`) — Replaced 5-level nested loop with im2col matrix construction + `cblas_sgemm` for Conv1d::forward(). Expected ~10-20x speedup for typical Conv1d workloads.
+
+**FFT buffer pool reuse** (`src/fft.rs`) — Replaced `vec!` allocations in rfft/irfft/fft/ifft with `pool_get`/`pool_recycle`. Reduces allocation overhead for repeated FFT calls.
+
+**Random buffer pool reuse** (`src/random.rs`) — Replaced `.collect()` in `uniform()` and `normal()` with `pool_get` + fill loop. Avoids per-call allocation for large random tensors.
+
+**Adafactor inner loop optimization** (`src/optim.rs`) — Precomputed `grad_sq` once for row/col factor updates, replaced `vec!` temporaries with pool buffers, precomputed reciprocals and constants.
+
 ### Stats
 
 - 98 Metal compute shaders (up from 38), 30 dispatch methods (up from 24)
-- 292 tests passing (235 unit + 34 activation + 23 parity)
+- 24 NEON SIMD kernels (up from 14) + Adam step kernel
+- 302 tests passing (245 unit + 34 activation + 23 parity)
 - ~19,500 lines of Rust (up from ~8,000)
 - 5 new modules: random, fft, linalg, transforms, init
 
