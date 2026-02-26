@@ -149,6 +149,15 @@ pub enum Op {
         dim: usize,
     },
     MatMulBiasRelu(Tensor, Tensor, Tensor), // input, weight, bias — fused matmul+bias+relu
+    // Phase 1B: Binary math ops
+    Maximum(Tensor, Tensor),
+    Minimum(Tensor, Tensor),
+    Power(Tensor, Tensor),
+    Arctan2(Tensor, Tensor),
+    Logaddexp(Tensor, Tensor),
+    // Phase 1C
+    Clip { input: Tensor, min_val: f32, max_val: f32 },
+    Where { cond: Tensor, x: Tensor, y: Tensor },
 }
 
 /// Compute flat index for a 4D tensor with shape [N, C, H, W].
@@ -1826,6 +1835,719 @@ impl Tensor {
         }
     }
 
+    // --- Phase 1B: Binary Math Ops ---
+
+    pub fn maximum(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("maximum_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Maximum(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        if a.shape == b.shape {
+            let len = a.data.len();
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = a.data[i].max(b.data[i]); }
+            Tensor::from_op(data, a.shape.clone(), Op::Maximum(self.clone(), other.clone()))
+        } else {
+            let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x.max(y));
+            Tensor::from_op(data, out_shape, Op::Maximum(self.clone(), other.clone()))
+        }
+    }
+
+    pub fn minimum(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("minimum_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Minimum(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        if a.shape == b.shape {
+            let len = a.data.len();
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = a.data[i].min(b.data[i]); }
+            Tensor::from_op(data, a.shape.clone(), Op::Minimum(self.clone(), other.clone()))
+        } else {
+            let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x.min(y));
+            Tensor::from_op(data, out_shape, Op::Minimum(self.clone(), other.clone()))
+        }
+    }
+
+    pub fn power(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("power_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Power(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        if a.shape == b.shape {
+            let len = a.data.len();
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = a.data[i].powf(b.data[i]); }
+            Tensor::from_op(data, a.shape.clone(), Op::Power(self.clone(), other.clone()))
+        } else {
+            let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x.powf(y));
+            Tensor::from_op(data, out_shape, Op::Power(self.clone(), other.clone()))
+        }
+    }
+
+    pub fn arctan2(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("arctan2_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Arctan2(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        if a.shape == b.shape {
+            let len = a.data.len();
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = a.data[i].atan2(b.data[i]); }
+            Tensor::from_op(data, a.shape.clone(), Op::Arctan2(self.clone(), other.clone()))
+        } else {
+            let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x.atan2(y));
+            Tensor::from_op(data, out_shape, Op::Arctan2(self.clone(), other.clone()))
+        }
+    }
+
+    pub fn logaddexp(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("logaddexp_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Logaddexp(self.clone(), other.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        let logaddexp_fn = |x: f32, y: f32| -> f32 {
+            let m = x.max(y);
+            m + ((x - m).exp() + (y - m).exp()).ln()
+        };
+        if a.shape == b.shape {
+            let len = a.data.len();
+            let mut data = pool_get(len);
+            for i in 0..len { data[i] = logaddexp_fn(a.data[i], b.data[i]); }
+            Tensor::from_op(data, a.shape.clone(), Op::Logaddexp(self.clone(), other.clone()))
+        } else {
+            let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, logaddexp_fn);
+            Tensor::from_op(data, out_shape, Op::Logaddexp(self.clone(), other.clone()))
+        }
+    }
+
+    // --- Phase 1C: Clip, Where, NanToNum ---
+
+    pub fn clip(&self, min_val: f32, max_val: f32) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_clip(buf, &out, min_val, max_val);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Clip { input: self.clone(), min_val, max_val });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = inner.data[i].clamp(min_val, max_val); }
+        Tensor::from_op(data, inner.shape.clone(), Op::Clip { input: self.clone(), min_val, max_val })
+    }
+
+    pub fn where_cond(cond: &Tensor, x: &Tensor, y: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let all_gpu_same_shape = {
+                let c = cond.0.borrow();
+                let xi = x.0.borrow();
+                let yi = y.0.borrow();
+                c.gpu_data.is_some() && xi.gpu_data.is_some() && yi.gpu_data.is_some()
+                    && c.shape == xi.shape && c.shape == yi.shape
+            };
+            if all_gpu_same_shape {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let c = cond.0.borrow();
+                    let xi = x.0.borrow();
+                    let yi = y.0.borrow();
+                    let c_buf = c.gpu_data.as_ref().unwrap();
+                    let x_buf = xi.gpu_data.as_ref().unwrap();
+                    let y_buf = yi.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(c_buf.len());
+                    gpu.dispatch_ternary(c_buf, x_buf, y_buf, &out);
+                    let shape = c.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1,
+                        Op::Where { cond: cond.clone(), x: x.clone(), y: y.clone() });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { cond.sync_gpu_to_cpu(); x.sync_gpu_to_cpu(); y.sync_gpu_to_cpu(); }
+        let c = cond.0.borrow();
+        let xi = x.0.borrow();
+        let yi = y.0.borrow();
+        assert_eq!(c.shape, xi.shape, "where_cond: cond and x must have the same shape");
+        assert_eq!(c.shape, yi.shape, "where_cond: cond and y must have the same shape");
+        let len = c.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len {
+            data[i] = if c.data[i] != 0.0 { xi.data[i] } else { yi.data[i] };
+        }
+        Tensor::from_op(data, c.shape.clone(), Op::Where { cond: cond.clone(), x: x.clone(), y: y.clone() })
+    }
+
+    pub fn nan_to_num(&self, nan_val: Option<f32>, posinf_val: Option<f32>, neginf_val: Option<f32>) -> Tensor {
+        let nan_v = nan_val.unwrap_or(0.0);
+        let posinf_v = posinf_val.unwrap_or(f32::MAX);
+        let neginf_v = neginf_val.unwrap_or(f32::MIN);
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_nan_to_num(buf, &out, nan_v, posinf_v, neginf_v);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len {
+            let v = inner.data[i];
+            data[i] = if v.is_nan() {
+                nan_v
+            } else if v.is_infinite() {
+                if v > 0.0 { posinf_v } else { neginf_v }
+            } else {
+                v
+            };
+        }
+        Tensor::from_op(data, inner.shape.clone(), Op::None)
+    }
+
+    // --- Phase 1D: Comparison / Logical Ops ---
+
+    pub fn equal(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("equal_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "equal: shapes must match");
+        let len = a.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if a.data[i] == b.data[i] { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, a.shape.clone(), Op::None)
+    }
+
+    pub fn not_equal(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("not_equal_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "not_equal: shapes must match");
+        let len = a.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if a.data[i] != b.data[i] { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, a.shape.clone(), Op::None)
+    }
+
+    pub fn greater(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("greater_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "greater: shapes must match");
+        let len = a.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if a.data[i] > b.data[i] { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, a.shape.clone(), Op::None)
+    }
+
+    pub fn greater_equal(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("greater_equal_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "greater_equal: shapes must match");
+        let len = a.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if a.data[i] >= b.data[i] { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, a.shape.clone(), Op::None)
+    }
+
+    pub fn less(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("less_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "less: shapes must match");
+        let len = a.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if a.data[i] < b.data[i] { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, a.shape.clone(), Op::None)
+    }
+
+    pub fn less_equal(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("less_equal_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "less_equal: shapes must match");
+        let len = a.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if a.data[i] <= b.data[i] { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, a.shape.clone(), Op::None)
+    }
+
+    pub fn logical_and(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("logical_and_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "logical_and: shapes must match");
+        let len = a.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if a.data[i] != 0.0 && b.data[i] != 0.0 { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, a.shape.clone(), Op::None)
+    }
+
+    pub fn logical_or(&self, other: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let (a_gpu, b_gpu) = {
+                let a = self.0.borrow();
+                let b = other.0.borrow();
+                (a.gpu_data.is_some() && a.shape == b.shape,
+                 b.gpu_data.is_some() && a.shape == b.shape)
+            };
+            if a_gpu && b_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let b = other.0.borrow();
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(a_buf.len());
+                    gpu.dispatch_binary("logical_or_f32", a_buf, b_buf, &out);
+                    let shape = a.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        assert_eq!(a.shape, b.shape, "logical_or: shapes must match");
+        let len = a.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if a.data[i] != 0.0 || b.data[i] != 0.0 { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, a.shape.clone(), Op::None)
+    }
+
+    // Unary comparison/logical ops
+
+    pub fn isnan_op(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("isnan_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if inner.data[i].is_nan() { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, inner.shape.clone(), Op::None)
+    }
+
+    pub fn isinf_op(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("isinf_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if inner.data[i].is_infinite() { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, inner.shape.clone(), Op::None)
+    }
+
+    pub fn isfinite_op(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("isfinite_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if inner.data[i].is_finite() { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, inner.shape.clone(), Op::None)
+    }
+
+    pub fn logical_not(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("logical_not_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        let len = inner.data.len();
+        let mut data = pool_get(len);
+        for i in 0..len { data[i] = if inner.data[i] == 0.0 { 1.0 } else { 0.0 }; }
+        Tensor::from_op(data, inner.shape.clone(), Op::None)
+    }
+
+    // CPU-only utility methods
+
+    /// Check if all elements of two tensors are close: |a-b| <= atol + rtol*|b|
+    pub fn allclose(&self, other: &Tensor, rtol: f32, atol: f32) -> bool {
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        if a.shape != b.shape { return false; }
+        a.data.iter().zip(b.data.iter()).all(|(av, bv)| (av - bv).abs() <= atol + rtol * bv.abs())
+    }
+
+    /// Check if two tensors have the same shape and all elements are exactly equal.
+    pub fn array_equal(&self, other: &Tensor) -> bool {
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); other.sync_gpu_to_cpu(); }
+        let a = self.0.borrow();
+        let b = other.0.borrow();
+        a.shape == b.shape && a.data == b.data
+    }
+
     pub fn neg(&self) -> Tensor {
         #[cfg(feature = "metal")]
         {
@@ -2277,13 +2999,17 @@ impl Tensor {
             match op {
                 Op::None => vec![],
                 Op::Add(a, b) | Op::Mul(a, b) | Op::MatMul(a, b)
-                | Op::AddBias(a, b) | Op::Sub(a, b) | Op::Div(a, b) => vec![a, b],
+                | Op::AddBias(a, b) | Op::Sub(a, b) | Op::Div(a, b)
+                | Op::Maximum(a, b) | Op::Minimum(a, b) | Op::Power(a, b)
+                | Op::Arctan2(a, b) | Op::Logaddexp(a, b) => vec![a, b],
                 Op::Relu(a) | Op::Sigmoid(a) | Op::Sum(a)
                 | Op::Scale(a, _) | Op::Select(a, _) | Op::BceLoss(a, _)
                 | Op::Neg(a) | Op::Exp(a) | Op::Log(a) | Op::Sqrt(a)
                 | Op::Abs(a) | Op::Pow(a, _) | Op::Sin(a) | Op::Cos(a)
                 | Op::Tanh(a) | Op::Mean(a) => vec![a],
+                Op::Clip { input, .. } => vec![input],
                 Op::Conv2d(a, b, c) | Op::MatMulBiasRelu(a, b, c) => vec![a, b, c],
+                Op::Where { cond, x, y } => vec![cond, x, y],
                 Op::Conv2dReluPool { input, kernel, bias, .. } => vec![input, kernel, bias],
                 Op::MaxPool2d { input, .. } | Op::Flatten { input, .. }
                 | Op::Squeeze { input, .. } | Op::Unsqueeze { input, .. }
@@ -2378,12 +3104,20 @@ impl Tensor {
         // Only needed when metal feature is on and inputs may be GPU-dirty.
         #[cfg(feature = "metal")]
         match &op {
-            Op::Mul(a, b) | Op::MatMul(a, b) | Op::Div(a, b) => {
+            Op::Mul(a, b) | Op::MatMul(a, b) | Op::Div(a, b)
+            | Op::Maximum(a, b) | Op::Minimum(a, b) | Op::Power(a, b)
+            | Op::Arctan2(a, b) | Op::Logaddexp(a, b) => {
                 a.sync_gpu_to_cpu();
                 b.sync_gpu_to_cpu();
             }
-            Op::Relu(a) | Op::Gelu(a) | Op::Pow(a, _) | Op::BceLoss(a, _) => {
+            Op::Relu(a) | Op::Gelu(a) | Op::Pow(a, _) | Op::BceLoss(a, _)
+            | Op::Clip { input: a, .. } => {
                 a.sync_gpu_to_cpu();
+            }
+            Op::Where { cond, x, y } => {
+                cond.sync_gpu_to_cpu();
+                x.sync_gpu_to_cpu();
+                y.sync_gpu_to_cpu();
             }
             Op::Conv2d(a, b, c)
             | Op::Conv2dReluPool { input: a, kernel: b, bias: c, .. }
@@ -3320,6 +4054,199 @@ impl Tensor {
                 };
                 drop(in_inner);
                 accumulate_grad(input, &grad_input);
+            }
+            // Phase 1B: Binary math ops backward
+            Op::Maximum(ref a, ref b) => {
+                let a_inner = a.0.borrow();
+                let b_inner = b.0.borrow();
+                if a_inner.shape == b_inner.shape {
+                    let len = grad.len();
+                    let mut ga = pool_get(len);
+                    let mut gb = pool_get(len);
+                    for i in 0..len {
+                        ga[i] = grad[i] * if a_inner.data[i] >= b_inner.data[i] { 1.0 } else { 0.0 };
+                        gb[i] = grad[i] * if b_inner.data[i] > a_inner.data[i] { 1.0 } else { 0.0 };
+                    }
+                    drop(a_inner);
+                    drop(b_inner);
+                    accumulate_grad(a, &ga);
+                    accumulate_grad(b, &gb);
+                } else {
+                    let a_shape = a_inner.shape.clone();
+                    let b_shape = b_inner.shape.clone();
+                    let out_shape = broadcast_shape(&a_shape, &b_shape);
+                    let a_expanded = broadcast_gather(&a_inner.data, &a_shape, &out_shape);
+                    let b_expanded = broadcast_gather(&b_inner.data, &b_shape, &out_shape);
+                    drop(a_inner);
+                    drop(b_inner);
+                    let ga_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&b_expanded))
+                        .map(|(g, (av, bv))| g * if av >= bv { 1.0 } else { 0.0 }).collect();
+                    let gb_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&b_expanded))
+                        .map(|(g, (av, bv))| g * if bv > av { 1.0 } else { 0.0 }).collect();
+                    accumulate_grad(a, &reduce_grad_for_broadcast(&ga_full, &out_shape, &a_shape));
+                    accumulate_grad(b, &reduce_grad_for_broadcast(&gb_full, &out_shape, &b_shape));
+                }
+            }
+            Op::Minimum(ref a, ref b) => {
+                let a_inner = a.0.borrow();
+                let b_inner = b.0.borrow();
+                if a_inner.shape == b_inner.shape {
+                    let len = grad.len();
+                    let mut ga = pool_get(len);
+                    let mut gb = pool_get(len);
+                    for i in 0..len {
+                        ga[i] = grad[i] * if a_inner.data[i] <= b_inner.data[i] { 1.0 } else { 0.0 };
+                        gb[i] = grad[i] * if b_inner.data[i] < a_inner.data[i] { 1.0 } else { 0.0 };
+                    }
+                    drop(a_inner);
+                    drop(b_inner);
+                    accumulate_grad(a, &ga);
+                    accumulate_grad(b, &gb);
+                } else {
+                    let a_shape = a_inner.shape.clone();
+                    let b_shape = b_inner.shape.clone();
+                    let out_shape = broadcast_shape(&a_shape, &b_shape);
+                    let a_expanded = broadcast_gather(&a_inner.data, &a_shape, &out_shape);
+                    let b_expanded = broadcast_gather(&b_inner.data, &b_shape, &out_shape);
+                    drop(a_inner);
+                    drop(b_inner);
+                    let ga_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&b_expanded))
+                        .map(|(g, (av, bv))| g * if av <= bv { 1.0 } else { 0.0 }).collect();
+                    let gb_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&b_expanded))
+                        .map(|(g, (av, bv))| g * if bv < av { 1.0 } else { 0.0 }).collect();
+                    accumulate_grad(a, &reduce_grad_for_broadcast(&ga_full, &out_shape, &a_shape));
+                    accumulate_grad(b, &reduce_grad_for_broadcast(&gb_full, &out_shape, &b_shape));
+                }
+            }
+            Op::Power(ref a, ref b) => {
+                let a_inner = a.0.borrow();
+                let b_inner = b.0.borrow();
+                if a_inner.shape == b_inner.shape {
+                    let len = grad.len();
+                    let mut ga = pool_get(len);
+                    let mut gb = pool_get(len);
+                    for i in 0..len {
+                        let av = a_inner.data[i];
+                        let bv = b_inner.data[i];
+                        ga[i] = grad[i] * bv * av.powf(bv - 1.0);
+                        gb[i] = grad[i] * av.powf(bv) * av.ln();
+                    }
+                    drop(a_inner);
+                    drop(b_inner);
+                    accumulate_grad(a, &ga);
+                    accumulate_grad(b, &gb);
+                } else {
+                    let a_shape = a_inner.shape.clone();
+                    let b_shape = b_inner.shape.clone();
+                    let out_shape = broadcast_shape(&a_shape, &b_shape);
+                    let a_expanded = broadcast_gather(&a_inner.data, &a_shape, &out_shape);
+                    let b_expanded = broadcast_gather(&b_inner.data, &b_shape, &out_shape);
+                    drop(a_inner);
+                    drop(b_inner);
+                    let ga_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&b_expanded))
+                        .map(|(g, (av, bv))| g * bv * av.powf(bv - 1.0)).collect();
+                    let gb_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&b_expanded))
+                        .map(|(g, (av, bv))| g * av.powf(*bv) * av.ln()).collect();
+                    accumulate_grad(a, &reduce_grad_for_broadcast(&ga_full, &out_shape, &a_shape));
+                    accumulate_grad(b, &reduce_grad_for_broadcast(&gb_full, &out_shape, &b_shape));
+                }
+            }
+            Op::Arctan2(ref a, ref b) => {
+                let a_inner = a.0.borrow();
+                let b_inner = b.0.borrow();
+                if a_inner.shape == b_inner.shape {
+                    let len = grad.len();
+                    let mut ga = pool_get(len);
+                    let mut gb = pool_get(len);
+                    for i in 0..len {
+                        let av = a_inner.data[i];
+                        let bv = b_inner.data[i];
+                        let denom = av * av + bv * bv;
+                        ga[i] = grad[i] * bv / denom;
+                        gb[i] = grad[i] * (-av) / denom;
+                    }
+                    drop(a_inner);
+                    drop(b_inner);
+                    accumulate_grad(a, &ga);
+                    accumulate_grad(b, &gb);
+                } else {
+                    let a_shape = a_inner.shape.clone();
+                    let b_shape = b_inner.shape.clone();
+                    let out_shape = broadcast_shape(&a_shape, &b_shape);
+                    let a_expanded = broadcast_gather(&a_inner.data, &a_shape, &out_shape);
+                    let b_expanded = broadcast_gather(&b_inner.data, &b_shape, &out_shape);
+                    drop(a_inner);
+                    drop(b_inner);
+                    let ga_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&b_expanded))
+                        .map(|(g, (av, bv))| g * bv / (av * av + bv * bv)).collect();
+                    let gb_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&b_expanded))
+                        .map(|(g, (av, bv))| g * (-av) / (av * av + bv * bv)).collect();
+                    accumulate_grad(a, &reduce_grad_for_broadcast(&ga_full, &out_shape, &a_shape));
+                    accumulate_grad(b, &reduce_grad_for_broadcast(&gb_full, &out_shape, &b_shape));
+                }
+            }
+            Op::Logaddexp(ref a, ref b) => {
+                // out = log(exp(a) + exp(b)), grad_a = grad * exp(a - out), grad_b = grad * exp(b - out)
+                let self_inner = self.0.borrow();
+                let a_inner = a.0.borrow();
+                let b_inner = b.0.borrow();
+                if a_inner.shape == b_inner.shape {
+                    let len = grad.len();
+                    let mut ga = pool_get(len);
+                    let mut gb = pool_get(len);
+                    for i in 0..len {
+                        let out_v = self_inner.data[i];
+                        ga[i] = grad[i] * (a_inner.data[i] - out_v).exp();
+                        gb[i] = grad[i] * (b_inner.data[i] - out_v).exp();
+                    }
+                    drop(self_inner);
+                    drop(a_inner);
+                    drop(b_inner);
+                    accumulate_grad(a, &ga);
+                    accumulate_grad(b, &gb);
+                } else {
+                    let a_shape = a_inner.shape.clone();
+                    let b_shape = b_inner.shape.clone();
+                    let out_shape = broadcast_shape(&a_shape, &b_shape);
+                    let a_expanded = broadcast_gather(&a_inner.data, &a_shape, &out_shape);
+                    let b_expanded = broadcast_gather(&b_inner.data, &b_shape, &out_shape);
+                    drop(self_inner);
+                    drop(a_inner);
+                    drop(b_inner);
+                    let out_data = self.data();
+                    let ga_full: Vec<f32> = grad.iter().zip(a_expanded.iter().zip(&out_data))
+                        .map(|(g, (av, ov))| g * (av - ov).exp()).collect();
+                    let gb_full: Vec<f32> = grad.iter().zip(b_expanded.iter().zip(&out_data))
+                        .map(|(g, (bv, ov))| g * (bv - ov).exp()).collect();
+                    accumulate_grad(a, &reduce_grad_for_broadcast(&ga_full, &out_shape, &a_shape));
+                    accumulate_grad(b, &reduce_grad_for_broadcast(&gb_full, &out_shape, &b_shape));
+                }
+            }
+            // Phase 1C backward
+            Op::Clip { ref input, min_val, max_val } => {
+                let in_inner = input.0.borrow();
+                let len = grad.len();
+                let mut gi = pool_get(len);
+                for i in 0..len {
+                    let x = in_inner.data[i];
+                    gi[i] = grad[i] * if x > min_val && x < max_val { 1.0 } else { 0.0 };
+                }
+                drop(in_inner);
+                accumulate_grad(input, &gi);
+            }
+            Op::Where { ref cond, ref x, ref y } => {
+                let c_inner = cond.0.borrow();
+                let len = grad.len();
+                let mut gx = pool_get(len);
+                let mut gy = pool_get(len);
+                for i in 0..len {
+                    let c_val = c_inner.data[i];
+                    gx[i] = grad[i] * c_val;
+                    gy[i] = grad[i] * (1.0 - c_val);
+                }
+                drop(c_inner);
+                accumulate_grad(x, &gx);
+                accumulate_grad(y, &gy);
             }
             Op::Concat { ref inputs, ref split_sizes, dim } => {
                 let out_shape = self.shape();
@@ -4498,5 +5425,230 @@ mod tests {
                 idx, analytical_grad[idx], numerical, diff
             );
         }
+    }
+
+    // --- Phase 1B: Binary Math Ops ---
+
+    #[test]
+    fn test_maximum() {
+        let a = Tensor::new(vec![1.0, 5.0, 3.0, 2.0], vec![2, 2], true);
+        let b = Tensor::new(vec![4.0, 2.0, 3.0, 6.0], vec![2, 2], true);
+        let c = a.maximum(&b);
+        assert_eq!(c.data(), vec![4.0, 5.0, 3.0, 6.0]);
+        let loss = c.sum();
+        loss.backward();
+        // a >= b: positions 1, 2 -> grad_a[1]=1, grad_a[2]=1
+        // b > a: positions 0, 3 -> grad_b[0]=1, grad_b[3]=1
+        assert_eq!(a.grad_data().unwrap(), vec![0.0, 1.0, 1.0, 0.0]);
+        assert_eq!(b.grad_data().unwrap(), vec![1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_minimum() {
+        let a = Tensor::new(vec![1.0, 5.0, 3.0, 2.0], vec![2, 2], true);
+        let b = Tensor::new(vec![4.0, 2.0, 3.0, 6.0], vec![2, 2], true);
+        let c = a.minimum(&b);
+        assert_eq!(c.data(), vec![1.0, 2.0, 3.0, 2.0]);
+        let loss = c.sum();
+        loss.backward();
+        // a <= b: positions 0, 2, 3 -> grad_a[0]=1, grad_a[2]=1, grad_a[3]=1
+        // b < a: positions 1 -> grad_b[1]=1
+        assert_eq!(a.grad_data().unwrap(), vec![1.0, 0.0, 1.0, 1.0]);
+        assert_eq!(b.grad_data().unwrap(), vec![0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_power() {
+        let a = Tensor::new(vec![2.0, 3.0, 4.0, 5.0], vec![4], true);
+        let b = Tensor::new(vec![3.0, 2.0, 0.5, 1.0], vec![4], true);
+        let c = a.power(&b);
+        let data = c.data();
+        assert!((data[0] - 8.0).abs() < 1e-5);   // 2^3
+        assert!((data[1] - 9.0).abs() < 1e-5);   // 3^2
+        assert!((data[2] - 2.0).abs() < 1e-5);   // 4^0.5
+        assert!((data[3] - 5.0).abs() < 1e-5);   // 5^1
+    }
+
+    #[test]
+    fn test_arctan2() {
+        let a = Tensor::new(vec![1.0, 0.0, -1.0, 0.0], vec![4], true);
+        let b = Tensor::new(vec![0.0, 1.0, 0.0, -1.0], vec![4], true);
+        let c = a.arctan2(&b);
+        let data = c.data();
+        assert!((data[0] - std::f32::consts::FRAC_PI_2).abs() < 1e-5);   // atan2(1,0) = pi/2
+        assert!((data[1] - 0.0).abs() < 1e-5);                            // atan2(0,1) = 0
+        assert!((data[2] - std::f32::consts::FRAC_PI_2).abs() < 1e-5 || (data[2] + std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_logaddexp() {
+        let a = Tensor::new(vec![0.0, 1.0, 2.0, -1.0], vec![4], true);
+        let b = Tensor::new(vec![0.0, 2.0, 1.0, 3.0], vec![4], true);
+        let c = a.logaddexp(&b);
+        let data = c.data();
+        // logaddexp(0, 0) = ln(e^0 + e^0) = ln(2)
+        assert!((data[0] - 2.0f32.ln()).abs() < 1e-5);
+        // logaddexp(1, 2) = ln(e^1 + e^2)
+        let expected = (1.0f32.exp() + 2.0f32.exp()).ln();
+        assert!((data[1] - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_logaddexp_backward() {
+        let a = Tensor::new(vec![1.0, 2.0], vec![2], true);
+        let b = Tensor::new(vec![3.0, 1.0], vec![2], true);
+        let c = a.logaddexp(&b);
+        let loss = c.sum();
+        loss.backward();
+        assert!(a.grad_data().is_some());
+        assert!(b.grad_data().is_some());
+    }
+
+    // --- Phase 1C ---
+
+    #[test]
+    fn test_clip() {
+        let a = Tensor::new(vec![-2.0, 0.5, 1.5, 3.0], vec![4], true);
+        let c = a.clip(0.0, 2.0);
+        assert_eq!(c.data(), vec![0.0, 0.5, 1.5, 2.0]);
+        let loss = c.sum();
+        loss.backward();
+        // grad passes through where min < x < max, else 0
+        assert_eq!(a.grad_data().unwrap(), vec![0.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_where_cond() {
+        let cond = Tensor::new(vec![1.0, 0.0, 1.0, 0.0], vec![4], false);
+        let x = Tensor::new(vec![10.0, 20.0, 30.0, 40.0], vec![4], true);
+        let y = Tensor::new(vec![100.0, 200.0, 300.0, 400.0], vec![4], true);
+        let out = Tensor::where_cond(&cond, &x, &y);
+        assert_eq!(out.data(), vec![10.0, 200.0, 30.0, 400.0]);
+        let loss = out.sum();
+        loss.backward();
+        assert_eq!(x.grad_data().unwrap(), vec![1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(y.grad_data().unwrap(), vec![0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_nan_to_num() {
+        let a = Tensor::new(vec![1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY], vec![4], false);
+        let out = a.nan_to_num(None, None, None);
+        let data = out.data();
+        assert_eq!(data[0], 1.0);
+        assert_eq!(data[1], 0.0);  // NaN -> 0.0
+        assert_eq!(data[2], f32::MAX);
+        assert_eq!(data[3], f32::MIN);
+    }
+
+    // --- Phase 1D: Comparison/Logical ---
+
+    #[test]
+    fn test_equal() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4], false);
+        let b = Tensor::new(vec![1.0, 3.0, 3.0, 5.0], vec![4], false);
+        let c = a.equal(&b);
+        assert_eq!(c.data(), vec![1.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_not_equal() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![4], false);
+        let b = Tensor::new(vec![1.0, 3.0, 3.0, 5.0], vec![4], false);
+        let c = a.not_equal(&b);
+        assert_eq!(c.data(), vec![0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_greater() {
+        let a = Tensor::new(vec![1.0, 5.0, 3.0, 2.0], vec![4], false);
+        let b = Tensor::new(vec![2.0, 3.0, 3.0, 4.0], vec![4], false);
+        let c = a.greater(&b);
+        assert_eq!(c.data(), vec![0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_greater_equal() {
+        let a = Tensor::new(vec![1.0, 5.0, 3.0, 2.0], vec![4], false);
+        let b = Tensor::new(vec![2.0, 3.0, 3.0, 4.0], vec![4], false);
+        let c = a.greater_equal(&b);
+        assert_eq!(c.data(), vec![0.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_less() {
+        let a = Tensor::new(vec![1.0, 5.0, 3.0, 2.0], vec![4], false);
+        let b = Tensor::new(vec![2.0, 3.0, 3.0, 4.0], vec![4], false);
+        let c = a.less(&b);
+        assert_eq!(c.data(), vec![1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_less_equal() {
+        let a = Tensor::new(vec![1.0, 5.0, 3.0, 2.0], vec![4], false);
+        let b = Tensor::new(vec![2.0, 3.0, 3.0, 4.0], vec![4], false);
+        let c = a.less_equal(&b);
+        assert_eq!(c.data(), vec![1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_logical_and() {
+        let a = Tensor::new(vec![1.0, 0.0, 1.0, 0.0], vec![4], false);
+        let b = Tensor::new(vec![1.0, 1.0, 0.0, 0.0], vec![4], false);
+        let c = a.logical_and(&b);
+        assert_eq!(c.data(), vec![1.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_logical_or() {
+        let a = Tensor::new(vec![1.0, 0.0, 1.0, 0.0], vec![4], false);
+        let b = Tensor::new(vec![1.0, 1.0, 0.0, 0.0], vec![4], false);
+        let c = a.logical_or(&b);
+        assert_eq!(c.data(), vec![1.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_isnan() {
+        let a = Tensor::new(vec![1.0, f32::NAN, 3.0, f32::NAN], vec![4], false);
+        let c = a.isnan_op();
+        assert_eq!(c.data(), vec![0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_isinf() {
+        let a = Tensor::new(vec![1.0, f32::INFINITY, f32::NEG_INFINITY, 0.0], vec![4], false);
+        let c = a.isinf_op();
+        assert_eq!(c.data(), vec![0.0, 1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn test_isfinite() {
+        let a = Tensor::new(vec![1.0, f32::NAN, f32::INFINITY, 0.0], vec![4], false);
+        let c = a.isfinite_op();
+        assert_eq!(c.data(), vec![1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_logical_not() {
+        let a = Tensor::new(vec![1.0, 0.0, 5.0, 0.0], vec![4], false);
+        let c = a.logical_not();
+        assert_eq!(c.data(), vec![0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_allclose() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], false);
+        let b = Tensor::new(vec![1.0, 2.0001, 3.0], vec![3], false);
+        assert!(a.allclose(&b, 1e-3, 1e-3));
+        assert!(!a.allclose(&b, 1e-6, 1e-6));
+    }
+
+    #[test]
+    fn test_array_equal() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], false);
+        let b = Tensor::new(vec![1.0, 2.0, 3.0], vec![3], false);
+        let c = Tensor::new(vec![1.0, 2.0, 4.0], vec![3], false);
+        assert!(a.array_equal(&b));
+        assert!(!a.array_equal(&c));
     }
 }

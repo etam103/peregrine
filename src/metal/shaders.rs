@@ -864,4 +864,210 @@ kernel void adam_step_f32(
 
     data[idx] -= p.lr * m_hat / (sqrt(v_hat) + p.eps);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 1B: Binary Math Ops
+// ---------------------------------------------------------------------------
+
+kernel void maximum_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = max(a[idx], b[idx]);
+}
+
+kernel void minimum_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = min(a[idx], b[idx]);
+}
+
+kernel void power_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = pow(a[idx], b[idx]);
+}
+
+kernel void arctan2_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = atan2(a[idx], b[idx]);
+}
+
+kernel void logaddexp_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float m = max(a[idx], b[idx]);
+    out[idx] = m + log(exp(a[idx] - m) + exp(b[idx] - m));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1C: Clip, Where, NanToNum
+// ---------------------------------------------------------------------------
+
+struct ClipParams {
+    float min_val;
+    float max_val;
+};
+
+kernel void clip_f32(
+    device const float* a   [[buffer(0)]],
+    device float* out        [[buffer(1)]],
+    constant ClipParams& p   [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = clamp(a[idx], p.min_val, p.max_val);
+}
+
+kernel void where_f32(
+    device const float* cond [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device const float* y    [[buffer(2)]],
+    device float* out        [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (cond[idx] != 0.0f) ? x[idx] : y[idx];
+}
+
+struct NanToNumParams {
+    float nan_val;
+    float posinf_val;
+    float neginf_val;
+};
+
+kernel void nan_to_num_f32(
+    device const float* a   [[buffer(0)]],
+    device float* out        [[buffer(1)]],
+    constant NanToNumParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float v = a[idx];
+    out[idx] = isnan(v) ? p.nan_val : (isinf(v) ? (v > 0 ? p.posinf_val : p.neginf_val) : v);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1D: Comparison / Logical Ops (binary)
+// ---------------------------------------------------------------------------
+
+kernel void equal_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] == b[idx]) ? 1.0f : 0.0f;
+}
+
+kernel void not_equal_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] != b[idx]) ? 1.0f : 0.0f;
+}
+
+kernel void greater_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] > b[idx]) ? 1.0f : 0.0f;
+}
+
+kernel void greater_equal_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] >= b[idx]) ? 1.0f : 0.0f;
+}
+
+kernel void less_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] < b[idx]) ? 1.0f : 0.0f;
+}
+
+kernel void less_equal_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] <= b[idx]) ? 1.0f : 0.0f;
+}
+
+kernel void logical_and_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] != 0.0f && b[idx] != 0.0f) ? 1.0f : 0.0f;
+}
+
+kernel void logical_or_f32(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out      [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] != 0.0f || b[idx] != 0.0f) ? 1.0f : 0.0f;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1D: Comparison / Logical Ops (unary)
+// ---------------------------------------------------------------------------
+
+kernel void isnan_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = isnan(a[idx]) ? 1.0f : 0.0f;
+}
+
+kernel void isinf_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = isinf(a[idx]) ? 1.0f : 0.0f;
+}
+
+kernel void isfinite_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (!isnan(a[idx]) && !isinf(a[idx])) ? 1.0f : 0.0f;
+}
+
+kernel void logical_not_f32(
+    device const float* a [[buffer(0)]],
+    device float* out      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    out[idx] = (a[idx] == 0.0f) ? 1.0f : 0.0f;
+}
 "#;
