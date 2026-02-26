@@ -6,6 +6,11 @@ pub mod nn;
 pub mod debug;
 pub mod optim;
 pub mod serial;
+pub mod random;
+pub mod init;
+pub mod fft;
+pub mod linalg;
+pub mod transforms;
 
 #[cfg(feature = "metal")]
 pub mod metal;
