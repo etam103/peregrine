@@ -48,6 +48,11 @@ extern "C" {
         nrhs: *const i32, a: *const f32, lda: *const i32, b: *mut f32,
         ldb: *const i32, info: *mut i32,
     );
+    fn sgels_(
+        trans: *const u8, m: *const i32, n: *const i32, nrhs: *const i32,
+        a: *mut f32, lda: *const i32, b: *mut f32, ldb: *const i32,
+        work: *mut f32, lwork: *const i32, info: *mut i32,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +621,165 @@ pub fn triangular_solve(_a: &Tensor, _b: &Tensor, _upper: bool) -> Tensor {
     panic!("linalg::triangular_solve requires macOS Accelerate framework");
 }
 
+/// Matrix rank via SVD: count singular values > tolerance.
+///
+/// Default tolerance: `max_sv * max(m, n) * f32::EPSILON`.
+pub fn matrix_rank(a: &Tensor, tol: Option<f32>) -> usize {
+    let shape = a.shape();
+    assert!(shape.len() == 2, "matrix_rank requires 2D matrix");
+    let m = shape[0];
+    let n = shape[1];
+    let (_u, s, _vt) = svd(a);
+    let s_data = s.data();
+    let max_sv = s_data.iter().cloned().fold(0.0f32, f32::max);
+    let threshold = tol.unwrap_or(max_sv * (m.max(n) as f32) * f32::EPSILON);
+    s_data.iter().filter(|&&sv| sv > threshold).count()
+}
+
+/// Condition number: ratio of largest to smallest singular value (2-norm condition number).
+pub fn cond(a: &Tensor) -> f32 {
+    let shape = a.shape();
+    assert!(shape.len() == 2, "cond requires 2D matrix");
+    let (_u, s, _vt) = svd(a);
+    let s_data = s.data();
+    let max_sv = s_data.iter().cloned().fold(0.0f32, f32::max);
+    let min_sv = s_data.iter().cloned().fold(f32::INFINITY, f32::min);
+    if min_sv == 0.0 {
+        f32::INFINITY
+    } else {
+        max_sv / min_sv
+    }
+}
+
+/// Least-squares solution via LAPACK sgels_: minimise ||Ax - b||.
+///
+/// - `a`: `[m, n]`
+/// - `b`: `[m]` or `[m, nrhs]`
+/// - Returns the least-squares solution `x` of shape `[n]` or `[n, nrhs]`.
+#[cfg(target_os = "macos")]
+pub fn lstsq(a: &Tensor, b: &Tensor) -> Tensor {
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    assert!(a_shape.len() == 2, "lstsq: A must be 2D");
+    let m = a_shape[0] as i32;
+    let n = a_shape[1] as i32;
+    let nrhs = if b_shape.len() > 1 { b_shape[1] as i32 } else { 1 };
+    assert!(
+        b_shape[0] == m as usize,
+        "lstsq: first dimension of b must match rows of A"
+    );
+
+    let mut a_data = a.data();
+    transpose_buf(&mut a_data, m as usize, n as usize);
+
+    // b needs to be in a buffer of size max(m,n) * nrhs for sgels_
+    let ldb = m.max(n);
+    let mut b_col = vec![0.0f32; (ldb * nrhs) as usize];
+    if nrhs == 1 {
+        // b is a vector [m]
+        for i in 0..m as usize {
+            b_col[i] = b.data()[i];
+        }
+    } else {
+        // b is [m, nrhs] row-major -> column-major in ldb rows
+        let bd = b.data();
+        for j in 0..nrhs as usize {
+            for i in 0..m as usize {
+                b_col[j * ldb as usize + i] = bd[i * nrhs as usize + j];
+            }
+        }
+    }
+
+    let trans = b'N';
+    let mut info = 0i32;
+
+    // Workspace query
+    let mut work_query = vec![0.0f32; 1];
+    let lwork_query: i32 = -1;
+    unsafe {
+        sgels_(
+            &trans, &m, &n, &nrhs,
+            a_data.as_mut_ptr(), &m,
+            b_col.as_mut_ptr(), &ldb,
+            work_query.as_mut_ptr(), &lwork_query, &mut info,
+        );
+    }
+    let lwork = work_query[0] as i32;
+    let mut work = vec![0.0f32; lwork as usize];
+
+    unsafe {
+        sgels_(
+            &trans, &m, &n, &nrhs,
+            a_data.as_mut_ptr(), &m,
+            b_col.as_mut_ptr(), &ldb,
+            work.as_mut_ptr(), &lwork, &mut info,
+        );
+    }
+    assert!(info == 0, "LAPACK sgels failed with info={}", info);
+
+    // Extract solution x from first n rows of b_col
+    if nrhs == 1 {
+        let x_data: Vec<f32> = b_col[..n as usize].to_vec();
+        Tensor::new(x_data, vec![n as usize], false)
+    } else {
+        // Column-major [ldb, nrhs] -> row-major [n, nrhs]
+        let nu = n as usize;
+        let nrhs_u = nrhs as usize;
+        let mut x_data = vec![0.0f32; nu * nrhs_u];
+        for j in 0..nrhs_u {
+            for i in 0..nu {
+                x_data[i * nrhs_u + j] = b_col[j * ldb as usize + i];
+            }
+        }
+        Tensor::new(x_data, vec![nu, nrhs_u], false)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn lstsq(_a: &Tensor, _b: &Tensor) -> Tensor {
+    panic!("linalg::lstsq requires macOS Accelerate framework");
+}
+
+/// Matrix power: raise a square matrix to an integer power n.
+///
+/// For n >= 0: repeated squaring. For n < 0: invert first, then raise to |n|.
+pub fn matrix_power(a: &Tensor, n: i32) -> Tensor {
+    let shape = a.shape();
+    assert!(
+        shape.len() == 2 && shape[0] == shape[1],
+        "matrix_power requires a square matrix"
+    );
+    let sz = shape[0];
+
+    if n == 0 {
+        return Tensor::eye(sz, false);
+    }
+
+    let (base, exp) = if n < 0 {
+        (inv(a), (-n) as u32)
+    } else {
+        (a.clone(), n as u32)
+    };
+
+    // Exponentiation by squaring
+    let mut result = Tensor::eye(sz, false);
+    let mut base_pow = base;
+    let mut e = exp;
+    while e > 0 {
+        if e & 1 == 1 {
+            result = result.matmul(&base_pow);
+        }
+        e >>= 1;
+        if e > 0 {
+            let tmp = base_pow.clone();
+            base_pow = tmp.matmul(&base_pow);
+        }
+    }
+
+    // Return without autograd
+    Tensor::new(result.data(), result.shape().to_vec(), false)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -769,5 +933,225 @@ mod tests {
         assert_eq!(l.shape(), vec![3, 2]); // [m, k]
         assert_eq!(u.shape(), vec![2, 2]); // [k, n]
         assert_eq!(pivots.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // matrix_rank tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_rank_identity() {
+        let a = Tensor::eye(4, false);
+        assert_eq!(matrix_rank(&a, None), 4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_rank_zero() {
+        let a = Tensor::zeros(&[3, 3], false);
+        assert_eq!(matrix_rank(&a, None), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_rank_rank_deficient() {
+        // Row 2 = 2 * Row 1 -> rank 1
+        let a = Tensor::new(vec![1.0, 2.0, 2.0, 4.0], vec![2, 2], false);
+        assert_eq!(matrix_rank(&a, None), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_rank_rectangular() {
+        // [3, 2] full-rank matrix
+        let a = Tensor::new(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![3, 2], false);
+        assert_eq!(matrix_rank(&a, None), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // cond tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_cond_identity() {
+        let a = Tensor::eye(3, false);
+        let c = cond(&a);
+        assert!(approx_eq(c, 1.0, 1e-4));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_cond_diagonal() {
+        // diag(1, 2, 4) -> cond = 4/1 = 4
+        let a = Tensor::new(
+            vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 4.0],
+            vec![3, 3],
+            false,
+        );
+        let c = cond(&a);
+        assert!(approx_eq(c, 4.0, 1e-3));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_cond_singular() {
+        // Nearly singular matrix -> very large condition number
+        let a = Tensor::new(vec![1.0, 2.0, 2.0, 4.0], vec![2, 2], false);
+        let c = cond(&a);
+        // SVD may produce a tiny (not exactly zero) smallest singular value,
+        // so the condition number is extremely large but possibly not infinite.
+        assert!(c > 1e6 || c.is_infinite(), "cond = {} should be very large", c);
+    }
+
+    // -----------------------------------------------------------------------
+    // lstsq tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_lstsq_exact() {
+        // Exact solution: A x = b where A is square and invertible
+        // A = [[1, 0], [0, 1]], b = [3, 4] -> x = [3, 4]
+        let a = Tensor::eye(2, false);
+        let b = Tensor::new(vec![3.0, 4.0], vec![2], false);
+        let x = lstsq(&a, &b);
+        let xd = x.data();
+        assert!(approx_eq(xd[0], 3.0, 1e-4));
+        assert!(approx_eq(xd[1], 4.0, 1e-4));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_lstsq_overdetermined() {
+        // Overdetermined: 3 equations, 2 unknowns
+        // A = [[1, 0], [0, 1], [1, 1]], b = [1, 2, 4]
+        // Least squares: minimise ||Ax - b||^2
+        let a = Tensor::new(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![3, 2], false);
+        let b = Tensor::new(vec![1.0, 2.0, 4.0], vec![3], false);
+        let x = lstsq(&a, &b);
+        assert_eq!(x.shape(), vec![2]);
+        // Verify Ax is close to b in least-squares sense
+        let xd = x.data();
+        // Residual should be small relative to original
+        let r0 = xd[0] - 1.0;
+        let r1 = xd[1] - 2.0;
+        let r2 = xd[0] + xd[1] - 4.0;
+        let res_norm = (r0 * r0 + r1 * r1 + r2 * r2).sqrt();
+        assert!(res_norm < 2.0, "residual too large: {}", res_norm);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_lstsq_multi_rhs() {
+        // A = I, B = [[1, 2], [3, 4]] -> X = B
+        let a = Tensor::eye(2, false);
+        let b = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false);
+        let x = lstsq(&a, &b);
+        assert_eq!(x.shape(), vec![2, 2]);
+        let xd = x.data();
+        assert!(approx_eq(xd[0], 1.0, 1e-4));
+        assert!(approx_eq(xd[1], 2.0, 1e-4));
+        assert!(approx_eq(xd[2], 3.0, 1e-4));
+        assert!(approx_eq(xd[3], 4.0, 1e-4));
+    }
+
+    // -----------------------------------------------------------------------
+    // matrix_power tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_power_zero() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false);
+        let r = matrix_power(&a, 0);
+        let d = r.data();
+        // A^0 = I
+        assert!(approx_eq(d[0], 1.0, 1e-6));
+        assert!(approx_eq(d[1], 0.0, 1e-6));
+        assert!(approx_eq(d[2], 0.0, 1e-6));
+        assert!(approx_eq(d[3], 1.0, 1e-6));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_power_one() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false);
+        let r = matrix_power(&a, 1);
+        let d = r.data();
+        assert!(approx_eq(d[0], 1.0, 1e-5));
+        assert!(approx_eq(d[1], 2.0, 1e-5));
+        assert!(approx_eq(d[2], 3.0, 1e-5));
+        assert!(approx_eq(d[3], 4.0, 1e-5));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_power_two() {
+        // A = [[1, 2], [3, 4]]
+        // A^2 = [[7, 10], [15, 22]]
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false);
+        let r = matrix_power(&a, 2);
+        let d = r.data();
+        assert!(approx_eq(d[0], 7.0, 1e-4));
+        assert!(approx_eq(d[1], 10.0, 1e-4));
+        assert!(approx_eq(d[2], 15.0, 1e-4));
+        assert!(approx_eq(d[3], 22.0, 1e-4));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_power_three() {
+        // A^3 = A^2 * A = [[7,10],[15,22]] * [[1,2],[3,4]] = [[37,54],[81,118]]
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false);
+        let r = matrix_power(&a, 3);
+        let d = r.data();
+        assert!(approx_eq(d[0], 37.0, 1e-3));
+        assert!(approx_eq(d[1], 54.0, 1e-3));
+        assert!(approx_eq(d[2], 81.0, 1e-3));
+        assert!(approx_eq(d[3], 118.0, 1e-3));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_power_negative_one() {
+        // A^-1 for A = [[1, 2], [3, 4]]
+        // A^-1 = [[-2, 1], [1.5, -0.5]]
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false);
+        let r = matrix_power(&a, -1);
+        let d = r.data();
+        assert!(approx_eq(d[0], -2.0, 1e-4));
+        assert!(approx_eq(d[1], 1.0, 1e-4));
+        assert!(approx_eq(d[2], 1.5, 1e-4));
+        assert!(approx_eq(d[3], -0.5, 1e-4));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_power_negative_two() {
+        // A^-2 = (A^-1)^2
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false);
+        let r = matrix_power(&a, -2);
+        // (A^-1)^2 = [[-2,1],[1.5,-0.5]] * [[-2,1],[1.5,-0.5]] = [[5.5, -2.5], [-3.75, 1.75]]
+        let d = r.data();
+        assert!(approx_eq(d[0], 5.5, 1e-3));
+        assert!(approx_eq(d[1], -2.5, 1e-3));
+        assert!(approx_eq(d[2], -3.75, 1e-3));
+        assert!(approx_eq(d[3], 1.75, 1e-3));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_matrix_power_identity() {
+        let a = Tensor::eye(3, false);
+        let r = matrix_power(&a, 5);
+        let d = r.data();
+        for i in 0..3 {
+            for j in 0..3 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(approx_eq(d[i * 3 + j], expected, 1e-5));
+            }
+        }
     }
 }

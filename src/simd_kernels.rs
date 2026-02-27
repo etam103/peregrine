@@ -780,6 +780,45 @@ pub fn vec_reciprocal_f32(a: &[f32], out: &mut [f32]) {
     }
 }
 
+/// logaddexp: out[i] = ln(exp(a[i]) + exp(b[i])), computed as max(a,b) + log1p(exp(-|a-b|))
+/// Uses NEON intrinsics for max/abs/exp, then scalar log1p for precision.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_logaddexp_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, b.len());
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            let vb = vld1q_f32(b.as_ptr().add(off));
+            // max(a, b)
+            let vmax = vmaxq_f32(va, vb);
+            // -|a - b|
+            let neg_abs_diff = vnegq_f32(vabsq_f32(vsubq_f32(va, vb)));
+            // exp(-|a - b|)
+            let exp_neg = fast_exp_f32x4(neg_abs_diff);
+            // Store exp values temporarily, then apply scalar log1p
+            let mut exp_buf = [0.0f32; 4];
+            let mut max_buf = [0.0f32; 4];
+            vst1q_f32(exp_buf.as_mut_ptr(), exp_neg);
+            vst1q_f32(max_buf.as_mut_ptr(), vmax);
+            // log1p has no fast NEON version; use scalar for precision
+            for j in 0..4 {
+                out[off + j] = max_buf[j] + exp_buf[j].ln_1p();
+            }
+        }
+    }
+    // Scalar tail
+    for i in (chunks * 4)..len {
+        let m = a[i].max(b[i]);
+        let d = (a[i] - b[i]).abs();
+        out[i] = m + (-d).exp().ln_1p();
+    }
+}
+
 // ========================================================================
 // Tests
 // ========================================================================

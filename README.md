@@ -17,7 +17,7 @@ Tensors, reverse-mode autograd, neural network layers, optimizers, and working m
 
 ```
 cargo build --release                          # build the library
-cargo test                                     # 302 tests
+cargo test                                     # 409 tests
 cargo run --example mnist --release            # train MNIST digit classifier (97.5% accuracy)
 cargo run --example rt_detr --release          # train RT-DETR on COCO images
 ./scripts/bench_compare.sh                     # wall-clock benchmark vs PyTorch, MLX, TF, tinygrad, JAX
@@ -29,13 +29,13 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 
 | Module | What it does |
 |--------|-------------|
-| **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, ~200 ops, NumPy-style broadcasting, Apple Accelerate BLAS, NEON intrinsics, rayon parallelism |
-| **`peregrine::nn`** | Linear, Embedding, MultiHeadAttention, Transformer, RNN/LSTM/GRU, Conv1d/2d, RMSNorm/GroupNorm/BatchNorm, Dropout, RoPE, Module trait, Sequential, 14 loss functions |
+| **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, ~220 ops, NumPy-style broadcasting, Apple Accelerate BLAS, NEON intrinsics, rayon parallelism |
+| **`peregrine::nn`** | Linear, Embedding, MultiHeadAttention, Transformer{Encoder,Decoder}, RNN/LSTM/GRU, Conv1d/2d, ConvTranspose1d/2d, MaxPool1d/2d, AvgPool, AdaptiveAvgPool, BatchNorm/LayerNorm/GroupNorm/InstanceNorm/RMSNorm, Dropout/Dropout2d/AlphaDropout, Upsample, PixelShuffle, padding layers, RoPE, Module trait, Sequential, 14 loss functions |
 | **`peregrine::optim`** | SGD, Adam/AdamW, RMSprop, Adagrad, Adamax, AdaDelta, Lion, Adafactor, LR schedulers (Step, Cosine, Warmup, Exponential, Linear, Join), gradient clipping |
-| **`peregrine::random`** | Xoshiro256++ PRNG — uniform, normal, bernoulli, categorical, gumbel, laplace, truncated normal, permutation |
+| **`peregrine::random`** | Xoshiro256++ PRNG — uniform, normal, bernoulli, categorical, gumbel, laplace, truncated normal, permutation, exponential, gamma, beta, poisson, multinomial |
 | **`peregrine::init`** | Weight initialization — Glorot, He, LeCun, orthogonal, constant |
-| **`peregrine::fft`** | FFT via Apple Accelerate vDSP — fft, ifft, rfft, irfft, fftshift |
-| **`peregrine::linalg`** | Linear algebra via LAPACK — solve, inv, cholesky, svd, qr, eigh, lu, det, pinv, norm |
+| **`peregrine::fft`** | FFT via Apple Accelerate vDSP — fft, ifft, rfft, irfft, fft2, ifft2, rfft2, irfft2, fftshift |
+| **`peregrine::linalg`** | Linear algebra via LAPACK — solve, inv, cholesky, svd, qr, eigh, lu, det, pinv, norm, matrix_rank, cond, lstsq, matrix_power |
 | **`peregrine::transforms`** | Functional autograd utilities — grad, value_and_grad, checkpoint |
 | **`peregrine::serial`** | Save/load model weights in compact binary format |
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
@@ -43,7 +43,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 
-The entire library is ~19,500 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
+The entire library is ~25,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
 ---
 
@@ -74,7 +74,7 @@ opt.zero_grad();
 **Shape:** reshape, transpose, squeeze, unsqueeze, concat, select, flatten, stack, split, tril, triu, repeat, tile, pad, roll, take, diagonal, diag, trace, outer, inner, broadcast_to, expand_dims
 **Conditional:** clip, where, nan_to_num
 **Comparison:** equal, not_equal, greater, greater_equal, less, less_equal, logical_and, logical_or, logical_not, isnan, isinf, isfinite
-**Layers:** matmul, conv1d, conv2d, conv2d+relu+pool (fused), max_pool2d, avg_pool2d, add_bias, batch_norm, layer_norm, rms_norm, group_norm
+**Layers:** matmul, conv1d, conv2d, conv2d_strided, conv_transpose1d, conv_transpose2d, conv2d+relu+pool (fused), max_pool2d, max_pool2d_ext, avg_pool2d, add_bias, batch_norm, layer_norm, rms_norm, group_norm, instance_norm, upsample_nearest, upsample_bilinear, index_select
 **Loss:** bce_with_logits, cross_entropy, mse, l1, nll, smooth_l1, huber, kl_div, cosine_similarity, triplet, hinge, log_cosh, margin_ranking, gaussian_nll
 
 All ops support broadcasting where applicable.
@@ -101,11 +101,11 @@ Model: MLP (784 → 128 → 64 → 10) with ReLU, trained with CrossEntropyLoss 
 
 ## PyTorch numerical parity
 
-23 integration tests cross-validate Peregrine against PyTorch reference data, covering matmul, softmax, log_softmax, layernorm, cross_entropy_loss, 14 element-wise ops, Adam optimizer, and a full 10-step MLP training loop. All pass within 1e-4 to 1e-7 absolute error. 34 additional activation tests and 245 unit tests cover the full op suite.
+23 integration tests cross-validate Peregrine against PyTorch reference data, covering matmul, softmax, log_softmax, layernorm, cross_entropy_loss, 14 element-wise ops, Adam optimizer, and a full 10-step MLP training loop. All pass within 1e-4 to 1e-7 absolute error. 34 additional activation tests and 352 unit tests cover the full op suite.
 
 ```
 $ cargo test
-running 302 tests ... ok (245 unit + 34 activation + 23 parity)
+running 409 tests ... ok (352 unit + 34 activation + 23 parity)
 ```
 
 To regenerate reference data: `.venv/bin/python tests/generate_reference.py`
@@ -189,19 +189,22 @@ Input Image [1, 3, 256, 256]
 
 CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compute shaders (`--features metal`). Wall-clock benchmarks run via `./scripts/bench_compare.sh`.
 
-### Peregrine vs ML Frameworks (CPU, wall-clock, all times in microseconds)
+### Peregrine vs ML Frameworks (133 ops, CPU, wall-clock, all times in microseconds)
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | **6.1** | 7.0 | 52.6 | 54.0 | 436.6 | 62.4 |
-| matmul 512x512 | 168.7 | **145.3** | 190.8 | 701.7 | 445.3 | 523.0 |
-| add 100k | **12.5** | 32.3 | 30.4 | 53.0 | 192.7 | 36.8 |
-| mul 100k | **12.5** | 30.0 | 29.4 | 42.9 | 202.4 | 33.2 |
-| relu 100k | **8.8** | 38.8 | 31.9 | 37.4 | 343.0 | 94.2 |
-| softmax 8x128 | **3.9** | 36.3 | 18.2 | 11.5 | 648.4 | 32.8 |
-| train step 64 | **809.1** | 1298.4 | 824.4 | 9601.5 | 25498.4 | 5368.9 |
+| matmul 128x128 | **6.2** | 6.0 | 19.6 | 94.3 | 431.2 | 82.6 |
+| matmul 512x512 | 214.2 | **142.8** | 161.7 | 704.0 | 429.9 | 533.2 |
+| add 100k | **12.5** | 41.7 | 29.7 | 52.4 | 186.7 | 33.9 |
+| mul 100k | **12.9** | 39.2 | 28.9 | 41.7 | 191.7 | 31.1 |
+| relu 100k | **8.9** | 37.9 | 25.3 | 38.3 | 343.3 | 99.5 |
+| softmax 8x128 | **3.8** | 33.8 | 14.6 | 11.2 | 618.7 | 31.0 |
+| silu 100k | **64.1** | 74.0 | 84.8 | 246.0 | 343.0 | 54.9 |
+| rfft 1k | **2.2** | 4.4 | 19.2 | 42.8 | — | 59.5 |
+| cross_entropy | **2.6** | 38.5 | 36.4 | 624.4 | 3337.3 | 55.7 |
+| train step 64 | **839.5** | 1247.3 | 788.1 | 8713.9 | 23717.2 | 5084.3 |
 
-Geometric mean ratio (lower = Peregrine faster): **PyTorch 0.70x**, **MLX 0.57x**, TensorFlow 0.40x, tinygrad 0.08x, JAX 0.39x. Peregrine wins 8 of 14 ops.
+Geometric mean ratio across 133 ops (lower = Peregrine faster): **PyTorch 0.95x**, **MLX 0.74x**, TensorFlow 0.55x, tinygrad 0.09x, JAX 0.68x. Peregrine wins 56 of 133 ops.
 
 | Optimization | Impact |
 |-------------|--------|
@@ -223,13 +226,13 @@ src/
   lib.rs          public API surface
   cpu_pool.rs     thread-local buffer pool for allocation reuse
   simd_kernels.rs hand-tuned NEON intrinsics for aarch64 (24 kernels + Adam step)
-  tensor.rs       tensor, autograd engine, ~200 ops, broadcasting (~9,700 lines)
-  nn.rs           Linear, Embedding, attention, transformer, RNN/LSTM/GRU, RoPE, Conv1d, AvgPool2d, RMSNorm, GroupNorm, Dropout, Module trait, 14 loss functions
+  tensor.rs       tensor, autograd engine, ~220 ops, broadcasting (~11,400 lines)
+  nn.rs           Linear, Embedding, attention, Transformer{Encoder,Decoder}, RNN/LSTM/GRU, Conv1d/2d, ConvTranspose1d/2d, MaxPool, AvgPool, AdaptiveAvgPool, BatchNorm/LayerNorm/GroupNorm/InstanceNorm/RMSNorm, Dropout/Dropout2d/AlphaDropout, Upsample, PixelShuffle, padding layers, Module trait, 14 loss functions (~4,400 lines)
   optim.rs        SGD, Adam/AdamW, RMSprop, Adagrad, Adamax, AdaDelta, Lion, Adafactor, LR schedulers, gradient clipping
-  random.rs       Xoshiro256++ PRNG, 10 distribution functions
+  random.rs       Xoshiro256++ PRNG, 15 distribution functions
   init.rs         weight initialization (Glorot, He, LeCun, orthogonal)
-  fft.rs          FFT via Apple Accelerate vDSP (fft, ifft, rfft, irfft, fftshift)
-  linalg.rs       linear algebra via LAPACK (solve, inv, cholesky, svd, qr, eigh, lu, det, pinv)
+  fft.rs          FFT via Apple Accelerate vDSP (fft, ifft, rfft, irfft, fft2, ifft2, rfft2, irfft2, fftshift)
+  linalg.rs       linear algebra via LAPACK (solve, inv, cholesky, svd, qr, eigh, lu, det, pinv, matrix_rank, cond, lstsq, matrix_power)
   transforms.rs   functional autograd utilities (grad, value_and_grad, checkpoint)
   debug.rs        model summary + training health diagnostics
   serial.rs       model weight save/load (binary format)

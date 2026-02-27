@@ -7,6 +7,91 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.12.0] - 2026-02-26
+
+### Added — PyTorch feature parity sprint
+
+Closes both performance gaps and missing features identified in the 133-op PyTorch benchmark comparison. Adds 30+ new NN modules, 5 new random distributions, 4 new linalg functions, 2D FFT, and multi-dimensional indexing. All with full autograd backward support.
+
+**Phase 1: Critical Performance Fixes** (`src/fft.rs`, `src/tensor.rs`, `src/simd_kernels.rs`, `src/nn.rs`)
+- FFT setup caching: thread-local `HashMap<u64, *mut c_void>` cache for `vDSP_create_fftsetup()` — eliminates ~300us per-call overhead. Added `vDSP_fft_zip` FFI for complex-to-complex FFT via Accelerate.
+- SiLU NEON dispatch: new `Op::Silu` with single-pass NEON kernel (`vec_silu_f32`), replacing 2-intermediate-tensor composition
+- cosine_similarity: `pow(2.0)` → `square()` (avoids `exp(2*ln(x))` per element)
+- logaddexp NEON kernel: `vec_logaddexp_f32` using `vmaxq_f32`, `vabsq_f32`, `fast_exp_f32x4`
+- GELU via vForce: `vvtanhf` FFI + NEON combination for `0.5 * x * (1 + tanh(inner))`
+- GroupNorm optimization: `pool_get()` allocation, fused mean+variance single pass, precomputed fused_scale/fused_bias
+- Transcendentals via vForce: `vvsinhf`, `vvcoshf`, `vvasinf`, `vvatanf` fast paths on macOS
+
+**Phase 2: Conv2d Module + Generalized MaxPool** (`src/tensor.rs`, `src/nn.rs`)
+- `im2col_strided()` / `col2im_strided()` with configurable stride and padding
+- `conv2d_strided()` forward + backward with `Op::Conv2dStrided`
+- `nn::Conv2d` module (Kaiming init, configurable kernel/stride/padding)
+- `max_pool2d_ext()` with configurable kernel_size/stride/padding + `Op::MaxPool2dExt`
+- `nn::MaxPool2d`, `nn::MaxPool1d` modules
+
+**Phase 3: Normalization Modules + Utility** (`src/tensor.rs`, `src/nn.rs`)
+- `nn::LayerNorm` module (wraps functional `layer_norm`)
+- `nn::BatchNorm2d` module with running_mean/running_var, EMA updates, train/eval modes
+- `nn::BatchNorm1d` module (reshapes to 4D, delegates to BatchNorm2d)
+- `Tensor::item()` — extract scalar value from single-element tensor
+- `index_select(dim, indices)` with `Op::IndexSelect` backward (scatter-add)
+- `index_add_(dim, indices, src)` in-place scatter-add helper
+
+**Phase 4: ConvTranspose + Upsample + Transformer Containers** (`src/tensor.rs`, `src/nn.rs`)
+- `conv_transpose2d()` / `conv_transpose1d()` with `Op::ConvTranspose2d` / `Op::ConvTranspose1d`, full backward
+- `nn::ConvTranspose2d`, `nn::ConvTranspose1d` modules (Kaiming init)
+- `upsample_nearest()` / `upsample_bilinear()` with `Op::UpsampleNearest` / `Op::UpsampleBilinear`, full backward
+- `nn::Upsample` module with `UpsampleMode::Nearest` / `UpsampleMode::Bilinear`
+- `nn::TransformerEncoder`, `nn::TransformerDecoder`, `nn::Transformer` container modules
+
+**Phase 5: Tier 2 Features** (`src/nn.rs`, `src/linalg.rs`, `src/fft.rs`)
+- Padding layers: `nn::ZeroPad2d`, `nn::ConstantPad2d`, `nn::ReflectionPad2d`, `nn::ReplicationPad2d`
+- Dropout variants: `nn::Dropout2d` (channel-wise), `nn::AlphaDropout` (SELU-preserving)
+- `nn::PixelShuffle`, `nn::PixelUnshuffle` (sub-pixel convolution rearrangement)
+- `nn::AdaptiveAvgPool2d`, `nn::AdaptiveAvgPool1d` (dynamic window sizing)
+- `linalg::matrix_rank` (via SVD), `linalg::cond` (condition number), `linalg::lstsq` (least-squares via LAPACK `sgels_`), `linalg::matrix_power` (exponentiation by squaring with inverse support)
+- `fft::fft2`, `fft::ifft2`, `fft::rfft2`, `fft::irfft2` (2D FFT via row-wise + column-wise composition)
+
+**Phase 6: Additional Distributions + InstanceNorm** (`src/random.rs`, `src/nn.rs`)
+- `random::exponential` (inverse CDF), `random::gamma` (Marsaglia-Tsang), `random::beta` (via gamma), `random::poisson` (Knuth), `random::multinomial` (with/without replacement)
+- `nn::InstanceNorm2d`, `nn::InstanceNorm1d` modules with running stats and train/eval modes
+
+### Fixed
+- `irfft` scaling bug: vDSP path used `1/N` instead of correct `1/(2N)` scale factor
+- `test_seed_determinism` race: hold PRNG mutex across both seed+generate pairs to prevent concurrent test interference
+
+### Stats
+
+- 409 tests passing (up from 302)
+- ~25,000 lines of Rust (up from ~19,500)
+- 30+ new NN modules, 5 new distributions, 4 new linalg functions, 4 new 2D FFT functions
+- 15 random distribution functions (up from 10)
+- Tensor ops: ~220 (up from ~200)
+
+### Benchmark Results (133 ops, CPU, Apple Silicon)
+
+**Geometric mean ratio (Peregrine / Framework):**
+- vs PyTorch: **0.95x** (Peregrine faster)
+- vs MLX: **0.74x** (Peregrine 1.35x faster)
+- vs JAX: **0.68x** (Peregrine 1.47x faster)
+- vs TensorFlow: **0.55x** (Peregrine 1.82x faster)
+- vs tinygrad: **0.09x** (Peregrine 11x faster)
+
+**Wins: Peregrine 56/133, PyTorch 27, MLX 20, JAX 16, TensorFlow 14**
+
+Key Phase 1 improvements:
+| Operation | Before (us) | After (us) | Speedup |
+|-----------|------------:|-----------:|--------:|
+| rfft 1k | 302 | 2.2 | 137x |
+| silu 100k | 125 | 64 | 2.0x |
+| cosine_sim 64x64 | 73 | 14 | 5.2x |
+| sinh 100k | 131 | 51 | 2.6x |
+| cosh 100k | 128 | 46 | 2.8x |
+| arcsin 100k | 72 | 52 | 1.4x |
+| arctan 100k | 96 | 53 | 1.8x |
+
+---
+
 ## [0.11.0] - 2026-02-26
 
 ### Added — MLX feature parity sprint

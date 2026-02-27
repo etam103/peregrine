@@ -845,4 +845,198 @@ Several micro-optimizations to the Adafactor `step()` inner loop:
 
 1. **GPU Philox random** — requires new Metal kernel; deferred to a future sprint
 2. **Adafactor GPU kernel** — factored updates are parallelizable on Metal
-3. **Fused silu Op** — currently composable (`self.mul(&self.sigmoid())`), which creates intermediates; a dedicated `Op::Silu` with backward would avoid two tensor allocations
+3. ~~**Fused silu Op** — currently composable (`self.mul(&self.sigmoid())`), which creates intermediates; a dedicated `Op::Silu` with backward would avoid two tensor allocations~~ ✅ Done in Round 9
+
+## Round 9: PyTorch feature parity sprint (2026-02-26)
+
+**Goal:** Close both performance gaps and missing feature gaps identified by benchmarking Peregrine against PyTorch across 133 operations. Performance targets: FFT 68-81x → <2x, cosine_similarity 6.8x → <2x, silu 1.8x → <1x. Feature targets: add Conv2d, MaxPool, BatchNorm, LayerNorm, ConvTranspose, Upsample, Transformer containers, multi-dim indexing, 2D FFT, additional distributions.
+
+**Approach:** 6 phases, each with 1-3 parallel agents. Total: ~15 agent invocations across 6 phases.
+
+### Phase 1: Critical Performance Fixes
+
+**7 targeted optimizations** to close the biggest speed gaps vs PyTorch:
+
+#### 1A. FFT Setup Caching (`src/fft.rs`)
+
+**Root cause:** `vDSP_create_fftsetup()` / `vDSP_destroy_fftsetup()` called every invocation — ~300us setup cost per call for precomputing twiddle factors.
+
+**Fix:** Thread-local `HashMap<u64, *mut c_void>` cache keyed by `log2n`. `get_cached_fft_setup(log2n)` returns cached setup or creates+caches a new one. Setups are never destroyed during thread lifetime. Also added `vDSP_fft_zip` FFI binding for complex-to-complex FFT via Accelerate (previously used scalar Cooley-Tukey fallback for `fft`/`ifft`).
+
+**Result:** rfft 1k: 302us → 2.2us (**137x faster**). fft 1k: 23us → 3.1us (7.4x faster).
+
+#### 1B. SiLU NEON Dispatch (`src/tensor.rs`, `src/simd_kernels.rs`)
+
+**Root cause:** `silu()` was `self.mul(&self.sigmoid())` — creates 2 intermediate tensors. The NEON kernel `vec_silu_f32` existed but was never called.
+
+**Fix:** Added `Op::Silu(Tensor)` variant. Rewrote `silu()` to use single-pass NEON kernel. Backward: `grad * (sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x)))`.
+
+**Result:** silu 100k: 125us → 64us (**2.0x faster**, now beats PyTorch's 74us).
+
+#### 1C. Cosine Similarity (`src/nn.rs`)
+
+**Root cause:** `a.pow(2.0)` calls `powf()` which computes `exp(2*ln(x))`. Should be `a.square()`.
+
+**Fix:** Changed `a.pow(2.0).sum().sqrt()` → `a.square().sum().sqrt()` in `cosine_similarity_loss` and `triplet_loss`.
+
+**Result:** cosine_sim 64x64: 73us → 14us (**5.2x faster**).
+
+#### 1D. Logaddexp NEON Kernel (`src/simd_kernels.rs`)
+
+**Root cause:** Scalar `exp()` + `ln()` per element.
+
+**Fix:** Added `vec_logaddexp_f32` using `max(a,b) + log1p(exp(-|a-b|))` with NEON `vmaxq_f32`, `vabsq_f32`, `fast_exp_f32x4`.
+
+**Result:** logaddexp 100k: 571us → 407us (1.4x faster). Still 2.6x slower than PyTorch — needs vForce `vvlog1pf` for the log1p step.
+
+#### 1E. GELU via vForce (`src/tensor.rs`)
+
+**Root cause:** NEON kernel used polynomial exp approximation for tanh. PyTorch uses Apple Accelerate `vvtanhf`.
+
+**Fix:** Added `vvtanhf` FFI. Compute inner values, batch-tanh via vForce, combine with NEON `0.5 * x * (1 + tanh_result)`.
+
+**Result:** gelu 100k: 219us → 200us (modest improvement — the vForce overhead amortizes better at larger sizes).
+
+#### 1F. GroupNorm Optimization (`src/nn.rs`)
+
+**Root cause:** `vec![0.0f32; ...]` allocation (no pool), 3 separate passes, no SIMD.
+
+**Fix:** `pool_get()`, fused mean+variance into 1 pass with f64 accumulation, precomputed `fused_scale = inv_std * w[c]` / `fused_bias = b[c] - mean * fused_scale`.
+
+**Result:** groupnorm 4×64×16×16: 139us → 73us (**1.9x faster**).
+
+#### 1G. Transcendentals via vForce (`src/tensor.rs`)
+
+**Fix:** Added `vvsinhf`, `vvcoshf`, `vvasinf`, `vvatanf` FFI. Added `#[cfg(target_os = "macos")]` fast paths.
+
+**Result:**
+
+| Op | Before (us) | After (us) | Speedup |
+|----|------------:|-----------:|--------:|
+| sinh 100k | 131 | 51 | 2.6x |
+| cosh 100k | 128 | 46 | 2.8x |
+| arcsin 100k | 72 | 52 | 1.4x |
+| arctan 100k | 96 | 53 | 1.8x |
+
+### Phase 2: Conv2d Module + Generalized MaxPool
+
+**Changes:**
+
+1. **`im2col_strided()` / `col2im_strided()`** — generalized im2col with configurable stride and padding. Output dims: `out_h = (h + 2*pad_h - kh)/stride_h + 1`. Updated existing `conv2d` to use the generalized version.
+
+2. **`conv2d_strided()` + `Op::Conv2dStrided`** — forward pass via im2col + BLAS sgemm. Backward computes grad_bias, grad_kernel (input × grad_col^T), and grad_input (kernel × grad_col via col2im).
+
+3. **`nn::Conv2d`** — module with weight `[out_channels, in_channels, kH, kW]`, Kaiming init, configurable kernel_size/stride/padding. Delegates to `conv2d` for stride=1/same-padding or `conv2d_strided` otherwise.
+
+4. **`max_pool2d_ext()` + `Op::MaxPool2dExt`** — generalized MaxPool with configurable kernel_size/stride/padding, with max_indices tracking for backward scatter.
+
+5. **`nn::MaxPool2d`**, **`nn::MaxPool1d`** — modules wrapping `max_pool2d_ext`. MaxPool1d reshapes 3D→4D, delegates, reshapes back.
+
+### Phase 3: Normalization Modules + Utility
+
+**Changes:**
+
+1. **`nn::LayerNorm`** — wraps functional `layer_norm()`. Weight (gamma) and bias (beta) parameters.
+
+2. **`nn::BatchNorm2d`** — running_mean/running_var with EMA updates (momentum=0.1). Training mode uses functional `batch_norm()` + updates running stats. Eval mode uses running stats manually: `(x - running_mean) / sqrt(running_var + eps) * weight + bias`. Implements `train()`/`eval()`.
+
+3. **`nn::BatchNorm1d`** — reshapes 2D/3D input to 4D, delegates to internal BatchNorm2d.
+
+4. **`Tensor::item()`** — extracts scalar `f32` from single-element tensor.
+
+5. **`index_select(dim, indices)`** + `Op::IndexSelect` — selects slices along a dimension with backward via scatter-add. `index_add_(dim, indices, src)` helper for in-place scatter-add.
+
+### Phase 4: ConvTranspose + Upsample + Transformer Containers
+
+**Changes:**
+
+1. **`conv_transpose2d()` / `conv_transpose1d()`** — transposed convolution (gradient of conv2d w.r.t. input). Forward uses col2im. Backward w.r.t. input is regular conv2d. Both have dedicated Op variants.
+
+2. **`nn::ConvTranspose2d`**, **`nn::ConvTranspose1d`** — modules with Kaiming init.
+
+3. **`upsample_nearest()` / `upsample_bilinear()`** — nearest-neighbor copies each input pixel to a `scale × scale` block. Bilinear uses standard 2D interpolation with half-pixel centers. Both with full backward pass.
+
+4. **`nn::Upsample`** — module with `scale_factor` or explicit `size`, `UpsampleMode::Nearest` / `UpsampleMode::Bilinear`.
+
+5. **`nn::TransformerEncoder`**, **`nn::TransformerDecoder`**, **`nn::Transformer`** — container modules wrapping `Vec<TransformerEncoderLayer>` / `Vec<TransformerDecoderLayer>`. Sequential forward, `params()` and `named_params()` collect from all layers with indexed prefixes.
+
+### Phase 5: Tier 2 Features
+
+**Changes:**
+
+1. **Padding layers** — `nn::ZeroPad2d`, `nn::ConstantPad2d` (delegate to `Tensor::pad()`), `nn::ReflectionPad2d` (reflected indices), `nn::ReplicationPad2d` (clamped indices).
+
+2. **Dropout variants** — `nn::Dropout2d` (zeros entire channels), `nn::AlphaDropout` (SELU-preserving with affine correction to maintain mean=0, var=1).
+
+3. **`nn::PixelShuffle`**, **`nn::PixelUnshuffle`** — rearranges `[N, C*r², H, W]` ↔ `[N, C, H*r, W*r]` for sub-pixel convolution.
+
+4. **`nn::AdaptiveAvgPool2d`**, **`nn::AdaptiveAvgPool1d`** — dynamic window sizing: `kernel = ceil(in / out)`.
+
+5. **Linalg** — `matrix_rank` (via SVD), `cond` (singular value ratio), `lstsq` (via LAPACK `sgels_`), `matrix_power` (exponentiation by squaring with inverse support).
+
+6. **2D FFT** — `fft2`, `ifft2`, `rfft2`, `irfft2` via row-wise + column-wise composition of 1D FFT.
+
+7. **irfft bugfix** — vDSP path scale corrected from `1/N` to `1/(2N)`.
+
+### Phase 6: Additional Distributions + InstanceNorm
+
+**Changes:**
+
+1. **Random distributions** — `exponential` (inverse CDF: `-log(u)/rate`), `gamma` (Marsaglia-Tsang rejection), `beta` (via two gammas: `x/(x+y)`), `poisson` (Knuth), `multinomial` (CDF binary search, with/without replacement).
+
+2. **`nn::InstanceNorm2d`**, **`nn::InstanceNorm1d`** — per-instance (per N, per C) normalization over spatial dims. Running stats with EMA, affine transform, train/eval modes.
+
+### Benchmark Results (133 ops, CPU, Apple Silicon)
+
+| Framework | Geo Mean Ratio | Meaning |
+|-----------|---------------:|---------|
+| PyTorch | **0.95x** | Peregrine faster |
+| MLX | **0.74x** | Peregrine 1.35x faster |
+| JAX | **0.68x** | Peregrine 1.47x faster |
+| TensorFlow | **0.55x** | Peregrine 1.82x faster |
+| tinygrad | **0.09x** | Peregrine 11x faster |
+
+**Wins: Peregrine 56/133, PyTorch 27, MLX 20, JAX 16, TensorFlow 14**
+
+Selected results showing Phase 1 improvements:
+
+| Operation | Peregrine (us) | PyTorch (us) | Winner |
+|-----------|---------------:|-------------:|--------|
+| rfft 1k | **2.2** | 4.4 | Peregrine (2x) |
+| rfft 4k | **7.5** | 14.7 | Peregrine (2x) |
+| rfft 16k | **30.3** | 65.0 | Peregrine (2x) |
+| fft 1k | **3.1** | 6.6 | Peregrine (2x) |
+| silu 100k | **64.1** | 74.0 | Peregrine (1.2x) |
+| cosine_sim 64x64 | 14.0 | **10.6** | PyTorch (1.3x) |
+| sinh 100k | **51.0** | 131.2 | Peregrine (2.6x) |
+| cosh 100k | **46.3** | 128.0 | Peregrine (2.8x) |
+| arcsin 100k | **52.1** | 71.7 | Peregrine (1.4x) |
+| arctan 100k | **53.1** | 95.9 | Peregrine (1.8x) |
+| groupnorm | 72.5 | **56.6** | PyTorch (1.3x) |
+| train_step 64 | **839.5** | 1247.3 | Peregrine (1.5x) |
+
+### Stats
+
+| Metric | Before | After |
+|--------|-------:|------:|
+| Tests passing | 302 | 409 |
+| NN modules | ~17 | ~47 |
+| Random distributions | 10 | 15 |
+| Linalg functions | 12 | 16 |
+| FFT functions | 6 | 10 |
+| Lines of Rust | ~19,500 | ~25,000 |
+
+### Analysis
+
+The FFT setup caching was the biggest single win: 137x speedup on rfft by eliminating redundant twiddle factor precomputation. The vForce transcendentals (sinh, cosh, arcsin, arctan) gave 1.4-2.8x speedups by replacing scalar libm calls with Apple Accelerate vectorized functions.
+
+On the feature side, the Conv2d, BatchNorm, LayerNorm, and Transformer container modules close the most important gaps for building standard architectures (ResNets, U-Nets, Transformers) entirely within Peregrine. The ConvTranspose + Upsample modules enable decoder networks and generative models.
+
+Remaining performance gaps: logaddexp (2.6x vs PyTorch — needs vForce log1p), gelu (2.9x — vForce tanh overhead), exp (1.6x — NEON polynomial vs Accelerate). These would require deeper integration with Accelerate's vectorized math library.
+
+### Remaining opportunities
+
+1. **GPU kernels for new modules** — Conv2d, MaxPool, BatchNorm, ConvTranspose, Upsample all run CPU-only. Metal kernels would accelerate training on large inputs.
+2. **NEON for axis reductions** — sum_axis, mean_axis are 3x slower than MLX. Vectorized reduction with horizontal adds would help.
+3. **vForce for more transcendentals** — logaddexp needs `vvlog1pf`, exp could use `vvexpf` instead of the NEON polynomial approximation.
+4. **GPU Philox random** — still deferred; new distributions (gamma, poisson) are inherently sequential but multinomial could benefit from GPU parallel CDF construction.
