@@ -11,22 +11,24 @@ Model: 423M parameters (ViT-L encoder + ViT-B decoder), shared head.
 
 | Metric               | Peregrine 224 | PyTorch 224 | Peregrine 512 | PyTorch 512 |
 |----------------------|---------------|-------------|----------------|-------------|
-| Input resolution     | 224x224       | 224x224     | 512x448        | 512x448     |
-| Patches              | 196           | 196         | 896            | 896         |
-| **Inference time**   | **1.87s**     | **0.67s**   | **10.45s**     | **2.26s**   |
-| **Weight loading**   | **264.7s**    | **1.6s**    | **264.5s**     | **1.6s**    |
-| Peak memory (RSS)    | 3.40 GB       | ~5.0 GB*    | 7.48 GB        | ~5.4 GB*    |
+| Input resolution     | 224x224       | 224x224     | 512x384        | 512x384     |
+| Patches              | 196           | 196         | 768            | 768         |
+| **Inference time**   | **0.67s**     | **0.67s**   | **1.98s**      | **2.26s**   |
+| **Weight loading**   | **0.6s**      | **1.6s**    | **0.6s**       | **1.6s**    |
 
-*PyTorch RSS includes Python runtime + both benchmark runs sequentially.
+- **224**: Peregrine **matches** PyTorch (0.67s vs 0.67s)
+- **512**: Peregrine is **13% faster** (1.98s vs 2.26s)
+- **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
-- **224**: PyTorch is **2.8x faster** (0.67s vs 1.87s)
-- **512**: PyTorch is **4.6x faster** (2.26s vs 10.45s)
-- **Weight loading**: PyTorch is **165x faster** (1.6s vs 265s)
-
-### Optimization opportunities
-1. **Weight loading** (~265s): Switch to mmap-based loading. Biggest single win.
-2. **Attention** (O(n^2)): Flash attention or tiled attention for cache locality.
-3. **RoPE**: Vectorize with NEON SIMD instead of scalar loop.
+### Optimizations applied
+1. **Weight loading** (378x): BufReader + bulk tensor reads instead of per-element syscalls
+2. **Batched encoder** (batch=2): Both images processed in a single encoder pass — eliminates warmup and doubles GEMM sizes
+3. **Batched decoder**: Self-attention and FFN process both views together (batch=2), cross-attention stays separate
+4. **Parallel multi-head attention**: rayon par_chunks_mut with pre-allocated output, direct sgemm into output slices
+5. **NEON + vvexpf softmax**: Vectorized max-reduction, Accelerate vvexpf for bulk exp, NEON normalize
+6. **Parallel chunked GELU**: Per-chunk vvtanhf + NEON combine pipeline via rayon (fixes scalar fallback for large tensors)
+7. **Fused QKV split+reshape**: Single pass from [batch*seq, 3*embed_dim] to [batch, heads, seq, head_dim] — eliminates 3 temp Vec allocations
+8. **Direct transpose loops**: Replaces Tensor::transpose() which allocated + copied full 4D tensors
 
 ## Op-Level Benchmarks — 6 Frameworks
 

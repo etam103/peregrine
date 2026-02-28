@@ -1315,39 +1315,68 @@ impl MultiHeadAttention {
         let v_2d = v_4d.reshape(vec![batch * self.num_heads * seq_kv, self.head_dim]);
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
-        let mut attn_out_data: Vec<f32> = Vec::with_capacity(batch * self.num_heads * seq_q * self.head_dim);
         let q_data = q_2d.data();
         let k_data = k_2d.data();
         let v_data = v_2d.data();
 
-        for bh in 0..(batch * self.num_heads) {
-            let q_offset = bh * seq_q * self.head_dim;
-            let k_offset = bh * seq_kv * self.head_dim;
-            let v_offset = bh * seq_kv * self.head_dim;
+        let total_bh = batch * self.num_heads;
 
-            let q_slice = q_data[q_offset..q_offset + seq_q * self.head_dim].to_vec();
-            let k_slice = k_data[k_offset..k_offset + seq_kv * self.head_dim].to_vec();
-            let v_slice = v_data[v_offset..v_offset + seq_kv * self.head_dim].to_vec();
-
-            let q_t = Tensor::new(q_slice, vec![seq_q, self.head_dim], false);
-            let k_t = Tensor::new(k_slice, vec![seq_kv, self.head_dim], false);
-            let v_t = Tensor::new(v_slice, vec![seq_kv, self.head_dim], false);
-
-            let k_transposed = k_t.transpose(0, 1);
-            let scores = q_t.matmul(&k_transposed).scale(scale);
-            let attn_weights = scores.softmax(-1);
-
-            let context = attn_weights.matmul(&v_t);
-            attn_out_data.extend(context.data());
-        }
-
-        let attn_out = Tensor::new(
-            attn_out_data,
-            vec![batch, self.num_heads, seq_q, self.head_dim],
-            false,
+        #[cfg(target_os = "macos")]
+        let attn_out_data = crate::tensor::multi_head_attention(
+            &q_data, &k_data, &v_data,
+            total_bh, seq_q, seq_kv, self.head_dim, scale,
         );
-        let attn_out = attn_out.transpose(1, 2);
-        let attn_flat = attn_out.reshape(vec![batch * seq_q, embed_dim]);
+        #[cfg(not(target_os = "macos"))]
+        let attn_out_data = {
+            let mut out = vec![0.0f32; total_bh * seq_q * self.head_dim];
+            let mut scores_buf = vec![0.0f32; seq_q * seq_kv];
+            for bh in 0..total_bh {
+                let q_off = bh * seq_q * self.head_dim;
+                let k_off = bh * seq_kv * self.head_dim;
+                let v_off = bh * seq_kv * self.head_dim;
+                let o_off = bh * seq_q * self.head_dim;
+
+                for i in 0..seq_q {
+                    for j in 0..seq_kv {
+                        let mut sum = 0.0f32;
+                        for p in 0..self.head_dim {
+                            sum += q_data[q_off + i * self.head_dim + p]
+                                 * k_data[k_off + j * self.head_dim + p];
+                        }
+                        scores_buf[i * seq_kv + j] = sum * scale;
+                    }
+                }
+
+                crate::tensor::softmax_rows_inplace(&mut scores_buf, 0, seq_q, seq_kv);
+
+                for i in 0..seq_q {
+                    for j in 0..self.head_dim {
+                        let mut sum = 0.0f32;
+                        for p in 0..seq_kv {
+                            sum += scores_buf[i * seq_kv + p]
+                                 * v_data[v_off + p * self.head_dim + j];
+                        }
+                        out[o_off + i * self.head_dim + j] = sum;
+                    }
+                }
+            }
+            out
+        };
+
+        // Direct transpose [batch, num_heads, seq_q, head_dim] -> [batch*seq_q, embed_dim]
+        let mut attn_flat_data = vec![0.0f32; batch * seq_q * embed_dim];
+        for b in 0..batch {
+            for s in 0..seq_q {
+                let dst_row = b * seq_q + s;
+                for h in 0..self.num_heads {
+                    let src_idx = ((b * self.num_heads + h) * seq_q + s) * self.head_dim;
+                    let dst_idx = dst_row * embed_dim + h * self.head_dim;
+                    attn_flat_data[dst_idx..dst_idx + self.head_dim]
+                        .copy_from_slice(&attn_out_data[src_idx..src_idx + self.head_dim]);
+                }
+            }
+        }
+        let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_q, embed_dim], false);
 
         attn_flat.matmul(&self.wo).add_bias(&self.bo)
     }

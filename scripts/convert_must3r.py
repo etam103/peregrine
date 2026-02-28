@@ -49,7 +49,15 @@ def convert_must3r(input_path: str, output_path: str):
 
     # The checkpoint may have the model under different keys
     if isinstance(ckpt, dict):
-        if 'model' in ckpt:
+        if 'encoder' in ckpt and 'decoder' in ckpt:
+            # MUSt3R splits into encoder/decoder sub-dicts
+            state_dict = {}
+            for k, v in ckpt['encoder'].items():
+                state_dict[k] = v
+            for k, v in ckpt['decoder'].items():
+                state_dict[k] = v
+            print(f"  Merged encoder ({len(ckpt['encoder'])}) + decoder ({len(ckpt['decoder'])}) params")
+        elif 'model' in ckpt:
             state_dict = ckpt['model']
         elif 'state_dict' in ckpt:
             state_dict = ckpt['state_dict']
@@ -88,12 +96,10 @@ def convert_must3r(input_path: str, output_path: str):
     has_blocks_enc = any(k.startswith('blocks_enc.') for k in state_dict.keys())
     has_enc_blocks = any(k.startswith('enc_blocks.') for k in state_dict.keys())
 
+    transposed = 0
     for key, tensor in state_dict.items():
         if not isinstance(tensor, torch.Tensor):
             continue
-
-        data = tensor.float().detach().numpy().flatten().tolist()
-        shape = list(tensor.shape)
 
         # Normalize key names to our convention
         name = key
@@ -110,9 +116,7 @@ def convert_must3r(input_path: str, output_path: str):
         if 'downstream_head1' in name:
             name = name.replace('downstream_head1', 'head_dec')
         elif 'downstream_head2' in name:
-            # Skip head2 (we only need one head for basic inference)
-            skipped.append(key)
-            continue
+            name = name.replace('downstream_head2', 'head2_dec')
 
         # Handle encoder-decoder projection
         if name == 'decoder_embed.weight':
@@ -124,9 +128,20 @@ def convert_must3r(input_path: str, output_path: str):
         if '_orig_mod.' in name:
             name = name.replace('_orig_mod.', '')
 
+        # Transpose 2D linear weights: PyTorch [out, in] -> Peregrine [in, out]
+        # This matches Peregrine's matmul convention: x [N, in] * w [in, out] -> [N, out]
+        # Conv2d weights (4D) and biases/norms (1D) are left unchanged.
+        data_np = tensor.float().detach().numpy()
+        if data_np.ndim == 2 and name.endswith('.weight'):
+            data_np = data_np.T  # [out, in] -> [in, out]
+            transposed += 1
+
+        shape = list(data_np.shape)
+        data = data_np.flatten().tolist()
+
         params[name] = (shape, data)
 
-    print(f"Converted {len(params)} parameters ({len(skipped)} skipped)")
+    print(f"Converted {len(params)} parameters ({len(skipped)} skipped, {transposed} transposed)")
 
     # Print parameter summary
     total_params = sum(np.prod(shape) for shape, _ in params.values())

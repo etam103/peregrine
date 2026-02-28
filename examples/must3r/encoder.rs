@@ -8,8 +8,12 @@
 /// All tensors use `requires_grad: false` (inference only).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use peregrine::tensor::Tensor;
 use super::rope2d::RoPE2D;
+
+static ENCODER_PROFILE_PRINTED: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // PatchEmbed: Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
@@ -151,56 +155,50 @@ impl EncoderBlock {
         num_heads: usize,
     ) -> Tensor {
         let head_dim = self.embed_dim / num_heads;
+        let t_block = Instant::now();
 
         // --- Pre-norm + Self-Attention ---
+        let t0 = Instant::now();
         let normed = x.layer_norm(&self.norm1_weight, &self.norm1_bias, self.embed_dim);
+        let dt_norm1 = t0.elapsed();
 
         // Fused QKV projection: [batch*seq, embed_dim] * [embed_dim, 3*embed_dim] -> [batch*seq, 3*embed_dim]
+        let t0 = Instant::now();
         let qkv = normed.matmul(&self.qkv_weight).add_bias(&self.qkv_bias);
         let qkv_data = qkv.data();
+        let dt_qkv = t0.elapsed();
 
-        // Split into Q, K, V: each [batch * seq_len, embed_dim]
-        let total_tokens = batch * seq_len;
-        let qkv_stride = 3 * self.embed_dim;
-        let mut q_data = Vec::with_capacity(total_tokens * self.embed_dim);
-        let mut k_data = Vec::with_capacity(total_tokens * self.embed_dim);
-        let mut v_data = Vec::with_capacity(total_tokens * self.embed_dim);
-
-        for t in 0..total_tokens {
-            let base = t * qkv_stride;
-            q_data.extend_from_slice(&qkv_data[base..base + self.embed_dim]);
-            k_data.extend_from_slice(&qkv_data[base + self.embed_dim..base + 2 * self.embed_dim]);
-            v_data.extend_from_slice(&qkv_data[base + 2 * self.embed_dim..base + 3 * self.embed_dim]);
-        }
-
-        // Reshape to [batch, num_heads, seq_len, head_dim] for RoPE application.
-        // Current layout: q_data is [batch * seq_len, embed_dim] (row-major).
-        // We need [batch, num_heads, seq_len, head_dim] which we can obtain by:
-        //   [batch, seq_len, num_heads, head_dim] -> transpose(1,2) -> [batch, num_heads, seq_len, head_dim]
-        // But since RoPE operates on raw data in [num_heads, seq_len, head_dim] layout per batch,
-        // we do the reshape manually.
-
+        // Fused QKV split + reshape: directly from [batch*seq, 3*embed_dim]
+        // to Q,K,V each in [batch, num_heads, seq_len, head_dim] layout.
+        let t0 = Instant::now();
+        let embed_dim = self.embed_dim;
+        let qkv_stride = 3 * embed_dim;
         let mut q_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
         let mut k_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
+        let mut v_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
 
-        // q_data layout: [batch*seq_len, embed_dim] where embed_dim = num_heads * head_dim
-        // We want: [batch, num_heads, seq_len, head_dim]
         for b in 0..batch {
             for s in 0..seq_len {
-                let src_row = b * seq_len + s;
+                let src_token = b * seq_len + s;
+                let qkv_base = src_token * qkv_stride;
                 for h in 0..num_heads {
                     let dst_idx = ((b * num_heads + h) * seq_len + s) * head_dim;
-                    let src_idx = src_row * self.embed_dim + h * head_dim;
+                    let h_offset = h * head_dim;
                     q_heads[dst_idx..dst_idx + head_dim]
-                        .copy_from_slice(&q_data[src_idx..src_idx + head_dim]);
+                        .copy_from_slice(&qkv_data[qkv_base + h_offset..qkv_base + h_offset + head_dim]);
                     k_heads[dst_idx..dst_idx + head_dim]
-                        .copy_from_slice(&k_data[src_idx..src_idx + head_dim]);
+                        .copy_from_slice(&qkv_data[qkv_base + embed_dim + h_offset..qkv_base + embed_dim + h_offset + head_dim]);
+                    v_heads[dst_idx..dst_idx + head_dim]
+                        .copy_from_slice(&qkv_data[qkv_base + 2 * embed_dim + h_offset..qkv_base + 2 * embed_dim + h_offset + head_dim]);
                 }
             }
         }
 
+        let dt_reshape = t0.elapsed();
+
         // Apply 2D RoPE to Q and K per batch element.
         // RoPE expects [num_heads, seq_len, head_dim] per batch.
+        let t0 = Instant::now();
         let per_batch = num_heads * seq_len * head_dim;
         for b in 0..batch {
             let start = b * per_batch;
@@ -223,72 +221,68 @@ impl EncoderBlock {
             );
             k_heads[start..end].copy_from_slice(&k_rotated);
         }
+        let dt_rope = t0.elapsed();
 
-        // Reshape V to [batch, num_heads, seq_len, head_dim] (same reorder as Q/K)
-        let mut v_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
+        // Multi-head attention (parallel for large sequences)
+        let t0 = Instant::now();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let total_bh = batch * num_heads;
+
+        let attn_out_data = peregrine::tensor::multi_head_attention(
+            &q_heads, &k_heads, &v_heads,
+            total_bh, seq_len, seq_len, head_dim, scale,
+        );
+
+        let dt_attn = t0.elapsed();
+
+        // Direct transpose [batch, num_heads, seq_len, head_dim] -> [batch*seq_len, embed_dim]
+        // Avoids Tensor::transpose which allocates + copies the full 4D tensor
+        let t0 = Instant::now();
+        let mut attn_flat_data = vec![0.0f32; batch * seq_len * embed_dim];
         for b in 0..batch {
             for s in 0..seq_len {
-                let src_row = b * seq_len + s;
+                let dst_row = b * seq_len + s;
                 for h in 0..num_heads {
-                    let dst_idx = ((b * num_heads + h) * seq_len + s) * head_dim;
-                    let src_idx = src_row * self.embed_dim + h * head_dim;
-                    v_heads[dst_idx..dst_idx + head_dim]
-                        .copy_from_slice(&v_data[src_idx..src_idx + head_dim]);
+                    let src_idx = ((b * num_heads + h) * seq_len + s) * head_dim;
+                    let dst_idx = dst_row * embed_dim + h * head_dim;
+                    attn_flat_data[dst_idx..dst_idx + head_dim]
+                        .copy_from_slice(&attn_out_data[src_idx..src_idx + head_dim]);
                 }
             }
         }
-
-        // Scaled dot-product attention per (batch, head)
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let mut attn_out_data = Vec::with_capacity(batch * num_heads * seq_len * head_dim);
-
-        for bh in 0..(batch * num_heads) {
-            let q_off = bh * seq_len * head_dim;
-            let k_off = bh * seq_len * head_dim;
-            let v_off = bh * seq_len * head_dim;
-
-            let q_slice = q_heads[q_off..q_off + seq_len * head_dim].to_vec();
-            let k_slice = k_heads[k_off..k_off + seq_len * head_dim].to_vec();
-            let v_slice = v_heads[v_off..v_off + seq_len * head_dim].to_vec();
-
-            // Q: [seq_len, head_dim], K: [seq_len, head_dim], V: [seq_len, head_dim]
-            let q_t = Tensor::new(q_slice, vec![seq_len, head_dim], false);
-            let k_t = Tensor::new(k_slice, vec![seq_len, head_dim], false);
-            let v_t = Tensor::new(v_slice, vec![seq_len, head_dim], false);
-
-            // scores = Q * K^T * scale: [seq_len, seq_len]
-            let k_transposed = k_t.transpose(0, 1);
-            let scores = q_t.matmul(&k_transposed).scale(scale);
-            let attn_weights = scores.softmax(-1);
-
-            // context = attn_weights * V: [seq_len, head_dim]
-            let context = attn_weights.matmul(&v_t);
-            attn_out_data.extend(context.data());
-        }
-
-        // attn_out_data is [batch, num_heads, seq_len, head_dim]
-        // Need to transpose back to [batch, seq_len, num_heads, head_dim] then flatten.
-        let attn_out = Tensor::new(
-            attn_out_data,
-            vec![batch, num_heads, seq_len, head_dim],
-            false,
-        );
-        let attn_out = attn_out.transpose(1, 2); // [batch, seq_len, num_heads, head_dim]
-        let attn_flat = attn_out.reshape(vec![batch * seq_len, self.embed_dim]);
+        let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_len, embed_dim], false);
 
         // Output projection
         let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
 
         // Residual connection
         let x = x.add(&attn_proj);
+        let dt_proj = t0.elapsed();
 
         // --- Pre-norm + FFN ---
+        let t0 = Instant::now();
         let normed = x.layer_norm(&self.norm2_weight, &self.norm2_bias, self.embed_dim);
         let h = normed.matmul(&self.mlp_fc1_weight).add_bias(&self.mlp_fc1_bias).gelu();
         let ffn_out = h.matmul(&self.mlp_fc2_weight).add_bias(&self.mlp_fc2_bias);
 
         // Residual connection
-        x.add(&ffn_out)
+        let out = x.add(&ffn_out);
+        let dt_ffn = t0.elapsed();
+
+        // Print profile for first encoder block only
+        if !ENCODER_PROFILE_PRINTED.swap(true, Ordering::Relaxed) {
+            let total = t_block.elapsed();
+            println!("    [Encoder block 0 profile] total={:.1}ms", total.as_secs_f64() * 1000.0);
+            println!("      norm1:    {:.2}ms", dt_norm1.as_secs_f64() * 1000.0);
+            println!("      qkv:     {:.2}ms", dt_qkv.as_secs_f64() * 1000.0);
+            println!("      reshape: {:.2}ms", dt_reshape.as_secs_f64() * 1000.0);
+            println!("      rope:    {:.2}ms", dt_rope.as_secs_f64() * 1000.0);
+            println!("      attn:    {:.2}ms", dt_attn.as_secs_f64() * 1000.0);
+            println!("      proj:    {:.2}ms", dt_proj.as_secs_f64() * 1000.0);
+            println!("      ffn:     {:.2}ms", dt_ffn.as_secs_f64() * 1000.0);
+        }
+
+        out
     }
 }
 
@@ -398,9 +392,9 @@ impl Dust3rEncoder {
     /// - "norm_enc.weight" -> [embed_dim]
     /// - "norm_enc.bias" -> [embed_dim]
     ///
-    /// PyTorch Linear stores weights as [out_features, in_features].
-    /// Peregrine matmul expects [in_features, out_features].
-    /// So all Linear weights are transposed during loading.
+    /// The converter (convert_must3r.py) transposes all 2D Linear weights from
+    /// PyTorch [out_features, in_features] to Peregrine [in_features, out_features].
+    /// Weights are loaded directly without runtime transposition.
     pub fn load_weights(&mut self, params: &HashMap<String, (Vec<usize>, Vec<f32>)>) {
         // --- Patch embedding ---
         if let Some((shape, data)) = params.get("patch_embed.proj.weight") {
@@ -423,23 +417,17 @@ impl Dust3rEncoder {
                 block.norm1_bias = Tensor::new(data.clone(), vec![self.embed_dim], false);
             }
 
-            // QKV (fused): PyTorch [3*embed_dim, embed_dim] -> transpose to [embed_dim, 3*embed_dim]
+            // QKV (fused): already transposed to [embed_dim, 3*embed_dim] by converter
             if let Some((shape, data)) = params.get(&format!("{}.attn.qkv.weight", prefix)) {
-                let out_f = shape[0]; // 3 * embed_dim
-                let in_f = shape[1];  // embed_dim
-                let pt_tensor = Tensor::new(data.clone(), vec![out_f, in_f], false);
-                block.qkv_weight = pt_tensor.transpose(0, 1);
+                block.qkv_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) = params.get(&format!("{}.attn.qkv.bias", prefix)) {
                 block.qkv_bias = Tensor::new(data.clone(), vec![1, 3 * self.embed_dim], false);
             }
 
-            // Output projection: PyTorch [embed_dim, embed_dim] -> transpose
+            // Output projection: already transposed to [embed_dim, embed_dim] by converter
             if let Some((shape, data)) = params.get(&format!("{}.attn.proj.weight", prefix)) {
-                let out_f = shape[0];
-                let in_f = shape[1];
-                let pt_tensor = Tensor::new(data.clone(), vec![out_f, in_f], false);
-                block.proj_weight = pt_tensor.transpose(0, 1);
+                block.proj_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) = params.get(&format!("{}.attn.proj.bias", prefix)) {
                 block.proj_bias = Tensor::new(data.clone(), vec![1, self.embed_dim], false);
@@ -453,24 +441,18 @@ impl Dust3rEncoder {
                 block.norm2_bias = Tensor::new(data.clone(), vec![self.embed_dim], false);
             }
 
-            // MLP fc1: PyTorch [mlp_dim, embed_dim] -> transpose to [embed_dim, mlp_dim]
+            // MLP fc1: already transposed to [embed_dim, mlp_dim] by converter
             let mlp_dim = 4 * self.embed_dim;
             if let Some((shape, data)) = params.get(&format!("{}.mlp.fc1.weight", prefix)) {
-                let out_f = shape[0]; // mlp_dim
-                let in_f = shape[1];  // embed_dim
-                let pt_tensor = Tensor::new(data.clone(), vec![out_f, in_f], false);
-                block.mlp_fc1_weight = pt_tensor.transpose(0, 1);
+                block.mlp_fc1_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) = params.get(&format!("{}.mlp.fc1.bias", prefix)) {
                 block.mlp_fc1_bias = Tensor::new(data.clone(), vec![1, mlp_dim], false);
             }
 
-            // MLP fc2: PyTorch [embed_dim, mlp_dim] -> transpose to [mlp_dim, embed_dim]
+            // MLP fc2: already transposed to [mlp_dim, embed_dim] by converter
             if let Some((shape, data)) = params.get(&format!("{}.mlp.fc2.weight", prefix)) {
-                let out_f = shape[0]; // embed_dim
-                let in_f = shape[1];  // mlp_dim
-                let pt_tensor = Tensor::new(data.clone(), vec![out_f, in_f], false);
-                block.mlp_fc2_weight = pt_tensor.transpose(0, 1);
+                block.mlp_fc2_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) = params.get(&format!("{}.mlp.fc2.bias", prefix)) {
                 block.mlp_fc2_bias = Tensor::new(data.clone(), vec![1, self.embed_dim], false);

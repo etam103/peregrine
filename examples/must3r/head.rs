@@ -80,34 +80,35 @@ impl LinearHead {
         let projected = x.matmul(&self.weight).add_bias(&self.bias);
         let proj_data = projected.data();
 
-        // Unpatchify: rearrange from patches to spatial layout
-        // Input layout per patch: [ps * ps * num_channels] (row-major within patch)
+        // Unpatchify: rearrange from patches to spatial layout.
+        // Matches PyTorch's F.pixel_shuffle which uses channel-first layout:
+        //   feature index = channel * (ps*ps) + row * ps + col
         // Output layout: [batch, H, W, num_channels]
         let out_size = batch * h * w * num_channels;
         let mut output = vec![0.0f32; out_size];
+        let ps2 = ps * ps;
 
         for b in 0..batch {
             for ph in 0..h_patches {
                 for pw in 0..w_patches {
                     let patch_idx = b * num_patches + ph * w_patches + pw;
-                    let patch_base = patch_idx * (ps * ps * num_channels);
+                    let patch_base = patch_idx * (ps2 * num_channels);
 
                     for py in 0..ps {
                         for px in 0..ps {
                             let pixel_y = ph * ps + py;
                             let pixel_x = pw * ps + px;
 
-                            // Source: patch data at position (py, px) within the patch
-                            let src_offset = (py * ps + px) * num_channels;
-
                             // Destination: [b, pixel_y, pixel_x, :]
                             let dst_offset =
                                 ((b * h + pixel_y) * w + pixel_x) * num_channels;
 
-                            output[dst_offset..dst_offset + num_channels].copy_from_slice(
-                                &proj_data[patch_base + src_offset
-                                    ..patch_base + src_offset + num_channels],
-                            );
+                            // Source: pixel_shuffle layout (channel-first within patch)
+                            // feature[c] = patch_base + c * ps*ps + py * ps + px
+                            for c in 0..num_channels {
+                                let src_idx = patch_base + c * ps2 + py * ps + px;
+                                output[dst_offset + c] = proj_data[src_idx];
+                            }
                         }
                     }
                 }
@@ -129,13 +130,8 @@ impl LinearHead {
         let bias_key = format!("{}.bias", prefix);
 
         if let Some((shape, data)) = params.get(&weight_key) {
-            // PyTorch Linear: [out_features, in_features] -> transpose for Peregrine
-            let t = Tensor::new(data.clone(), shape.clone(), false);
-            if shape.len() == 2 {
-                self.weight = t.transpose(0, 1);
-            } else {
-                self.weight = t;
-            }
+            // Already transposed to [in_features, out_features] by converter
+            self.weight = Tensor::new(data.clone(), shape.clone(), false);
         } else {
             panic!("Missing weight: {}", weight_key);
         }
@@ -160,12 +156,13 @@ impl LinearHead {
 /// - h: image height in pixels
 /// - w: image width in pixels
 ///
-/// Activations:
-/// - pts3d: norm_exp -- normalize direction to unit vector, then scale by exp(norm)
-///   to get distance. Specifically for each pixel's (x, y, z):
-///     norm = sqrt(x^2 + y^2 + z^2)
-///     direction = (x/norm, y/norm, z/norm)
-///     pts3d = direction * exp(norm)
+/// Activations (matching the reference MUSt3R/DUSt3R implementation):
+/// - pts3d: norm_exp -- normalize direction to unit vector, then scale by expm1(norm).
+///   Specifically for each pixel's (x, y, z):
+///     d = sqrt(x^2 + y^2 + z^2)
+///     direction = (x/d, y/d, z/d)
+///     pts3d = direction * (exp(d) - 1)
+///   This is `apply_exp_to_norm` from must3r/tools/geometry.py using torch.expm1.
 /// - conf: 1 + exp(raw_conf) (always positive, minimum 1.0)
 pub fn postprocess(pointmap_data: &[f32], h: usize, w: usize) -> Pointmap {
     let num_pixels = h * w;
@@ -192,19 +189,16 @@ pub fn postprocess(pointmap_data: &[f32], h: usize, w: usize) -> Pointmap {
         let py = pointmap_data[base + 1];
         let pz = pointmap_data[base + 2];
 
-        // norm_exp activation: normalize direction, scale by exp(norm)
-        let norm = (px * px + py * py + pz * pz).sqrt();
-        if norm > 1e-8 {
-            let scale = norm.exp() / norm;
+        // norm_exp activation: direction * expm1(norm)
+        // Reference: apply_exp_to_norm(xyz) = (xyz / d.clip(1e-8)) * expm1(d)
+        let d = (px * px + py * py + pz * pz).sqrt();
+        if d > 1e-8 {
+            let scale = (d.exp() - 1.0) / d; // expm1(d) / d
             pts3d[i * 3] = px * scale;
             pts3d[i * 3 + 1] = py * scale;
             pts3d[i * 3 + 2] = pz * scale;
-        } else {
-            // Near-zero vector: exp(0) = 1, direction is arbitrary
-            pts3d[i * 3] = 1.0;
-            pts3d[i * 3 + 1] = 0.0;
-            pts3d[i * 3 + 2] = 0.0;
         }
+        // else: leave as zeros (expm1(0) = 0)
 
         // Raw pts3d_local channels [3..6] (no activation, kept raw)
         pts3d_local[i * 3] = pointmap_data[base + 3];

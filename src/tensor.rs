@@ -43,6 +43,7 @@ extern "C" {
 #[cfg(target_os = "macos")]
 #[link(name = "Accelerate", kind = "framework")]
 extern "C" {
+    fn vvexpf(result: *mut f32, input: *const f32, count: *const i32);
     fn vvsinhf(result: *mut f32, input: *const f32, count: *const i32);
     fn vvcoshf(result: *mut f32, input: *const f32, count: *const i32);
     fn vvasinf(result: *mut f32, input: *const f32, count: *const i32);
@@ -51,7 +52,7 @@ extern "C" {
 
 /// Safe wrapper around cblas_sgemm. Computes C = alpha * op(A) * op(B) + beta * C.
 #[cfg(target_os = "macos")]
-pub(crate) fn sgemm(
+pub fn sgemm(
     trans_a: bool, trans_b: bool,
     m: usize, n: usize, k: usize,
     alpha: f32, a: &[f32], lda: usize,
@@ -68,6 +69,206 @@ pub(crate) fn sgemm(
             b.as_ptr(), ldb as i32,
             beta, c.as_mut_ptr(), ldc as i32,
         );
+    }
+}
+
+/// Strided sgemm: like sgemm but operates on a sub-slice of contiguous data.
+/// `a_offset`, `b_offset`, `c_offset` are element offsets into the full slices.
+/// This avoids creating sub-slices and allows batched attention without copying.
+#[cfg(target_os = "macos")]
+#[inline]
+pub fn sgemm_strided(
+    trans_a: bool, trans_b: bool,
+    m: usize, n: usize, k: usize,
+    alpha: f32, a: &[f32], lda: usize, a_offset: usize,
+    b: &[f32], ldb: usize, b_offset: usize,
+    beta: f32, c: &mut [f32], ldc: usize, c_offset: usize,
+) {
+    unsafe {
+        cblas_sgemm(
+            CBLAS_ROW_MAJOR,
+            if trans_a { CBLAS_TRANS } else { CBLAS_NO_TRANS },
+            if trans_b { CBLAS_TRANS } else { CBLAS_NO_TRANS },
+            m as i32, n as i32, k as i32,
+            alpha, a.as_ptr().add(a_offset), lda as i32,
+            b.as_ptr().add(b_offset), ldb as i32,
+            beta, c.as_mut_ptr().add(c_offset), ldc as i32,
+        );
+    }
+}
+
+/// In-place softmax over rows of a contiguous buffer.
+/// `data[offset..offset + rows * cols]` is treated as a `[rows, cols]` matrix.
+/// Each row is independently softmax-normalized.
+///
+/// On macOS/aarch64: uses NEON for max-reduction and normalization,
+/// and Accelerate vvexpf for bulk vectorized exp.
+#[inline]
+pub fn softmax_rows_inplace(data: &mut [f32], offset: usize, rows: usize, cols: usize) {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        use std::arch::aarch64::*;
+        for r in 0..rows {
+            let row_start = offset + r * cols;
+            let row = &mut data[row_start..row_start + cols];
+
+            // NEON max-reduction
+            let chunks = cols / 4;
+            let mut max_vec = unsafe { vdupq_n_f32(f32::NEG_INFINITY) };
+            let ptr = row.as_ptr();
+            for i in 0..chunks {
+                let v = unsafe { vld1q_f32(ptr.add(i * 4)) };
+                max_vec = unsafe { vmaxq_f32(max_vec, v) };
+            }
+            let mut max_val = unsafe { vmaxvq_f32(max_vec) };
+            for i in (chunks * 4)..cols {
+                if row[i] > max_val { max_val = row[i]; }
+            }
+
+            // Subtract max in-place (NEON), then bulk vvexpf
+            let max_splat = unsafe { vdupq_n_f32(max_val) };
+            let mptr = row.as_mut_ptr();
+            for i in 0..chunks {
+                let v = unsafe { vld1q_f32(mptr.add(i * 4)) };
+                let shifted = unsafe { vsubq_f32(v, max_splat) };
+                unsafe { vst1q_f32(mptr.add(i * 4), shifted) };
+            }
+            for i in (chunks * 4)..cols {
+                row[i] -= max_val;
+            }
+
+            // vvexpf: exp(row) in-place
+            let n = cols as i32;
+            unsafe { vvexpf(mptr, mptr as *const f32, &n) };
+
+            // NEON sum-reduction
+            let mut sum_vec = unsafe { vdupq_n_f32(0.0) };
+            for i in 0..chunks {
+                let v = unsafe { vld1q_f32(mptr.add(i * 4)) };
+                sum_vec = unsafe { vaddq_f32(sum_vec, v) };
+            }
+            let mut sum = unsafe { vaddvq_f32(sum_vec) };
+            for i in (chunks * 4)..cols {
+                sum += row[i];
+            }
+
+            // NEON normalize
+            let inv_sum = 1.0 / sum;
+            let inv_splat = unsafe { vdupq_n_f32(inv_sum) };
+            for i in 0..chunks {
+                let v = unsafe { vld1q_f32(mptr.add(i * 4)) };
+                let normed = unsafe { vmulq_f32(v, inv_splat) };
+                unsafe { vst1q_f32(mptr.add(i * 4), normed) };
+            }
+            for i in (chunks * 4)..cols {
+                row[i] *= inv_sum;
+            }
+        }
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        for r in 0..rows {
+            let row_start = offset + r * cols;
+            let row = &mut data[row_start..row_start + cols];
+            let mut max_val = f32::NEG_INFINITY;
+            for &v in row.iter() {
+                if v > max_val { max_val = v; }
+            }
+            let mut sum = 0.0f32;
+            for v in row.iter_mut() {
+                *v = (*v - max_val).exp();
+                sum += *v;
+            }
+            let inv_sum = 1.0 / sum;
+            for v in row.iter_mut() {
+                *v *= inv_sum;
+            }
+        }
+    }
+}
+
+/// Multi-head attention computed in parallel across heads.
+///
+/// Q, K, V are `[total_bh * seq, head_dim]` contiguous buffers (all heads concatenated).
+/// Returns a flat `Vec<f32>` of `[total_bh * seq_q * head_dim]` with each head's output.
+///
+/// Each head independently computes `softmax(Q_h @ K_h^T * scale) @ V_h`.
+/// Heads are processed in parallel using rayon when the sequence is large enough.
+pub fn multi_head_attention(
+    q: &[f32], k: &[f32], v: &[f32],
+    total_bh: usize,
+    seq_q: usize, seq_kv: usize, head_dim: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let head_q_size = seq_q * head_dim;
+    let head_s_size = seq_q * seq_kv;
+
+    // Use parallel iterator for large sequences (attention-dominated workload)
+    if seq_q * seq_kv >= 4096 {
+        use rayon::prelude::*;
+        let mut attn_out = vec![0.0f32; total_bh * head_q_size];
+
+        // Split output into per-head slices and process in parallel
+        attn_out
+            .par_chunks_mut(head_q_size)
+            .enumerate()
+            .for_each(|(bh, out_slice)| {
+                let qk_off = bh * head_q_size;
+                let kv_off = bh * seq_kv * head_dim;
+                let mut scores = vec![0.0f32; head_s_size];
+
+                sgemm_strided(
+                    false, true,
+                    seq_q, seq_kv, head_dim,
+                    scale, q, head_dim, qk_off,
+                    k, head_dim, kv_off,
+                    0.0, &mut scores, seq_kv, 0,
+                );
+
+                softmax_rows_inplace(&mut scores, 0, seq_q, seq_kv);
+
+                // Write directly into the pre-allocated output slice
+                sgemm(
+                    false, false,
+                    seq_q, head_dim, seq_kv,
+                    1.0, &scores, seq_kv,
+                    &v[kv_off..kv_off + seq_kv * head_dim], head_dim,
+                    0.0, out_slice, head_dim,
+                );
+            });
+
+        attn_out
+    } else {
+        // Sequential for small sequences (overhead of parallel > benefit)
+        let mut attn_out = vec![0.0f32; total_bh * head_q_size];
+        let mut scores = vec![0.0f32; head_s_size];
+
+        for bh in 0..total_bh {
+            let qk_off = bh * head_q_size;
+            let kv_off = bh * seq_kv * head_dim;
+            let o_off = bh * head_q_size;
+
+            sgemm_strided(
+                false, true,
+                seq_q, seq_kv, head_dim,
+                scale, q, head_dim, qk_off,
+                k, head_dim, kv_off,
+                0.0, &mut scores, seq_kv, 0,
+            );
+
+            softmax_rows_inplace(&mut scores, 0, seq_q, seq_kv);
+
+            sgemm_strided(
+                false, false,
+                seq_q, head_dim, seq_kv,
+                1.0, &scores, seq_kv, 0,
+                v, head_dim, kv_off,
+                0.0, &mut attn_out, head_dim, o_off,
+            );
+        }
+
+        attn_out
     }
 }
 
@@ -1995,26 +2196,117 @@ impl Tensor {
 
         let mut data = vec![0.0f32; inner.data.len()];
 
-        for o in 0..outer {
-            for i in 0..inner_size {
-                let base = o * dim_size * inner_size + i;
-                let mut max_val = f32::NEG_INFINITY;
-                for d in 0..dim_size {
-                    let idx = base + d * inner_size;
-                    if inner.data[idx] > max_val {
-                        max_val = inner.data[idx];
+        // Fast NEON path: softmax over last dim (inner_size == 1), contiguous slices
+        #[cfg(target_arch = "aarch64")]
+        if inner_size == 1 {
+            use std::arch::aarch64::*;
+            let src = &inner.data;
+            for o in 0..outer {
+                let base = o * dim_size;
+                let slice = &src[base..base + dim_size];
+                let out = &mut data[base..base + dim_size];
+                let chunks = dim_size / 4;
+                let tail = chunks * 4;
+
+                // Pass 1: find max via NEON vmaxq_f32
+                let mut vmax = unsafe { vdupq_n_f32(f32::NEG_INFINITY) };
+                unsafe {
+                    for c in 0..chunks {
+                        let v = vld1q_f32(slice.as_ptr().add(c * 4));
+                        vmax = vmaxq_f32(vmax, v);
                     }
                 }
-                let mut sum_exp = 0.0f32;
-                for d in 0..dim_size {
-                    let idx = base + d * inner_size;
-                    let e = (inner.data[idx] - max_val).exp();
-                    data[idx] = e;
+                // Horizontal max of the 4 lanes
+                let mut max_val = unsafe { vmaxvq_f32(vmax) };
+                for j in tail..dim_size {
+                    if slice[j] > max_val { max_val = slice[j]; }
+                }
+
+                // Pass 2: exp(x - max) and accumulate sum
+                let vmax_splat = unsafe { vdupq_n_f32(max_val) };
+                let mut vsum = unsafe { vdupq_n_f32(0.0) };
+                unsafe {
+                    for c in 0..chunks {
+                        let off = c * 4;
+                        let v = vld1q_f32(slice.as_ptr().add(off));
+                        let shifted = vsubq_f32(v, vmax_splat);
+                        let e = simd_kernels::fast_exp_f32x4(shifted);
+                        vst1q_f32(out.as_mut_ptr().add(off), e);
+                        vsum = vaddq_f32(vsum, e);
+                    }
+                }
+                let mut sum_exp: f32 = unsafe { vaddvq_f32(vsum) };
+                for j in tail..dim_size {
+                    let e = (slice[j] - max_val).exp();
+                    out[j] = e;
                     sum_exp += e;
                 }
-                for d in 0..dim_size {
-                    let idx = base + d * inner_size;
-                    data[idx] /= sum_exp;
+
+                // Pass 3: normalize by 1/sum
+                let inv_sum = 1.0 / sum_exp;
+                let vinv = unsafe { vdupq_n_f32(inv_sum) };
+                unsafe {
+                    for c in 0..chunks {
+                        let off = c * 4;
+                        let v = vld1q_f32(out.as_ptr().add(off));
+                        vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(v, vinv));
+                    }
+                }
+                for j in tail..dim_size {
+                    out[j] *= inv_sum;
+                }
+            }
+        }
+        // Scalar fallback: non-aarch64, or inner_size != 1 (non-contiguous softmax dim)
+        #[cfg(target_arch = "aarch64")]
+        if inner_size != 1 {
+            for o in 0..outer {
+                for i in 0..inner_size {
+                    let base = o * dim_size * inner_size + i;
+                    let mut max_val = f32::NEG_INFINITY;
+                    for d in 0..dim_size {
+                        let idx = base + d * inner_size;
+                        if inner.data[idx] > max_val {
+                            max_val = inner.data[idx];
+                        }
+                    }
+                    let mut sum_exp = 0.0f32;
+                    for d in 0..dim_size {
+                        let idx = base + d * inner_size;
+                        let e = (inner.data[idx] - max_val).exp();
+                        data[idx] = e;
+                        sum_exp += e;
+                    }
+                    for d in 0..dim_size {
+                        let idx = base + d * inner_size;
+                        data[idx] /= sum_exp;
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for o in 0..outer {
+                for i in 0..inner_size {
+                    let base = o * dim_size * inner_size + i;
+                    let mut max_val = f32::NEG_INFINITY;
+                    for d in 0..dim_size {
+                        let idx = base + d * inner_size;
+                        if inner.data[idx] > max_val {
+                            max_val = inner.data[idx];
+                        }
+                    }
+                    let mut sum_exp = 0.0f32;
+                    for d in 0..dim_size {
+                        let idx = base + d * inner_size;
+                        let e = (inner.data[idx] - max_val).exp();
+                        data[idx] = e;
+                        sum_exp += e;
+                    }
+                    for d in 0..dim_size {
+                        let idx = base + d * inner_size;
+                        data[idx] /= sum_exp;
+                    }
                 }
             }
         }
@@ -2182,20 +2474,87 @@ impl Tensor {
         let mut inv_std = vec![0.0f32; num_instances];
         let mut data = vec![0.0f32; total];
 
-        for inst in 0..num_instances {
-            let offset = inst * normalized_shape;
-            let slice = &inner.data[offset..offset + normalized_shape];
+        // NEON-accelerated single-pass LayerNorm
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            let n = normalized_shape;
+            let n_f32 = n as f32;
+            let chunks = n / 4;
+            let tail = chunks * 4;
 
-            let mean: f32 = slice.iter().sum::<f32>() / normalized_shape as f32;
-            let var: f32 = slice.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>()
-                / normalized_shape as f32;
-            let istd = 1.0 / (var + eps).sqrt();
-            inv_std[inst] = istd;
+            for inst in 0..num_instances {
+                let offset = inst * n;
+                let slice = &inner.data[offset..offset + n];
+                let norm_out = &mut normalized[offset..offset + n];
+                let data_out = &mut data[offset..offset + n];
 
-            for j in 0..normalized_shape {
-                let norm_val = (slice[j] - mean) * istd;
-                normalized[offset + j] = norm_val;
-                data[offset + j] = norm_val * g.data[j] + b.data[j];
+                // Single-pass: accumulate sum and sum-of-squares via NEON
+                let mut vsum = unsafe { vdupq_n_f32(0.0) };
+                let mut vsum2 = unsafe { vdupq_n_f32(0.0) };
+                unsafe {
+                    for c in 0..chunks {
+                        let off = c * 4;
+                        let v = vld1q_f32(slice.as_ptr().add(off));
+                        vsum = vaddq_f32(vsum, v);
+                        vsum2 = vfmaq_f32(vsum2, v, v); // sum2 += v * v
+                    }
+                }
+                let mut sum_val: f32 = unsafe { vaddvq_f32(vsum) };
+                let mut sum2_val: f32 = unsafe { vaddvq_f32(vsum2) };
+                for j in tail..n {
+                    sum_val += slice[j];
+                    sum2_val += slice[j] * slice[j];
+                }
+
+                let mean = sum_val / n_f32;
+                // var = E[x^2] - E[x]^2
+                let var = sum2_val / n_f32 - mean * mean;
+                let istd = 1.0 / (var + eps).sqrt();
+                inv_std[inst] = istd;
+
+                // Fused normalize + scale + shift pass via NEON
+                let vmean = unsafe { vdupq_n_f32(mean) };
+                let vistd = unsafe { vdupq_n_f32(istd) };
+                unsafe {
+                    for c in 0..chunks {
+                        let off = c * 4;
+                        let v = vld1q_f32(slice.as_ptr().add(off));
+                        let vg = vld1q_f32(g.data.as_ptr().add(off));
+                        let vb = vld1q_f32(b.data.as_ptr().add(off));
+                        // norm = (x - mean) * istd
+                        let norm = vmulq_f32(vsubq_f32(v, vmean), vistd);
+                        vst1q_f32(norm_out.as_mut_ptr().add(off), norm);
+                        // out = norm * gamma + beta
+                        let out = vfmaq_f32(vb, norm, vg); // beta + norm * gamma
+                        vst1q_f32(data_out.as_mut_ptr().add(off), out);
+                    }
+                }
+                for j in tail..n {
+                    let norm_val = (slice[j] - mean) * istd;
+                    norm_out[j] = norm_val;
+                    data_out[j] = norm_val * g.data[j] + b.data[j];
+                }
+            }
+        }
+        // Scalar fallback for non-aarch64
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for inst in 0..num_instances {
+                let offset = inst * normalized_shape;
+                let slice = &inner.data[offset..offset + normalized_shape];
+
+                let mean: f32 = slice.iter().sum::<f32>() / normalized_shape as f32;
+                let var: f32 = slice.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>()
+                    / normalized_shape as f32;
+                let istd = 1.0 / (var + eps).sqrt();
+                inv_std[inst] = istd;
+
+                for j in 0..normalized_shape {
+                    let norm_val = (slice[j] - mean) * istd;
+                    normalized[offset + j] = norm_val;
+                    data[offset + j] = norm_val * g.data[j] + b.data[j];
+                }
             }
         }
 
@@ -2217,26 +2576,51 @@ impl Tensor {
         // Backward will still use gelu_backward_f32 if gpu_grad path is active.
         let inner = self.0.borrow();
         let len = inner.data.len();
+        let src = &inner.data[..]; // plain &[f32] — Send+Sync for rayon
         let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-        if len >= PAR_THRESHOLD_EXPENSIVE {
-            let data: Vec<f32> = inner.data.par_iter().map(|&x| {
-                let inner_val = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-                0.5 * x * (1.0 + inner_val.tanh())
-            }).collect();
-            Tensor::from_op(data, inner.shape.clone(), Op::Gelu(self.clone()))
-        } else {
-            let mut data = pool_get(len);
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            {
-                // Fast path: use Accelerate vvtanhf for the tanh step, then NEON combine
+        let mut data = pool_get(len);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            // Fast path: vvtanhf + NEON combine, parallelized per-chunk for large tensors.
+            // Each rayon chunk does its own prep → vvtanhf → NEON combine pipeline.
+            if len >= PAR_THRESHOLD_EXPENSIVE {
+                const CHUNK: usize = 32768; // 128KB per chunk — fits in L1/L2
+                let src_chunks: Vec<&[f32]> = src.chunks(CHUNK).collect();
+                let out_chunks: Vec<&mut [f32]> = data.chunks_mut(CHUNK).collect();
+                src_chunks.into_par_iter().zip(out_chunks).for_each(|(s, d)| {
+                    let clen = s.len();
+                    let mut tmp = vec![0.0f32; clen];
+                    for i in 0..clen {
+                        let x = s[i];
+                        tmp[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                    }
+                    let n = clen as i32;
+                    unsafe { vvtanhf(d.as_mut_ptr(), tmp.as_ptr(), &n); }
+                    unsafe {
+                        use std::arch::aarch64::*;
+                        let half = vdupq_n_f32(0.5);
+                        let one = vdupq_n_f32(1.0);
+                        let simd_chunks = clen / 4;
+                        for i in 0..simd_chunks {
+                            let off = i * 4;
+                            let vx = vld1q_f32(s.as_ptr().add(off));
+                            let vt = vld1q_f32(d.as_ptr().add(off));
+                            let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, vt)));
+                            vst1q_f32(d.as_mut_ptr().add(off), result);
+                        }
+                        for i in (simd_chunks * 4)..clen {
+                            d[i] = 0.5 * s[i] * (1.0 + d[i]);
+                        }
+                    }
+                });
+            } else {
                 let mut inner_buf = pool_get(len);
                 for i in 0..len {
-                    let x = inner.data[i];
+                    let x = src[i];
                     inner_buf[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
                 }
                 let n = len as i32;
                 unsafe { vvtanhf(data.as_mut_ptr(), inner_buf.as_ptr(), &n); }
-                // data now holds tanh values; combine: 0.5 * x * (1 + tanh_result)
                 unsafe {
                     use std::arch::aarch64::*;
                     let half = vdupq_n_f32(0.5);
@@ -2244,30 +2628,38 @@ impl Tensor {
                     let chunks = len / 4;
                     for i in 0..chunks {
                         let off = i * 4;
-                        let vx = vld1q_f32(inner.data.as_ptr().add(off));
+                        let vx = vld1q_f32(src.as_ptr().add(off));
                         let vt = vld1q_f32(data.as_ptr().add(off));
                         let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, vt)));
                         vst1q_f32(data.as_mut_ptr().add(off), result);
                     }
                     for i in (chunks * 4)..len {
-                        data[i] = 0.5 * inner.data[i] * (1.0 + data[i]);
+                        data[i] = 0.5 * src[i] * (1.0 + data[i]);
                     }
                 }
                 pool_recycle(inner_buf);
             }
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            {
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            if len >= PAR_THRESHOLD_EXPENSIVE {
+                data.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    let x = src[i];
+                    let inner_val = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                    *out = 0.5 * x * (1.0 + inner_val.tanh());
+                });
+            } else {
                 #[cfg(target_arch = "aarch64")]
-                simd_kernels::vec_gelu_f32(&inner.data, &mut data);
+                simd_kernels::vec_gelu_f32(src, &mut data);
                 #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..len {
-                    let x = inner.data[i];
+                    let x = src[i];
                     let inner_val = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
                     data[i] = 0.5 * x * (1.0 + inner_val.tanh());
                 }
             }
-            Tensor::from_op(data, inner.shape.clone(), Op::Gelu(self.clone()))
         }
+        Tensor::from_op(data, inner.shape.clone(), Op::Gelu(self.clone()))
     }
 
     pub fn sub(&self, other: &Tensor) -> Tensor {

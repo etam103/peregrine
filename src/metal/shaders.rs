@@ -215,12 +215,26 @@ kernel void log1p_f32(
     out[idx] = log(1.0f + a[idx]);
 }
 
+// Abramowitz & Stegun approximation (max error ~1.5e-7)
+float erf_approx(float x) {
+    float ax = abs(x);
+    float t = 1.0f / (1.0f + 0.3275911f * ax);
+    float t2 = t * t;
+    float t3 = t2 * t;
+    float t4 = t3 * t;
+    float t5 = t4 * t;
+    float poly = 0.254829592f * t - 0.284496736f * t2 + 1.421413741f * t3
+               - 1.453152027f * t4 + 1.061405429f * t5;
+    float result = 1.0f - poly * exp(-ax * ax);
+    return x >= 0.0f ? result : -result;
+}
+
 kernel void erf_f32(
     device const float* a [[buffer(0)]],
     device float* out      [[buffer(1)]],
     uint idx [[thread_position_in_grid]])
 {
-    out[idx] = erf(a[idx]);
+    out[idx] = erf_approx(a[idx]);
 }
 
 float erfinv_approx(float x) {

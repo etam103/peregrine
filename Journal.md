@@ -1040,3 +1040,102 @@ Remaining performance gaps: logaddexp (2.6x vs PyTorch — needs vForce log1p), 
 2. **NEON for axis reductions** — sum_axis, mean_axis are 3x slower than MLX. Vectorized reduction with horizontal adds would help.
 3. **vForce for more transcendentals** — logaddexp needs `vvlog1pf`, exp could use `vvexpf` instead of the NEON polynomial approximation.
 4. **GPU Philox random** — still deferred; new distributions (gamma, poisson) are inherently sequential but multinomial could benefit from GPU parallel CDF construction.
+
+---
+
+## MUSt3R Inference Performance Sprint (2026-02-27)
+
+Target: Match or beat PyTorch CPU inference speed for the MUSt3R 3D reconstruction model (423M params, ViT-L encoder + ViT-B decoder).
+
+Starting point: Peregrine 1.87s vs PyTorch 0.67s at 224 (2.8x slower), 10.45s vs 2.26s at 512 (4.6x slower), weight loading 264.7s vs 1.6s (165x slower).
+
+### Round 1: Weight Loading (378x)
+
+**Changes:**
+- `src/serial.rs`: BufReader + bulk tensor read (one `read_exact` per tensor, not per element)
+- Bulk write via byte reinterpret slice
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Weight load | 264.7s | 0.7s |
+| Speedup | — | 378x |
+
+### Round 2: Batched Attention + NEON Softmax/LayerNorm
+
+**Changes:**
+- `src/tensor.rs`: `sgemm_strided()`, `softmax_rows_inplace()`, `multi_head_attention()` (sequential)
+- `src/simd_kernels.rs`: made `fast_exp_f32x4` pub
+- NEON softmax in Tensor::softmax, single-pass Welford LayerNorm with NEON
+- Replaced per-head Tensor allocations with direct pointer math
+
+| Resolution | Before | After |
+|-----------|--------|-------|
+| 224 | 1.87s | 1.35s |
+| 512 | 10.45s | 7.64s |
+
+### Round 3: Transpose + Score Buffer Fix
+
+**Changes:**
+- Direct transpose loop replacing Tensor::transpose(1,2).reshape()
+- Score buffer reduced from [total_bh * seq * seq] to [seq * seq] (reused per head)
+
+| Resolution | Before | After |
+|-----------|--------|-------|
+| 224 | 1.35s | 0.96s |
+| 512 | 7.64s | 6.26s |
+
+### Round 4: Parallel Multi-Head Attention
+
+**Changes:**
+- `multi_head_attention()` with rayon par_iter for large sequences (seq_q * seq_kv >= 4096)
+- Sequential fallback for small sequences
+
+| Resolution | Before | After |
+|-----------|--------|-------|
+| 224 | 0.96s | 0.92s |
+| 512 | 6.26s | 3.40s |
+
+### Round 5: NEON+vvexpf Softmax, Fused QKV, Parallel Attention Allocation
+
+**Changes:**
+- `softmax_rows_inplace()`: NEON max-reduction + Accelerate vvexpf + NEON normalize
+- Fused QKV split+reshape: single pass eliminating 3 temp Vec allocations
+- `multi_head_attention()`: pre-allocated output with par_chunks_mut (no Vec<Vec<f32>>)
+
+| Resolution | Before | After |
+|-----------|--------|-------|
+| 224 | 0.92s | 0.88s |
+| 512 | 3.40s | 2.50s |
+
+### Round 6: Chunked Parallel GELU Fix
+
+**Changes:**
+- Fixed GELU large-tensor path: was using scalar `.tanh()` via rayon, bypassing vvtanhf+NEON
+- Now uses chunked parallel pipeline (32K chunks): each rayon thread runs prep -> vvtanhf -> NEON combine
+
+| Resolution | Before | After |
+|-----------|--------|-------|
+| 224 | 0.88s | 0.82s |
+| 512 | 2.50s | 2.36s |
+
+### Round 7: Batched Encoder + Decoder
+
+**Changes:**
+- `model.rs`: Both images processed in single encoder pass (batch=2) — eliminates warmup penalty, doubles GEMM sizes
+- `decoder.rs`: Self-attention and FFN process both views together (batch=2), cross-attention stays separate
+- Batched feature embedding, final LayerNorm
+
+| Resolution | Before | After | PyTorch |
+|-----------|--------|-------|---------|
+| 224 | 0.82s | **0.67s** | 0.67s |
+| 512 | 2.36s | **1.98s** | 2.26s |
+
+### Summary
+
+| Metric | Start | Final | PyTorch | Total Speedup |
+|--------|-------|-------|---------|---------------|
+| Weight load | 264.7s | 0.6s | 1.6s | 441x |
+| Inference 224 | 1.87s | 0.67s | 0.67s | 2.8x |
+| Inference 512 | 10.45s | 1.98s | 2.26s | 5.3x |
+
+All optimizations use the same Apple Accelerate BLAS (cblas_sgemm) as PyTorch. The remaining gains came from eliminating overhead in non-matmul operations: vectorized softmax/GELU, fused data layout transforms, parallel attention, batched encoder/decoder, and allocation reduction.

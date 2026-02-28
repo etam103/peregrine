@@ -4,14 +4,14 @@
 //! Model file: `[num_tensors: u32][name_len: u32][name: utf8]...[tensor]...`
 
 use crate::tensor::Tensor;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 /// Save named parameters to a binary file.
 pub fn save_model(
     params: &[(String, &Tensor)],
     path: &str,
 ) -> std::io::Result<()> {
-    let mut file = std::fs::File::create(path)?;
+    let mut file = BufWriter::new(std::fs::File::create(path)?);
 
     // Number of tensors
     file.write_all(&(params.len() as u32).to_le_bytes())?;
@@ -29,11 +29,12 @@ pub fn save_model(
             file.write_all(&(s as u32).to_le_bytes())?;
         }
 
-        // Data
+        // Data — bulk write via byte reinterpret
         let data = tensor.data();
-        for &v in &data {
-            file.write_all(&v.to_le_bytes())?;
-        }
+        let byte_slice = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+        };
+        file.write_all(byte_slice)?;
     }
 
     Ok(())
@@ -41,7 +42,7 @@ pub fn save_model(
 
 /// Load named parameters from a binary file. Returns (name, shape, data) triples.
 pub fn load_model(path: &str) -> std::io::Result<Vec<(String, Vec<usize>, Vec<f32>)>> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = BufReader::new(std::fs::File::open(path)?);
     let mut buf4 = [0u8; 4];
 
     // Number of tensors
@@ -68,13 +69,14 @@ pub fn load_model(path: &str) -> std::io::Result<Vec<(String, Vec<usize>, Vec<f3
             shape.push(u32::from_le_bytes(buf4) as usize);
         }
 
-        // Data
+        // Data — bulk read via byte reinterpret
         let num_elements: usize = shape.iter().product();
-        let mut data = Vec::with_capacity(num_elements);
-        for _ in 0..num_elements {
-            file.read_exact(&mut buf4)?;
-            data.push(f32::from_le_bytes(buf4));
-        }
+        let mut byte_buf = vec![0u8; num_elements * 4];
+        file.read_exact(&mut byte_buf)?;
+        let data: Vec<f32> = byte_buf
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         result.push((name, shape, data));
     }

@@ -8,6 +8,7 @@
 // Two-view forward: img1 attends to img2 as memory, img2 attends to img1.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use peregrine::tensor::Tensor;
 
@@ -116,37 +117,27 @@ impl CachedDecoderBlock {
         let qkv = normed.matmul(&self.qkv_weight).add_bias(&self.qkv_bias);
         let qkv_data = qkv.data();
 
-        let total_tokens = batch * seq_len;
         let qkv_stride = 3 * embed_dim;
 
-        // Split into Q, K, V: each [batch * seq_len, embed_dim]
-        let mut q_data = Vec::with_capacity(total_tokens * embed_dim);
-        let mut k_data = Vec::with_capacity(total_tokens * embed_dim);
-        let mut v_data = Vec::with_capacity(total_tokens * embed_dim);
-
-        for t in 0..total_tokens {
-            let base = t * qkv_stride;
-            q_data.extend_from_slice(&qkv_data[base..base + embed_dim]);
-            k_data.extend_from_slice(&qkv_data[base + embed_dim..base + 2 * embed_dim]);
-            v_data.extend_from_slice(&qkv_data[base + 2 * embed_dim..base + 3 * embed_dim]);
-        }
-
-        // Reshape Q, K to [batch, num_heads, seq_len, head_dim] for RoPE application.
-        // Layout: [batch*seq_len, embed_dim] where embed_dim = num_heads * head_dim
-        // -> [batch, num_heads, seq_len, head_dim]
+        // Fused QKV split + reshape: directly from [batch*seq, 3*embed_dim]
+        // to Q,K,V each in [batch, num_heads, seq_len, head_dim] layout.
         let mut q_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
         let mut k_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
+        let mut v_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
 
         for b in 0..batch {
             for s in 0..seq_len {
-                let src_row = b * seq_len + s;
+                let src_token = b * seq_len + s;
+                let qkv_base = src_token * qkv_stride;
                 for h in 0..num_heads {
                     let dst_idx = ((b * num_heads + h) * seq_len + s) * head_dim;
-                    let src_idx = src_row * embed_dim + h * head_dim;
+                    let h_offset = h * head_dim;
                     q_heads[dst_idx..dst_idx + head_dim]
-                        .copy_from_slice(&q_data[src_idx..src_idx + head_dim]);
+                        .copy_from_slice(&qkv_data[qkv_base + h_offset..qkv_base + h_offset + head_dim]);
                     k_heads[dst_idx..dst_idx + head_dim]
-                        .copy_from_slice(&k_data[src_idx..src_idx + head_dim]);
+                        .copy_from_slice(&qkv_data[qkv_base + embed_dim + h_offset..qkv_base + embed_dim + h_offset + head_dim]);
+                    v_heads[dst_idx..dst_idx + head_dim]
+                        .copy_from_slice(&qkv_data[qkv_base + 2 * embed_dim + h_offset..qkv_base + 2 * embed_dim + h_offset + head_dim]);
                 }
             }
         }
@@ -177,54 +168,29 @@ impl CachedDecoderBlock {
             k_heads[start..end].copy_from_slice(&k_rotated);
         }
 
-        // Reshape V to [batch, num_heads, seq_len, head_dim] (same reorder as Q/K)
-        let mut v_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
+        // Multi-head attention (parallel for large sequences)
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let total_bh = batch * num_heads;
+
+        let attn_out_data = peregrine::tensor::multi_head_attention(
+            &q_heads, &k_heads, &v_heads,
+            total_bh, seq_len, seq_len, head_dim, scale,
+        );
+
+        // Direct transpose [batch, num_heads, seq_len, head_dim] -> [batch*seq_len, embed_dim]
+        let mut attn_flat_data = vec![0.0f32; batch * seq_len * embed_dim];
         for b in 0..batch {
             for s in 0..seq_len {
-                let src_row = b * seq_len + s;
+                let dst_row = b * seq_len + s;
                 for h in 0..num_heads {
-                    let dst_idx = ((b * num_heads + h) * seq_len + s) * head_dim;
-                    let src_idx = src_row * embed_dim + h * head_dim;
-                    v_heads[dst_idx..dst_idx + head_dim]
-                        .copy_from_slice(&v_data[src_idx..src_idx + head_dim]);
+                    let src_idx = ((b * num_heads + h) * seq_len + s) * head_dim;
+                    let dst_idx = dst_row * embed_dim + h * head_dim;
+                    attn_flat_data[dst_idx..dst_idx + head_dim]
+                        .copy_from_slice(&attn_out_data[src_idx..src_idx + head_dim]);
                 }
             }
         }
-
-        // Scaled dot-product attention per (batch, head)
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let mut attn_out_data = Vec::with_capacity(batch * num_heads * seq_len * head_dim);
-
-        for bh in 0..(batch * num_heads) {
-            let off = bh * seq_len * head_dim;
-
-            let q_slice = q_heads[off..off + seq_len * head_dim].to_vec();
-            let k_slice = k_heads[off..off + seq_len * head_dim].to_vec();
-            let v_slice = v_heads[off..off + seq_len * head_dim].to_vec();
-
-            let q_t = Tensor::new(q_slice, vec![seq_len, head_dim], false);
-            let k_t = Tensor::new(k_slice, vec![seq_len, head_dim], false);
-            let v_t = Tensor::new(v_slice, vec![seq_len, head_dim], false);
-
-            // scores = Q * K^T * scale: [seq_len, seq_len]
-            let k_transposed = k_t.transpose(0, 1);
-            let scores = q_t.matmul(&k_transposed).scale(scale);
-            let attn_weights = scores.softmax(-1);
-
-            // context = attn_weights * V: [seq_len, head_dim]
-            let context = attn_weights.matmul(&v_t);
-            attn_out_data.extend(context.data());
-        }
-
-        // attn_out_data is [batch, num_heads, seq_len, head_dim]
-        // Transpose back to [batch, seq_len, num_heads, head_dim] then flatten.
-        let attn_out = Tensor::new(
-            attn_out_data,
-            vec![batch, num_heads, seq_len, head_dim],
-            false,
-        );
-        let attn_out = attn_out.transpose(1, 2); // [batch, seq_len, num_heads, head_dim]
-        let attn_flat = attn_out.reshape(vec![batch * seq_len, embed_dim]);
+        let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_len, embed_dim], false);
 
         // Output projection
         let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
@@ -304,42 +270,29 @@ impl CachedDecoderBlock {
             }
         }
 
-        // Scaled dot-product cross-attention per (batch, head) -- NO RoPE
+        // Multi-head cross-attention (parallel for large sequences)
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let mut attn_out_data = Vec::with_capacity(batch * num_heads * seq_q * head_dim);
+        let total_bh = batch * num_heads;
 
-        for bh in 0..(batch * num_heads) {
-            let q_off = bh * seq_q * head_dim;
-            let k_off = bh * seq_kv * head_dim;
-            let v_off = bh * seq_kv * head_dim;
-
-            let q_slice = q_heads[q_off..q_off + seq_q * head_dim].to_vec();
-            let k_slice = k_heads[k_off..k_off + seq_kv * head_dim].to_vec();
-            let v_slice = v_heads[v_off..v_off + seq_kv * head_dim].to_vec();
-
-            let q_t = Tensor::new(q_slice, vec![seq_q, head_dim], false);
-            let k_t = Tensor::new(k_slice, vec![seq_kv, head_dim], false);
-            let v_t = Tensor::new(v_slice, vec![seq_kv, head_dim], false);
-
-            // scores = Q * K^T * scale: [seq_q, seq_kv]
-            let k_transposed = k_t.transpose(0, 1); // [head_dim, seq_kv]
-            let scores = q_t.matmul(&k_transposed).scale(scale);
-            let attn_weights = scores.softmax(-1);
-
-            // context = attn_weights * V: [seq_q, head_dim]
-            let context = attn_weights.matmul(&v_t);
-            attn_out_data.extend(context.data());
-        }
-
-        // attn_out_data is [batch, num_heads, seq_q, head_dim]
-        // Transpose back to [batch, seq_q, num_heads, head_dim] then flatten.
-        let attn_out = Tensor::new(
-            attn_out_data,
-            vec![batch, num_heads, seq_q, head_dim],
-            false,
+        let attn_out_data = peregrine::tensor::multi_head_attention(
+            &q_heads, &k_heads, &v_heads,
+            total_bh, seq_q, seq_kv, head_dim, scale,
         );
-        let attn_out = attn_out.transpose(1, 2); // [batch, seq_q, num_heads, head_dim]
-        let attn_flat = attn_out.reshape(vec![batch * seq_q, embed_dim]);
+
+        // Direct transpose [batch, num_heads, seq_q, head_dim] -> [batch*seq_q, embed_dim]
+        let mut attn_flat_data = vec![0.0f32; batch * seq_q * embed_dim];
+        for b in 0..batch {
+            for s in 0..seq_q {
+                let dst_row = b * seq_q + s;
+                for h in 0..num_heads {
+                    let src_idx = ((b * num_heads + h) * seq_q + s) * head_dim;
+                    let dst_idx = dst_row * embed_dim + h * head_dim;
+                    attn_flat_data[dst_idx..dst_idx + head_dim]
+                        .copy_from_slice(&attn_out_data[src_idx..src_idx + head_dim]);
+                }
+            }
+        }
+        let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_q, embed_dim], false);
 
         // Output projection
         let attn_proj = attn_flat
@@ -435,47 +388,53 @@ impl MUSt3RDecoder {
         seq_len: usize,
     ) -> (Tensor, Tensor) {
         let total_tokens = batch * seq_len;
+        let embed_dim = self.embed_dim;
 
-        // Project encoder features to decoder dimension
-        // [batch*seq, enc_dim] x [enc_dim, dec_dim] -> [batch*seq, dec_dim]
-        let feat1 = enc_feat1
-            .matmul(&self.feat_embed_weight)
-            .add_bias(&self.feat_embed_bias);
-        let feat2 = enc_feat2
-            .matmul(&self.feat_embed_weight)
-            .add_bias(&self.feat_embed_bias);
+        // Batch feature embedding: stack both encoder outputs, project once
+        let enc1_data = enc_feat1.data();
+        let enc2_data = enc_feat2.data();
+        let enc_dim = enc1_data.len() / total_tokens;
+        let mut enc_both_data = Vec::with_capacity(enc1_data.len() + enc2_data.len());
+        enc_both_data.extend_from_slice(&enc1_data);
+        enc_both_data.extend_from_slice(&enc2_data);
+        let enc_both = Tensor::new(enc_both_data, vec![2 * total_tokens, enc_dim], false);
+        let feat_both = enc_both.matmul(&self.feat_embed_weight).add_bias(&self.feat_embed_bias);
 
-        // Add image2_embed to feat2 to distinguish target from reference.
-        // image2_embed is [1, 1, embed_dim]; broadcast-add to [batch*seq, embed_dim].
+        // Split and add image2_embed to feat2
+        let feat_data = feat_both.data();
+        let half = total_tokens * embed_dim;
+        let feat1_data = &feat_data[..half];
         let img2_embed_data = self.image2_embed.data();
-        let feat2_data = feat2.data();
-        let mut feat2_with_embed = vec![0.0f32; total_tokens * self.embed_dim];
+        let mut feat2_with_embed = feat_data[half..].to_vec();
         for t in 0..total_tokens {
-            for d in 0..self.embed_dim {
-                feat2_with_embed[t * self.embed_dim + d] =
-                    feat2_data[t * self.embed_dim + d] + img2_embed_data[d];
+            for d in 0..embed_dim {
+                feat2_with_embed[t * embed_dim + d] += img2_embed_data[d];
             }
         }
 
-        // Process through decoder blocks
-        let mut feat1 = feat1;
-        let mut feat2 = Tensor::new(
-            feat2_with_embed,
-            vec![total_tokens, self.embed_dim],
-            false,
-        );
+        let mut feat1 = Tensor::new(feat1_data.to_vec(), vec![total_tokens, embed_dim], false);
+        let mut feat2 = Tensor::new(feat2_with_embed, vec![total_tokens, embed_dim], false);
+
+        let mut total_self_attn = 0.0f64;
+        let mut total_cross_attn = 0.0f64;
+        let mut total_ffn = 0.0f64;
 
         for block in &self.blocks {
-            // Self-attention with RoPE on own tokens
-            feat1 = block.forward_self_attn(
-                &feat1, pos1, &self.rope, batch, seq_len, self.num_heads,
+            // Batched self-attention: stack feat1/feat2, run once with batch=2.
+            // Both views use the same positions (same grid), so pos1 works for both.
+            let t0 = Instant::now();
+            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim);
+            let both = block.forward_self_attn(
+                &both, pos1, &self.rope, 2 * batch, seq_len, self.num_heads,
             );
-            feat2 = block.forward_self_attn(
-                &feat2, pos2, &self.rope, batch, seq_len, self.num_heads,
-            );
+            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim);
+            feat1 = f1;
+            feat2 = f2;
+            total_self_attn += t0.elapsed().as_secs_f64() * 1000.0;
 
             // Cross-attention: img1 attends to img2 as memory, and vice versa.
-            // Snapshot both states before cross-attention updates.
+            // Cannot batch — each view uses different memory (the other view).
+            let t0 = Instant::now();
             let mem1 = feat1.clone();
             let mem2 = feat2.clone();
             feat1 = block.forward_cross_attn(
@@ -484,17 +443,48 @@ impl MUSt3RDecoder {
             feat2 = block.forward_cross_attn(
                 &feat2, &mem1, batch, seq_len, seq_len, self.num_heads,
             );
+            total_cross_attn += t0.elapsed().as_secs_f64() * 1000.0;
 
-            // FFN
-            feat1 = block.forward_ffn(&feat1);
-            feat2 = block.forward_ffn(&feat2);
+            // Batched FFN: stack feat1/feat2, run once
+            let t0 = Instant::now();
+            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim);
+            let both = block.forward_ffn(&both);
+            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim);
+            feat1 = f1;
+            feat2 = f2;
+            total_ffn += t0.elapsed().as_secs_f64() * 1000.0;
         }
 
-        // Final layer norm
-        let out1 = feat1.layer_norm(&self.norm_weight, &self.norm_bias, self.embed_dim);
-        let out2 = feat2.layer_norm(&self.norm_weight, &self.norm_bias, self.embed_dim);
+        println!("    [Decoder profile] self_attn={:.1}ms cross_attn={:.1}ms ffn={:.1}ms",
+                 total_self_attn, total_cross_attn, total_ffn);
+
+        // Batched final layer norm
+        let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim);
+        let normed = both.layer_norm(&self.norm_weight, &self.norm_bias, embed_dim);
+        let (out1, out2) = Self::split_features(&normed, total_tokens, embed_dim);
 
         (out1, out2)
+    }
+
+    /// Stack two [tokens, dim] tensors into [2*tokens, dim].
+    #[inline]
+    fn stack_features(a: &Tensor, b: &Tensor, tokens: usize, dim: usize) -> Tensor {
+        let a_data = a.data();
+        let b_data = b.data();
+        let mut out = Vec::with_capacity(2 * tokens * dim);
+        out.extend_from_slice(&a_data);
+        out.extend_from_slice(&b_data);
+        Tensor::new(out, vec![2 * tokens, dim], false)
+    }
+
+    /// Split [2*tokens, dim] tensor into two [tokens, dim] tensors.
+    #[inline]
+    fn split_features(both: &Tensor, tokens: usize, dim: usize) -> (Tensor, Tensor) {
+        let data = both.data();
+        let half = tokens * dim;
+        let a = Tensor::new(data[..half].to_vec(), vec![tokens, dim], false);
+        let b = Tensor::new(data[half..].to_vec(), vec![tokens, dim], false);
+        (a, b)
     }
 
     /// Load pretrained weights from a parameter map.
@@ -516,15 +506,14 @@ impl MUSt3RDecoder {
     /// - "blocks_dec.{i}.mlp.fc2.weight" / ".bias"
     /// - "norm_dec.weight" / ".bias"
     ///
-    /// PyTorch Linear weights are [out_features, in_features]. Peregrine's matmul
-    /// expects [N, in] x [in, out], so all Linear weight matrices are transposed
-    /// during loading.
+    /// The converter (convert_must3r.py) transposes all 2D Linear weights from
+    /// PyTorch [out_features, in_features] to Peregrine [in_features, out_features].
+    /// Weights are loaded directly without runtime transposition.
     pub fn load_weights(&mut self, params: &HashMap<String, (Vec<usize>, Vec<f32>)>) {
         // Feature embedding (encoder -> decoder dimension)
-        // Weight: PyTorch [dec_dim, enc_dim] -> transpose to [enc_dim, dec_dim]
+        // Already transposed to [enc_dim, dec_dim] by converter
         if let Some((shape, data)) = params.get("feat_embed_enc_to_dec.weight") {
-            let pt_tensor = Tensor::new(data.clone(), shape.clone(), false);
-            self.feat_embed_weight = pt_tensor.transpose(0, 1);
+            self.feat_embed_weight = Tensor::new(data.clone(), shape.clone(), false);
         }
         if let Some((_s, data)) = params.get("feat_embed_enc_to_dec.bias") {
             self.feat_embed_bias = Tensor::new(data.clone(), vec![1, self.embed_dim], false);
@@ -549,19 +538,17 @@ impl MUSt3RDecoder {
                 block.norm1_bias = Tensor::new(data.clone(), vec![self.embed_dim], false);
             }
 
-            // QKV (fused): PyTorch [3*embed_dim, embed_dim] -> transpose to [embed_dim, 3*embed_dim]
+            // QKV (fused): already transposed to [embed_dim, 3*embed_dim] by converter
             if let Some((shape, data)) = params.get(&format!("{}.attn.qkv.weight", prefix)) {
-                let pt_tensor = Tensor::new(data.clone(), vec![shape[0], shape[1]], false);
-                block.qkv_weight = pt_tensor.transpose(0, 1);
+                block.qkv_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) = params.get(&format!("{}.attn.qkv.bias", prefix)) {
                 block.qkv_bias = Tensor::new(data.clone(), vec![1, 3 * self.embed_dim], false);
             }
 
-            // Output projection: PyTorch [embed_dim, embed_dim] -> transpose
+            // Output projection: already transposed to [embed_dim, embed_dim] by converter
             if let Some((shape, data)) = params.get(&format!("{}.attn.proj.weight", prefix)) {
-                let pt_tensor = Tensor::new(data.clone(), vec![shape[0], shape[1]], false);
-                block.proj_weight = pt_tensor.transpose(0, 1);
+                block.proj_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) = params.get(&format!("{}.attn.proj.bias", prefix)) {
                 block.proj_bias = Tensor::new(data.clone(), vec![1, self.embed_dim], false);
@@ -581,12 +568,11 @@ impl MUSt3RDecoder {
                 block.norm2_bias = Tensor::new(data.clone(), vec![self.embed_dim], false);
             }
 
-            // Cross-attn Q projection: PyTorch [embed_dim, embed_dim] -> transpose
+            // Cross-attn Q projection: already transposed by converter
             if let Some((shape, data)) =
                 params.get(&format!("{}.cross_attn.projq.weight", prefix))
             {
-                let pt_tensor = Tensor::new(data.clone(), vec![shape[0], shape[1]], false);
-                block.cross_projq_weight = pt_tensor.transpose(0, 1);
+                block.cross_projq_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) =
                 params.get(&format!("{}.cross_attn.projq.bias", prefix))
@@ -595,12 +581,11 @@ impl MUSt3RDecoder {
                     Tensor::new(data.clone(), vec![1, self.embed_dim], false);
             }
 
-            // Cross-attn K projection
+            // Cross-attn K projection: already transposed by converter
             if let Some((shape, data)) =
                 params.get(&format!("{}.cross_attn.projk.weight", prefix))
             {
-                let pt_tensor = Tensor::new(data.clone(), vec![shape[0], shape[1]], false);
-                block.cross_projk_weight = pt_tensor.transpose(0, 1);
+                block.cross_projk_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) =
                 params.get(&format!("{}.cross_attn.projk.bias", prefix))
@@ -609,12 +594,11 @@ impl MUSt3RDecoder {
                     Tensor::new(data.clone(), vec![1, self.embed_dim], false);
             }
 
-            // Cross-attn V projection
+            // Cross-attn V projection: already transposed by converter
             if let Some((shape, data)) =
                 params.get(&format!("{}.cross_attn.projv.weight", prefix))
             {
-                let pt_tensor = Tensor::new(data.clone(), vec![shape[0], shape[1]], false);
-                block.cross_projv_weight = pt_tensor.transpose(0, 1);
+                block.cross_projv_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) =
                 params.get(&format!("{}.cross_attn.projv.bias", prefix))
@@ -623,12 +607,11 @@ impl MUSt3RDecoder {
                     Tensor::new(data.clone(), vec![1, self.embed_dim], false);
             }
 
-            // Cross-attn output projection
+            // Cross-attn output projection: already transposed by converter
             if let Some((shape, data)) =
                 params.get(&format!("{}.cross_attn.proj.weight", prefix))
             {
-                let pt_tensor = Tensor::new(data.clone(), vec![shape[0], shape[1]], false);
-                block.cross_proj_weight = pt_tensor.transpose(0, 1);
+                block.cross_proj_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) =
                 params.get(&format!("{}.cross_attn.proj.bias", prefix))
@@ -645,19 +628,17 @@ impl MUSt3RDecoder {
                 block.norm3_bias = Tensor::new(data.clone(), vec![self.embed_dim], false);
             }
 
-            // MLP fc1: PyTorch [ffn_dim, embed_dim] -> transpose to [embed_dim, ffn_dim]
+            // MLP fc1: already transposed to [embed_dim, ffn_dim] by converter
             if let Some((shape, data)) = params.get(&format!("{}.mlp.fc1.weight", prefix)) {
-                let pt_tensor = Tensor::new(data.clone(), vec![shape[0], shape[1]], false);
-                block.mlp_fc1_weight = pt_tensor.transpose(0, 1);
+                block.mlp_fc1_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) = params.get(&format!("{}.mlp.fc1.bias", prefix)) {
                 block.mlp_fc1_bias = Tensor::new(data.clone(), vec![1, ffn_dim], false);
             }
 
-            // MLP fc2: PyTorch [embed_dim, ffn_dim] -> transpose to [ffn_dim, embed_dim]
+            // MLP fc2: already transposed to [ffn_dim, embed_dim] by converter
             if let Some((shape, data)) = params.get(&format!("{}.mlp.fc2.weight", prefix)) {
-                let pt_tensor = Tensor::new(data.clone(), vec![shape[0], shape[1]], false);
-                block.mlp_fc2_weight = pt_tensor.transpose(0, 1);
+                block.mlp_fc2_weight = Tensor::new(data.clone(), shape.clone(), false);
             }
             if let Some((_s, data)) = params.get(&format!("{}.mlp.fc2.bias", prefix)) {
                 block.mlp_fc2_bias =

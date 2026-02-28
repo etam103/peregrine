@@ -218,7 +218,7 @@ pub fn vec_relu_backward_f32(input: &[f32], grad: &[f32], out: &mut [f32]) {
 /// Relative error ~1.2e-7 over the full float32 range.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn fast_exp_f32x4(x: float32x4_t) -> float32x4_t {
+pub unsafe fn fast_exp_f32x4(x: float32x4_t) -> float32x4_t {
     // Clamp input to prevent overflow/underflow
     let min_val = vdupq_n_f32(-87.3365);
     let max_val = vdupq_n_f32(88.7228);

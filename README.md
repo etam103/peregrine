@@ -42,6 +42,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::metal`** | Metal GPU backend — 98 compute shaders, 30 dispatch methods, command batching, autograd integration, buffer pool (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
+| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512) |
 
 The entire library is ~25,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
@@ -207,6 +208,16 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 | train step 64 | **839.5** | 1247.3 | 788.1 | 8713.9 | 23717.2 | 5084.3 |
 
 Geometric mean ratio across 133 ops (lower = Peregrine faster): **PyTorch 0.95x**, **MLX 0.74x**, TensorFlow 0.55x, tinygrad 0.09x, JAX 0.68x. Peregrine wins 56 of 133 ops.
+
+### MUSt3R 3D Reconstruction (423M params, CPU, Apple Silicon)
+
+| Resolution | Peregrine | PyTorch | Ratio |
+|-----------|-----------|---------|-------|
+| 224x224 | **0.67s** | 0.67s | 1.00x |
+| 512x384 | **1.98s** | 2.26s | 0.88x |
+| Weight load | **0.6s** | 1.6s | 0.38x |
+
+Peregrine matches PyTorch at 224 and is 13% faster at 512 on this 423M parameter ViT model, using the same Accelerate BLAS. Optimizations: batched encoder/decoder, parallel multi-head attention, NEON+vvexpf softmax, chunked parallel GELU, fused QKV reshape.
 
 | Optimization | Impact |
 |-------------|--------|

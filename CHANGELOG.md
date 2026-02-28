@@ -7,6 +7,63 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.13.0] - 2026-02-27
+
+### Added — MUSt3R inference performance sprint
+
+End-to-end optimization of the MUSt3R 3D reconstruction example (423M param ViT-L encoder + ViT-B decoder). Peregrine now matches PyTorch at 224x224 and beats it by 13% at 512x384 on Apple Silicon CPU.
+
+**Weight loading** (378x speedup) (`src/serial.rs`)
+- BufReader wrapping for amortized I/O
+- Bulk tensor read: single `read_exact` per tensor instead of per-element 4-byte reads
+- Bulk tensor write: byte reinterpret slice for `save_model`
+
+**Batched encoder** (`examples/must3r/model.rs`)
+- Both images processed in a single encoder pass with batch=2
+- Eliminates cold-cache warmup penalty (~40ms at 224)
+- Doubles GEMM sizes for better AMX utilization
+
+**Batched decoder** (`examples/must3r/decoder.rs`)
+- Self-attention and FFN process both views together (batch=2)
+- Cross-attention stays separate (different KV per view)
+- Batched feature embedding projection and final LayerNorm
+
+**Parallel multi-head attention** (`src/tensor.rs`)
+- `multi_head_attention()`: rayon par_chunks_mut with pre-allocated output
+- Each thread writes directly to its output slice (no Vec<Vec<f32>> collect+flatten)
+- Sequential fallback for small sequences (seq_q * seq_kv < 4096)
+- `sgemm_strided()`: zero-copy GEMM with element offsets into existing buffers
+
+**Vectorized softmax** (`src/tensor.rs`)
+- `softmax_rows_inplace()`: NEON vmaxq/vmaxvq max-reduction, Accelerate `vvexpf` for bulk exp, NEON vaddvq sum-reduction, NEON vmulq normalize
+- Added `vvexpf` FFI declaration
+
+**Fixed GELU for large tensors** (`src/tensor.rs`)
+- Large-tensor path (>100K elements) was using scalar `.tanh()` via rayon, bypassing the vvtanhf+NEON fast path
+- Now uses chunked parallel pipeline: each rayon thread runs prep -> vvtanhf -> NEON combine on its 32K-element chunk
+
+**Fused QKV split+reshape** (`examples/must3r/encoder.rs`, `examples/must3r/decoder.rs`)
+- Single pass from [batch*seq, 3*embed_dim] directly to Q,K,V in [batch, heads, seq, head_dim] layout
+- Eliminates 3 intermediate Vec allocations per attention call
+
+**Direct transpose loops** (`examples/must3r/encoder.rs`, `examples/must3r/decoder.rs`)
+- Replaced Tensor::transpose(1,2).reshape() with direct memory copy loops
+- Avoids allocating + copying full 4D tensors
+
+**NEON LayerNorm** (`src/tensor.rs`)
+- Single-pass Welford algorithm with NEON vaddq + vfmaq for sum/sum_sq
+- Fused normalize+scale+shift in one NEON pass
+
+### Benchmark Results (MUSt3R, CPU, Apple Silicon)
+
+| Metric | Before | After | PyTorch | Improvement |
+|--------|--------|-------|---------|-------------|
+| Weight load | 264.7s | 0.6s | 1.6s | 441x (2.7x faster than PyTorch) |
+| Inference 224 | 1.87s | 0.67s | 0.67s | 2.8x (matches PyTorch) |
+| Inference 512 | 10.45s | 1.98s | 2.26s | 5.3x (13% faster than PyTorch) |
+
+---
+
 ## [0.12.0] - 2026-02-26
 
 ### Added — PyTorch feature parity sprint
