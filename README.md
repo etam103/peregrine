@@ -67,15 +67,17 @@ opt.zero_grad();
 
 ### Supported ops with autograd
 
-**Arithmetic:** add, sub, mul, div, neg, scale, maximum, minimum, power, logaddexp
-**Math:** exp, log, sqrt, abs, pow, sin, cos, tanh, sinh, cosh, reciprocal, square, rsqrt, erf, erfinv, expm1, log2, log10, log1p, arcsin, arccos, arctan, arcsinh, arccosh, arctanh, arctan2, degrees, radians, floor, ceil, round, sign
-**Activations:** relu, sigmoid, gelu, silu, softplus, mish, leaky_relu, elu, hard_tanh, relu6, hardswish, softsign, log_sigmoid, selu, celu, gelu_fast, softmin, glu, hard_shrink, soft_shrink, PReLU
-**Reductions:** sum, mean, softmax, log_softmax, sum_axis, mean_axis, max_axis, min_axis, var, std, prod_axis, logsumexp, cumsum, cumprod, argmax_axis, argmin_axis, topk, sort, argsort, any, all
-**Shape:** reshape, transpose, squeeze, unsqueeze, concat, select, flatten, stack, split, tril, triu, repeat, tile, pad, roll, take, diagonal, diag, trace, outer, inner, broadcast_to, expand_dims
-**Conditional:** clip, where, nan_to_num
-**Comparison:** equal, not_equal, greater, greater_equal, less, less_equal, logical_and, logical_or, logical_not, isnan, isinf, isfinite
-**Layers:** matmul, conv1d, conv2d, conv2d_strided, conv_transpose1d, conv_transpose2d, conv2d+relu+pool (fused), max_pool2d, max_pool2d_ext, avg_pool2d, add_bias, batch_norm, layer_norm, rms_norm, group_norm, instance_norm, upsample_nearest, upsample_bilinear, index_select
-**Loss:** bce_with_logits, cross_entropy, mse, l1, nll, smooth_l1, huber, kl_div, cosine_similarity, triplet, hinge, log_cosh, margin_ranking, gaussian_nll
+| Category | Ops |
+|----------|-----|
+| **Arithmetic** | `add` `sub` `mul` `div` `neg` `scale` `maximum` `minimum` `power` `logaddexp` |
+| **Math** | `exp` `log` `sqrt` `abs` `pow` `sin` `cos` `tanh` `sinh` `cosh` `reciprocal` `square` `rsqrt` `erf` `erfinv` `expm1` `log2` `log10` `log1p` `arcsin` `arccos` `arctan` `arcsinh` `arccosh` `arctanh` `arctan2` `degrees` `radians` `floor` `ceil` `round` `sign` |
+| **Activations** | `relu` `sigmoid` `gelu` `silu` `softplus` `mish` `leaky_relu` `elu` `hard_tanh` `relu6` `hardswish` `softsign` `log_sigmoid` `selu` `celu` `gelu_fast` `softmin` `glu` `hard_shrink` `soft_shrink` `PReLU` |
+| **Reductions** | `sum` `mean` `softmax` `log_softmax` `sum_axis` `mean_axis` `max_axis` `min_axis` `var` `std` `prod_axis` `logsumexp` `cumsum` `cumprod` `argmax_axis` `argmin_axis` `topk` `sort` `argsort` `any` `all` |
+| **Shape** | `reshape` `transpose` `squeeze` `unsqueeze` `concat` `select` `flatten` `stack` `split` `tril` `triu` `repeat` `tile` `pad` `roll` `take` `diagonal` `diag` `trace` `outer` `inner` `broadcast_to` `expand_dims` |
+| **Conditional** | `clip` `where` `nan_to_num` |
+| **Comparison** | `equal` `not_equal` `greater` `greater_equal` `less` `less_equal` `logical_and` `logical_or` `logical_not` `isnan` `isinf` `isfinite` |
+| **Layers** | `matmul` `conv1d` `conv2d` `conv2d_strided` `conv_transpose1d` `conv_transpose2d` `conv2d+relu+pool` `max_pool2d` `max_pool2d_ext` `avg_pool2d` `add_bias` `batch_norm` `layer_norm` `rms_norm` `group_norm` `instance_norm` `upsample_nearest` `upsample_bilinear` `index_select` |
+| **Loss** | `bce_with_logits` `cross_entropy` `mse` `l1` `nll` `smooth_l1` `huber` `kl_div` `cosine_similarity` `triplet` `hinge` `log_cosh` `margin_ranking` `gaussian_nll` |
 
 All ops support broadcasting where applicable.
 
