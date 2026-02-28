@@ -48,7 +48,7 @@ impl GpuContext {
             "add_f32", "sub_f32", "mul_f32", "div_f32",
             // Unary ops
             "neg_f32", "exp_f32", "log_f32", "sqrt_f32",
-            "relu_f32", "sigmoid_f32", "tanh_f32",
+            "relu_f32", "sigmoid_f32", "tanh_f32", "gelu_f32",
             "sin_f32", "cos_f32", "abs_f32",
             "reciprocal_f32", "square_f32", "rsqrt_f32",
             "floor_f32", "ceil_f32", "round_f32", "sign_f32",

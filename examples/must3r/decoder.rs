@@ -93,6 +93,38 @@ impl CachedDecoderBlock {
         }
     }
 
+    /// Upload all weight tensors to GPU.
+    #[cfg(feature = "metal")]
+    pub fn to_gpu(&self) {
+        // Self-attention
+        self.norm1_weight.to_gpu();
+        self.norm1_bias.to_gpu();
+        self.qkv_weight.to_gpu();
+        self.qkv_bias.to_gpu();
+        self.proj_weight.to_gpu();
+        self.proj_bias.to_gpu();
+        // Cross-attention
+        self.norm_y_weight.to_gpu();
+        self.norm_y_bias.to_gpu();
+        self.norm2_weight.to_gpu();
+        self.norm2_bias.to_gpu();
+        self.cross_projq_weight.to_gpu();
+        self.cross_projq_bias.to_gpu();
+        self.cross_projk_weight.to_gpu();
+        self.cross_projk_bias.to_gpu();
+        self.cross_projv_weight.to_gpu();
+        self.cross_projv_bias.to_gpu();
+        self.cross_proj_weight.to_gpu();
+        self.cross_proj_bias.to_gpu();
+        // FFN
+        self.norm3_weight.to_gpu();
+        self.norm3_bias.to_gpu();
+        self.mlp_fc1_weight.to_gpu();
+        self.mlp_fc1_bias.to_gpu();
+        self.mlp_fc2_weight.to_gpu();
+        self.mlp_fc2_bias.to_gpu();
+    }
+
     /// Self-attention with 2D RoPE.
     ///
     /// x: [batch * seq_len, embed_dim]
@@ -106,6 +138,7 @@ impl CachedDecoderBlock {
         batch: usize,
         seq_len: usize,
         num_heads: usize,
+        use_gpu: bool,
     ) -> Tensor {
         let embed_dim = self.embed_dim;
         let head_dim = embed_dim / num_heads;
@@ -192,8 +225,15 @@ impl CachedDecoderBlock {
         }
         let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_len, embed_dim], false);
 
+        // Upload attention output back to GPU for subsequent matmul ops
+        #[cfg(feature = "metal")]
+        if use_gpu { attn_flat.to_gpu(); }
+
         // Output projection
         let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
+
+        // Suppress unused variable warning when metal feature is off
+        let _ = use_gpu;
 
         // Residual connection
         x.add(&attn_proj)
@@ -212,6 +252,7 @@ impl CachedDecoderBlock {
         seq_q: usize,
         seq_kv: usize,
         num_heads: usize,
+        use_gpu: bool,
     ) -> Tensor {
         let embed_dim = self.embed_dim;
         let head_dim = embed_dim / num_heads;
@@ -294,10 +335,17 @@ impl CachedDecoderBlock {
         }
         let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_q, embed_dim], false);
 
+        // Upload attention output back to GPU for subsequent matmul ops
+        #[cfg(feature = "metal")]
+        if use_gpu { attn_flat.to_gpu(); }
+
         // Output projection
         let attn_proj = attn_flat
             .matmul(&self.cross_proj_weight)
             .add_bias(&self.cross_proj_bias);
+
+        // Suppress unused variable warning when metal feature is off
+        let _ = use_gpu;
 
         // Residual connection
         x.add(&attn_proj)
@@ -368,6 +416,20 @@ impl MUSt3RDecoder {
         }
     }
 
+    /// Upload all weight tensors to GPU.
+    #[cfg(feature = "metal")]
+    pub fn to_gpu(&self) {
+        self.feat_embed_weight.to_gpu();
+        self.feat_embed_bias.to_gpu();
+        // image2_embed is a small learnable param, upload it too
+        self.image2_embed.to_gpu();
+        for block in &self.blocks {
+            block.to_gpu();
+        }
+        self.norm_weight.to_gpu();
+        self.norm_bias.to_gpu();
+    }
+
     /// Two-view forward pass.
     ///
     /// - enc_feat1: [batch * seq_len, enc_embed_dim] encoder output for image 1 (reference)
@@ -376,6 +438,7 @@ impl MUSt3RDecoder {
     /// - pos2: flattened [seq_len, 2] position data (y, x) for image 2
     /// - batch: batch size
     /// - seq_len: number of patches per image
+    /// - use_gpu: whether GPU acceleration is active
     ///
     /// Returns: (decoded_feat1, decoded_feat2), each [batch * seq_len, embed_dim]
     pub fn forward(
@@ -383,9 +446,10 @@ impl MUSt3RDecoder {
         enc_feat1: &Tensor,
         enc_feat2: &Tensor,
         pos1: &[f32],
-        pos2: &[f32],
+        _pos2: &[f32],
         batch: usize,
         seq_len: usize,
+        use_gpu: bool,
     ) -> (Tensor, Tensor) {
         let total_tokens = batch * seq_len;
         let embed_dim = self.embed_dim;
@@ -398,6 +462,11 @@ impl MUSt3RDecoder {
         enc_both_data.extend_from_slice(&enc1_data);
         enc_both_data.extend_from_slice(&enc2_data);
         let enc_both = Tensor::new(enc_both_data, vec![2 * total_tokens, enc_dim], false);
+
+        // Upload encoder features to GPU for the matmul
+        #[cfg(feature = "metal")]
+        if use_gpu { enc_both.to_gpu(); }
+
         let feat_both = enc_both.matmul(&self.feat_embed_weight).add_bias(&self.feat_embed_bias);
 
         // Split and add image2_embed to feat2
@@ -423,11 +492,11 @@ impl MUSt3RDecoder {
             // Batched self-attention: stack feat1/feat2, run once with batch=2.
             // Both views use the same positions (same grid), so pos1 works for both.
             let t0 = Instant::now();
-            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim);
+            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, use_gpu);
             let both = block.forward_self_attn(
-                &both, pos1, &self.rope, 2 * batch, seq_len, self.num_heads,
+                &both, pos1, &self.rope, 2 * batch, seq_len, self.num_heads, use_gpu,
             );
-            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim);
+            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim, use_gpu);
             feat1 = f1;
             feat2 = f2;
             total_self_attn += t0.elapsed().as_secs_f64() * 1000.0;
@@ -438,52 +507,59 @@ impl MUSt3RDecoder {
             let mem1 = feat1.clone();
             let mem2 = feat2.clone();
             feat1 = block.forward_cross_attn(
-                &feat1, &mem2, batch, seq_len, seq_len, self.num_heads,
+                &feat1, &mem2, batch, seq_len, seq_len, self.num_heads, use_gpu,
             );
             feat2 = block.forward_cross_attn(
-                &feat2, &mem1, batch, seq_len, seq_len, self.num_heads,
+                &feat2, &mem1, batch, seq_len, seq_len, self.num_heads, use_gpu,
             );
             total_cross_attn += t0.elapsed().as_secs_f64() * 1000.0;
 
             // Batched FFN: stack feat1/feat2, run once
             let t0 = Instant::now();
-            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim);
+            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, use_gpu);
             let both = block.forward_ffn(&both);
-            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim);
+            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim, use_gpu);
             feat1 = f1;
             feat2 = f2;
             total_ffn += t0.elapsed().as_secs_f64() * 1000.0;
         }
 
-        println!("    [Decoder profile] self_attn={:.1}ms cross_attn={:.1}ms ffn={:.1}ms",
+        eprintln!("    [Decoder profile] self_attn={:.1}ms cross_attn={:.1}ms ffn={:.1}ms",
                  total_self_attn, total_cross_attn, total_ffn);
 
         // Batched final layer norm
-        let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim);
+        let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, use_gpu);
         let normed = both.layer_norm(&self.norm_weight, &self.norm_bias, embed_dim);
-        let (out1, out2) = Self::split_features(&normed, total_tokens, embed_dim);
+        let (out1, out2) = Self::split_features(&normed, total_tokens, embed_dim, use_gpu);
 
         (out1, out2)
     }
 
     /// Stack two [tokens, dim] tensors into [2*tokens, dim].
     #[inline]
-    fn stack_features(a: &Tensor, b: &Tensor, tokens: usize, dim: usize) -> Tensor {
+    fn stack_features(a: &Tensor, b: &Tensor, tokens: usize, dim: usize, use_gpu: bool) -> Tensor {
         let a_data = a.data();
         let b_data = b.data();
         let mut out = Vec::with_capacity(2 * tokens * dim);
         out.extend_from_slice(&a_data);
         out.extend_from_slice(&b_data);
-        Tensor::new(out, vec![2 * tokens, dim], false)
+        let t = Tensor::new(out, vec![2 * tokens, dim], false);
+        #[cfg(feature = "metal")]
+        if use_gpu { t.to_gpu(); }
+        let _ = use_gpu;
+        t
     }
 
     /// Split [2*tokens, dim] tensor into two [tokens, dim] tensors.
     #[inline]
-    fn split_features(both: &Tensor, tokens: usize, dim: usize) -> (Tensor, Tensor) {
+    fn split_features(both: &Tensor, tokens: usize, dim: usize, use_gpu: bool) -> (Tensor, Tensor) {
         let data = both.data();
         let half = tokens * dim;
         let a = Tensor::new(data[..half].to_vec(), vec![tokens, dim], false);
         let b = Tensor::new(data[half..].to_vec(), vec![tokens, dim], false);
+        #[cfg(feature = "metal")]
+        if use_gpu { a.to_gpu(); b.to_gpu(); }
+        let _ = use_gpu;
         (a, b)
     }
 

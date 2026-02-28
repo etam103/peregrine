@@ -702,6 +702,21 @@ kernel void tanh_backward_f32(
     out[idx] = grad[idx] * (1.0f - y * y);
 }
 
+// GELU forward: 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
+// Use precise:: math to prevent Metal compiler from pattern-matching
+// and replacing with a fast GELU approximation that can produce NaN.
+kernel void gelu_f32(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float x = input[idx];
+    float x3 = x * x * x;
+    float inner = 0.7978845608f * (x + 0.044715f * x3);
+    float t = precise::tanh(inner);
+    output[idx] = 0.5f * x * (1.0f + t);
+}
+
 // GELU backward: full derivative of GELU(x) = 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
 kernel void gelu_backward_f32(
     device const float* input   [[buffer(0)]],
@@ -713,7 +728,7 @@ kernel void gelu_backward_f32(
     float x3 = x * x * x;
     float sqrt_2_over_pi = 0.7978845608f; // sqrt(2/pi)
     float inner_val = sqrt_2_over_pi * (x + 0.044715f * x3);
-    float tanh_val = tanh(inner_val);
+    float tanh_val = precise::tanh(inner_val);
     float sech2 = 1.0f - tanh_val * tanh_val;
     float d_inner = sqrt_2_over_pi * (1.0f + 3.0f * 0.044715f * x * x);
     out[idx] = grad[idx] * (0.5f * (1.0f + tanh_val) + 0.5f * x * sech2 * d_inner);

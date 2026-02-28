@@ -6,29 +6,80 @@ mod model;
 
 use std::env;
 use std::time::Instant;
+use std::io::{self, BufRead, Write};
 use peregrine::tensor::Tensor;
 use model::MUSt3R;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 4 {
-        eprintln!("Usage: cargo run --example must3r --release -- <weights.bin> <image1> <image2> [size]");
-        eprintln!();
-        eprintln!("Convert PyTorch weights first:");
-        eprintln!("  python scripts/convert_must3r.py MUSt3R_224_cvpr.pth weights/must3r_224.bin");
-        eprintln!();
-        eprintln!("Optional [size] argument: image dimension (default 224, use 512 for MUSt3R_512)");
-        std::process::exit(1);
+    // Check for flags in args
+    let has_server = args.iter().any(|a| a == "--server");
+    let has_gpu = args.iter().any(|a| a == "--gpu");
+
+    // Filter out flags for positional arg parsing
+    let positional: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
+
+    if has_server {
+        // Server mode: <weights.bin> --server [--gpu]
+        if positional.is_empty() {
+            eprintln!("Usage: must3r <weights.bin> --server [--gpu]");
+            std::process::exit(1);
+        }
+        let weights_path = positional[0];
+        run_server(weights_path, has_gpu);
+    } else {
+        // Single-pair mode: <weights.bin> <image1> <image2> [size] [--gpu]
+        if positional.len() < 3 {
+            eprintln!("Usage: must3r <weights.bin> <image1> <image2> [size] [--gpu]");
+            eprintln!("       must3r <weights.bin> --server [--gpu]");
+            eprintln!();
+            eprintln!("Convert PyTorch weights first:");
+            eprintln!("  python scripts/convert_must3r.py MUSt3R_224_cvpr.pth weights/must3r_224.bin");
+            eprintln!();
+            eprintln!("Flags:");
+            eprintln!("  --server  Server mode: read pairs from stdin, write binary to stdout");
+            eprintln!("  --gpu     Use Metal GPU acceleration (requires --features metal)");
+            std::process::exit(1);
+        }
+        run_single_pair(&positional, has_gpu);
+    }
+}
+
+fn init_model(weights_path: &str, use_gpu: bool) -> MUSt3R {
+    #[cfg(feature = "metal")]
+    if use_gpu {
+        peregrine::metal::init_gpu().expect("Failed to initialize Metal GPU");
+        eprintln!("Metal GPU initialized");
+    }
+    #[cfg(not(feature = "metal"))]
+    if use_gpu {
+        eprintln!("Warning: --gpu flag ignored (not compiled with --features metal)");
     }
 
-    let weights_path = &args[1];
-    let img1_path = &args[2];
-    let img2_path = &args[3];
+    let t0 = Instant::now();
+    let mut model = MUSt3R::new();
+    model.load_weights(weights_path);
+    eprintln!("Model loaded in {:.1}s", t0.elapsed().as_secs_f32());
+
+    #[cfg(feature = "metal")]
+    if use_gpu {
+        let t0 = Instant::now();
+        model.to_gpu();
+        eprintln!("Weights uploaded to GPU in {:.1}s", t0.elapsed().as_secs_f32());
+    }
+
+    model
+}
+
+fn run_single_pair(positional: &[&String], use_gpu: bool) {
+    let weights_path = positional[0];
+    let img1_path = positional[1];
+    let img2_path = positional[2];
 
     // Image size: WxH format, default 224x224
-    let (img_w, img_h) = if args.len() > 4 {
-        let size_arg = &args[4];
+    let (img_w, img_h) = if positional.len() > 3 {
+        let size_arg = positional[3].as_str();
         if let Some(idx) = size_arg.find('x') {
             let w: usize = size_arg[..idx].parse().unwrap_or(224);
             let h: usize = size_arg[idx + 1..].parse().unwrap_or(224);
@@ -45,6 +96,7 @@ fn main() {
     println!("========================");
     println!("Model: MUSt3R (ViT-L encoder + ViT-B decoder)");
     println!("Image size: {}x{}", img_w, img_h);
+    if use_gpu { println!("GPU: enabled"); }
     println!();
 
     // Load and preprocess images
@@ -56,10 +108,7 @@ fn main() {
 
     // Create model and load weights
     println!("Loading model...");
-    let t0 = Instant::now();
-    let mut model = MUSt3R::new();
-    model.load_weights(weights_path);
-    println!("  Loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    let model = init_model(weights_path, use_gpu);
 
     // Count parameters
     // MUSt3R-224: ~400M parameters
@@ -68,7 +117,7 @@ fn main() {
     // Run inference
     println!("Running inference...");
     let t0 = Instant::now();
-    let (pm1, pm2) = model.forward(&img1, &img2, img_h, img_w);
+    let (pm1, pm2) = model.forward(&img1, &img2, img_h, img_w, use_gpu);
     let elapsed = t0.elapsed().as_secs_f32();
     println!("  Inference time: {:.2}s", elapsed);
 
@@ -84,9 +133,68 @@ fn main() {
 
     // Save pointmaps as binary for visualization
     let out_path = "must3r_output.bin";
-    save_pointmaps(&pm1, &pm2, out_path);
+    save_pointmaps_to_file(&pm1, &pm2, out_path);
     println!();
     println!("Pointmaps saved to {}", out_path);
+}
+
+fn run_server(weights_path: &str, use_gpu: bool) {
+    eprintln!("MUSt3R server mode");
+    let model = init_model(weights_path, use_gpu);
+    eprintln!("Ready, reading pairs from stdin...");
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+
+    for line in stdin.lock().lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse: <img1_path>\t<img2_path>\t<width>\t<height>
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 4 {
+            eprintln!("ERROR: expected 4 tab-separated fields, got {}", parts.len());
+            continue;
+        }
+
+        let img1_path = parts[0];
+        let img2_path = parts[1];
+        let width: usize = parts[2].parse().unwrap_or(224);
+        let height: usize = parts[3].parse().unwrap_or(224);
+
+        eprintln!("Processing: {} + {} ({}x{})", img1_path, img2_path, width, height);
+        let t0 = Instant::now();
+
+        let img1 = load_image(img1_path, width, height);
+        let img2 = load_image(img2_path, width, height);
+        let (pm1, pm2) = model.forward(&img1, &img2, height, width, use_gpu);
+
+        let elapsed = t0.elapsed().as_secs_f32();
+        eprintln!("  Done in {:.2}s", elapsed);
+
+        // Write binary response: [u32 H][u32 W][f32*H*W*3 pts1][f32*H*W conf1][f32*H*W*3 pts2][f32*H*W conf2]
+        write_pointmaps_binary(&mut stdout, &pm1, &pm2);
+        // Sentinel newline
+        stdout.write_all(b"\n").unwrap();
+        stdout.flush().unwrap();
+    }
+
+    eprintln!("Server shutting down.");
+}
+
+fn write_pointmaps_binary(w: &mut dyn Write, pm1: &head::Pointmap, pm2: &head::Pointmap) {
+    w.write_all(&(pm1.height as u32).to_le_bytes()).unwrap();
+    w.write_all(&(pm1.width as u32).to_le_bytes()).unwrap();
+    for &v in &pm1.pts3d { w.write_all(&v.to_le_bytes()).unwrap(); }
+    for &v in &pm1.conf { w.write_all(&v.to_le_bytes()).unwrap(); }
+    for &v in &pm2.pts3d { w.write_all(&v.to_le_bytes()).unwrap(); }
+    for &v in &pm2.conf { w.write_all(&v.to_le_bytes()).unwrap(); }
 }
 
 /// Load an image, resize to img_size x img_size, convert to [1, 3, H, W] tensor.
@@ -228,15 +336,7 @@ fn print_pointmap_stats(name: &str, pm: &head::Pointmap) {
              name, min_x, max_x, min_y, max_y, min_z, max_z, mean_conf);
 }
 
-fn save_pointmaps(pm1: &head::Pointmap, pm2: &head::Pointmap, path: &str) {
-    use std::io::Write;
+fn save_pointmaps_to_file(pm1: &head::Pointmap, pm2: &head::Pointmap, path: &str) {
     let mut f = std::fs::File::create(path).expect("Failed to create output file");
-
-    // Simple binary format: [H: u32][W: u32][pts3d: f32*H*W*3][conf: f32*H*W] x2
-    f.write_all(&(pm1.height as u32).to_le_bytes()).unwrap();
-    f.write_all(&(pm1.width as u32).to_le_bytes()).unwrap();
-    for &v in &pm1.pts3d { f.write_all(&v.to_le_bytes()).unwrap(); }
-    for &v in &pm1.conf { f.write_all(&v.to_le_bytes()).unwrap(); }
-    for &v in &pm2.pts3d { f.write_all(&v.to_le_bytes()).unwrap(); }
-    for &v in &pm2.conf { f.write_all(&v.to_le_bytes()).unwrap(); }
+    write_pointmaps_binary(&mut f, pm1, pm2);
 }

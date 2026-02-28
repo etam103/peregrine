@@ -39,17 +39,25 @@ impl MUSt3R {
             params.insert(name, (shape, data));
         }
 
-        println!("Loaded {} parameters from {}", params.len(), path);
+        eprintln!("Loaded {} parameters from {}", params.len(), path);
 
         self.encoder.load_weights(&params);
         self.decoder.load_weights(&params);
         self.head.load_weights(&params, "head_dec.proj");
     }
 
+    /// Upload all weight tensors to GPU.
+    #[cfg(feature = "metal")]
+    pub fn to_gpu(&self) {
+        self.encoder.to_gpu();
+        self.decoder.to_gpu();
+        self.head.to_gpu();
+    }
+
     /// Run two-view inference.
     /// img1, img2: [1, 3, H, W] tensors (normalized to [0,1], then ImageNet-standardized)
     /// Returns (pointmap1, pointmap2) for the two views.
-    pub fn forward(&self, img1: &Tensor, img2: &Tensor, height: usize, width: usize) -> (Pointmap, Pointmap) {
+    pub fn forward(&self, img1: &Tensor, img2: &Tensor, height: usize, width: usize, use_gpu: bool) -> (Pointmap, Pointmap) {
         let h_patches = height / self.patch_size;
         let w_patches = width / self.patch_size;
         let seq_len = h_patches * w_patches;
@@ -57,7 +65,7 @@ impl MUSt3R {
         // Batch both images: [1,3,H,W] + [1,3,H,W] -> [2,3,H,W]
         // Run encoder once with batch=2 instead of twice — eliminates warmup
         // penalty and doubles GEMM sizes for better AMX utilization.
-        println!("  Encoding both images (batched)...");
+        eprintln!("  Encoding both images (batched)...");
         let t = Instant::now();
         let img1_data = img1.data();
         let img2_data = img2.data();
@@ -65,7 +73,12 @@ impl MUSt3R {
         both_data.extend_from_slice(&img1_data);
         both_data.extend_from_slice(&img2_data);
         let img_both = Tensor::new(both_data, vec![2, 3, height, width], false);
-        let (enc_both, pos) = self.encoder.forward(&img_both, 2, height, width);
+
+        // Upload input to GPU if weights are GPU-resident
+        #[cfg(feature = "metal")]
+        if use_gpu { img_both.to_gpu(); }
+
+        let (enc_both, pos) = self.encoder.forward(&img_both, 2, height, width, use_gpu);
         let enc_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // Split encoder output: [2*seq_len, embed_dim] -> two [seq_len, embed_dim]
@@ -76,12 +89,12 @@ impl MUSt3R {
         let enc1 = Tensor::new(enc_data[..half].to_vec(), vec![seq_len, embed_dim], false);
         let enc2 = Tensor::new(enc_data[half..].to_vec(), vec![seq_len, embed_dim], false);
 
-        println!("  Decoding...");
+        eprintln!("  Decoding...");
         let t = Instant::now();
-        let (dec1, dec2) = self.decoder.forward(&enc1, &enc2, &pos, &pos, 1, seq_len);
+        let (dec1, dec2) = self.decoder.forward(&enc1, &enc2, &pos, &pos, 1, seq_len, use_gpu);
         let dec_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        println!("  Computing pointmaps...");
+        eprintln!("  Computing pointmaps...");
         let t = Instant::now();
         let raw1 = self.head.forward(&dec1, 1, h_patches, w_patches);
         let raw2 = self.head.forward(&dec2, 1, h_patches, w_patches);
@@ -89,10 +102,13 @@ impl MUSt3R {
         let pm2 = super::head::postprocess(&raw2.data(), height, width);
         let head_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-        println!();
-        println!("  [Profile] Encoder (batched): {:.1}ms", enc_ms);
-        println!("  [Profile] Decoder:           {:.1}ms", dec_ms);
-        println!("  [Profile] Head+postproc:     {:.1}ms", head_ms);
+        eprintln!();
+        eprintln!("  [Profile] Encoder (batched): {:.1}ms", enc_ms);
+        eprintln!("  [Profile] Decoder:           {:.1}ms", dec_ms);
+        eprintln!("  [Profile] Head+postproc:     {:.1}ms", head_ms);
+
+        // Suppress unused variable warning when metal feature is off
+        let _ = use_gpu;
 
         (pm1, pm2)
     }

@@ -7,6 +7,54 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.15.0] - 2026-02-28
+
+### Added — MUSt3R server mode, parallel workers, and Metal GPU inference
+
+Three performance features for the multi-view 3D reconstruction pipeline.
+
+**Server mode** (`examples/must3r/main.rs`)
+- `--server` flag: load weights once, read image pairs from stdin, write binary pointmaps to stdout
+- Protocol: tab-separated `<img1>\t<img2>\t<W>\t<H>\n` requests, binary response (`8 + 32*H*W` bytes)
+- Eliminates ~0.5s weight-loading overhead per pair (33s saved across 67 pairs)
+
+**Parallel workers** (`reconstruct_video.py`)
+- `--workers N` flag: spawns N server processes, distributes pairs across them via ThreadPoolExecutor
+- Each worker has its own model copy (~1.7GB); 4 workers = ~6.8GB RAM
+- `MUSt3RServer` class wraps `subprocess.Popen` for persistent stdin/stdout communication
+
+**Metal GPU inference** (`--features metal`, `--gpu` flag)
+- New `gelu_f32` Metal compute kernel for GPU-resident GELU activation
+- `to_gpu()` methods on all model components (encoder, decoder, head) to upload weights to GPU
+- `use_gpu: bool` threaded through forward calls; activations uploaded at encoder/decoder entry points
+- GPU dispatch for GELU in `tensor.rs` via `dispatch_unary` (same pattern as relu/sigmoid)
+
+### Fixed
+
+- **Metal GELU kernel NaN**: Metal's fast-math `tanh()` produced NaN for certain input values (~10.5) when used in the GELU computation pattern. Changed to `precise::tanh()` in both `gelu_f32` and `gelu_backward_f32` kernels. Root cause: the Metal compiler's fast GELU approximation has precision issues for large-ish inputs that compound through the `0.5 * x * (1 + tanh(inner))` expression.
+
+### Benchmark Results
+
+**Server mode vs subprocess-per-pair (CPU, Apple Silicon):**
+
+| Resolution | Subprocess | Server (warm) | Speedup |
+|-----------|----------:|-------------:|--------:|
+| 224x224 | ~0.57s/pair | ~0.51s/pair | 1.1x per pair |
+| 512x384 | ~1.90s/pair | ~1.81s/pair | 1.05x per pair |
+
+Server mode eliminates weight loading overhead. With parallel workers, wall-clock time scales near-linearly with worker count.
+
+**GPU vs CPU (server mode, Apple Silicon):**
+
+| Resolution | CPU | GPU | Note |
+|-----------|----:|----:|------|
+| 224x224 | 0.51s | 0.52s | Parity |
+| 512x384 | 1.83s | 1.82s | Parity |
+
+GPU mode produces byte-identical output to CPU. Performance is at parity due to decoder GPU↔CPU roundtrips in stack/split features and Apple's AMX-based sgemm matching the 16x16 tiled Metal matmul.
+
+---
+
 ## [0.14.0] - 2026-02-28
 
 ### Added — Multi-view global pose optimization for MUSt3R reconstruction

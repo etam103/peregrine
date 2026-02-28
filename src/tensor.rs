@@ -2572,8 +2572,23 @@ impl Tensor {
     }
 
     pub fn gelu(&self) -> Tensor {
-        // No GPU forward dispatch for GELU (no forward kernel yet — uses CPU path).
-        // Backward will still use gelu_backward_f32 if gpu_grad path is active.
+        #[cfg(feature = "metal")]
+        {
+            if self.0.borrow().gpu_data.is_some() {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let inner = self.0.borrow();
+                    let buf = inner.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(buf.len());
+                    gpu.dispatch_unary("gelu_f32", buf, &out);
+                    let shape = inner.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1, Op::Gelu(self.clone()));
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         let src = &inner.data[..]; // plain &[f32] — Send+Sync for rayon

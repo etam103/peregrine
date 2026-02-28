@@ -42,7 +42,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::metal`** | Metal GPU backend — 98 compute shaders, 30 dispatch methods, command batching, autograd integration, buffer pool (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
-| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
+| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), optional Metal GPU (`--gpu`). Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
 
 The entire library is ~25,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
@@ -221,10 +221,10 @@ Peregrine matches PyTorch at 224 and is 13% faster at 512 on this 423M parameter
 
 ### Multi-View Reconstruction Pipeline
 
-`reconstruct_video.py` extracts frames from video, runs all-pairs MUSt3R inference via Peregrine, then jointly optimizes camera poses and fuses pointmaps into a coherent 3D reconstruction.
+`reconstruct_video.py` extracts frames from video, runs all-pairs MUSt3R inference via Peregrine, then jointly optimizes camera poses and fuses pointmaps into a coherent 3D reconstruction. Supports server mode for persistent weight loading, parallel workers for multi-process inference, and optional Metal GPU acceleration.
 
 ```
-python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all
+python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all --workers 4
 ```
 
 | Mode | Pairs | Inference (12 frames) |
@@ -232,6 +232,8 @@ python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs a
 | consecutive | 11 | ~7s (224) |
 | dense | 31 | ~21s (224) |
 | all | 67 | ~45s (224), ~3min (512) |
+
+Server mode (`--server` flag on the Rust binary) loads weights once and processes pairs over stdin/stdout, eliminating ~0.5s overhead per pair. Parallel workers (`--workers N`) distribute pairs across N server processes for near-linear wall-clock scaling.
 
 | Optimization | Impact |
 |-------------|--------|

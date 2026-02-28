@@ -37,6 +37,12 @@ impl PatchEmbed {
         }
     }
 
+    #[cfg(feature = "metal")]
+    pub fn to_gpu(&self) {
+        self.weight.to_gpu();
+        self.bias.to_gpu();
+    }
+
     /// Forward pass for patch embedding.
     ///
     /// # Arguments
@@ -133,6 +139,22 @@ impl EncoderBlock {
         }
     }
 
+    #[cfg(feature = "metal")]
+    pub fn to_gpu(&self) {
+        self.norm1_weight.to_gpu();
+        self.norm1_bias.to_gpu();
+        self.qkv_weight.to_gpu();
+        self.qkv_bias.to_gpu();
+        self.proj_weight.to_gpu();
+        self.proj_bias.to_gpu();
+        self.norm2_weight.to_gpu();
+        self.norm2_bias.to_gpu();
+        self.mlp_fc1_weight.to_gpu();
+        self.mlp_fc1_bias.to_gpu();
+        self.mlp_fc2_weight.to_gpu();
+        self.mlp_fc2_bias.to_gpu();
+    }
+
     /// Forward pass for one encoder block.
     ///
     /// # Arguments
@@ -142,6 +164,7 @@ impl EncoderBlock {
     /// * `batch` - batch size
     /// * `seq_len` - sequence length (number of patches)
     /// * `num_heads` - number of attention heads
+    /// * `use_gpu` - whether to upload attention output back to GPU
     ///
     /// # Returns
     /// Tensor [batch * seq_len, embed_dim]
@@ -153,6 +176,7 @@ impl EncoderBlock {
         batch: usize,
         seq_len: usize,
         num_heads: usize,
+        use_gpu: bool,
     ) -> Tensor {
         let head_dim = self.embed_dim / num_heads;
         let t_block = Instant::now();
@@ -252,6 +276,10 @@ impl EncoderBlock {
         }
         let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_len, embed_dim], false);
 
+        // Upload attention output back to GPU for subsequent matmul ops
+        #[cfg(feature = "metal")]
+        if use_gpu { attn_flat.to_gpu(); }
+
         // Output projection
         let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
 
@@ -272,15 +300,18 @@ impl EncoderBlock {
         // Print profile for first encoder block only
         if !ENCODER_PROFILE_PRINTED.swap(true, Ordering::Relaxed) {
             let total = t_block.elapsed();
-            println!("    [Encoder block 0 profile] total={:.1}ms", total.as_secs_f64() * 1000.0);
-            println!("      norm1:    {:.2}ms", dt_norm1.as_secs_f64() * 1000.0);
-            println!("      qkv:     {:.2}ms", dt_qkv.as_secs_f64() * 1000.0);
-            println!("      reshape: {:.2}ms", dt_reshape.as_secs_f64() * 1000.0);
-            println!("      rope:    {:.2}ms", dt_rope.as_secs_f64() * 1000.0);
-            println!("      attn:    {:.2}ms", dt_attn.as_secs_f64() * 1000.0);
-            println!("      proj:    {:.2}ms", dt_proj.as_secs_f64() * 1000.0);
-            println!("      ffn:     {:.2}ms", dt_ffn.as_secs_f64() * 1000.0);
+            eprintln!("    [Encoder block 0 profile] total={:.1}ms", total.as_secs_f64() * 1000.0);
+            eprintln!("      norm1:    {:.2}ms", dt_norm1.as_secs_f64() * 1000.0);
+            eprintln!("      qkv:     {:.2}ms", dt_qkv.as_secs_f64() * 1000.0);
+            eprintln!("      reshape: {:.2}ms", dt_reshape.as_secs_f64() * 1000.0);
+            eprintln!("      rope:    {:.2}ms", dt_rope.as_secs_f64() * 1000.0);
+            eprintln!("      attn:    {:.2}ms", dt_attn.as_secs_f64() * 1000.0);
+            eprintln!("      proj:    {:.2}ms", dt_proj.as_secs_f64() * 1000.0);
+            eprintln!("      ffn:     {:.2}ms", dt_ffn.as_secs_f64() * 1000.0);
         }
+
+        // Suppress unused variable warning when metal feature is off
+        let _ = use_gpu;
 
         out
     }
@@ -326,6 +357,17 @@ impl Dust3rEncoder {
         }
     }
 
+    /// Upload all weight tensors to GPU.
+    #[cfg(feature = "metal")]
+    pub fn to_gpu(&self) {
+        self.patch_embed.to_gpu();
+        for block in &self.blocks {
+            block.to_gpu();
+        }
+        self.norm_weight.to_gpu();
+        self.norm_bias.to_gpu();
+    }
+
     /// Run encoder forward pass.
     ///
     /// # Arguments
@@ -333,6 +375,7 @@ impl Dust3rEncoder {
     /// * `batch` - batch size
     /// * `height` - image height
     /// * `width` - image width
+    /// * `use_gpu` - whether GPU acceleration is active
     ///
     /// # Returns
     /// (features, positions) where:
@@ -344,6 +387,7 @@ impl Dust3rEncoder {
         batch: usize,
         height: usize,
         width: usize,
+        use_gpu: bool,
     ) -> (Tensor, Vec<f32>) {
         let grid_h = height / self.patch_size;
         let grid_w = width / self.patch_size;
@@ -361,13 +405,20 @@ impl Dust3rEncoder {
         // Patch embedding: [batch, 3, H, W] -> [batch * seq_len, embed_dim]
         let mut x = self.patch_embed.forward(img, batch, 3, height, width);
 
+        // Upload patch embeddings to GPU if in GPU mode
+        #[cfg(feature = "metal")]
+        if use_gpu { x.to_gpu(); }
+
         // Encoder blocks
         for block in &self.blocks {
-            x = block.forward(&x, &positions, &self.rope, batch, seq_len, self.num_heads);
+            x = block.forward(&x, &positions, &self.rope, batch, seq_len, self.num_heads, use_gpu);
         }
 
         // Final LayerNorm
         let x = x.layer_norm(&self.norm_weight, &self.norm_bias, self.embed_dim);
+
+        // Suppress unused variable warning when metal feature is off
+        let _ = use_gpu;
 
         (x, positions)
     }

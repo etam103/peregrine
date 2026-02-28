@@ -53,6 +53,13 @@ impl LinearHead {
         }
     }
 
+    /// Upload weight tensors to GPU.
+    #[cfg(feature = "metal")]
+    pub fn to_gpu(&self) {
+        self.weight.to_gpu();
+        self.bias.to_gpu();
+    }
+
     /// Forward pass: project and unpatchify.
     ///
     /// - x: [batch * num_patches, embed_dim] decoder output

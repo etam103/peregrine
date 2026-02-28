@@ -7,7 +7,7 @@ system via global pose optimization, and produces an interactive 3D mesh.
 Usage:
     python3 reconstruct_video.py vids/out.mp4 --frames 12 --resolution 224
     python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 224 --pairs dense
-    python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 224 --pairs all
+    python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 224 --pairs all --workers 4
 """
 import argparse
 import struct
@@ -16,6 +16,7 @@ import sys
 import tempfile
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -90,6 +91,87 @@ def load_ppm(path):
         _ = f.readline()
         data = f.read()
     return np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)
+
+
+# ---------------------------------------------------------------------------
+# MUSt3R server process
+# ---------------------------------------------------------------------------
+
+class MUSt3RServer:
+    """Wraps a long-running MUSt3R binary in --server mode.
+
+    Loads weights once, then processes pairs via stdin/stdout.
+    """
+
+    def __init__(self, binary, weights_path, gpu=False):
+        cmd = [binary, weights_path, "--server"]
+        if gpu:
+            cmd.append("--gpu")
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Wait for "Ready" message on stderr
+        while True:
+            line = self.proc.stderr.readline().decode("utf-8", errors="replace")
+            if not line:
+                raise RuntimeError("MUSt3R server process terminated unexpectedly")
+            if "Ready" in line:
+                break
+
+    def run_pair(self, ppm1, ppm2, width, height):
+        """Send a pair request and read back the binary response."""
+        request = f"{ppm1}\t{ppm2}\t{width}\t{height}\n"
+        self.proc.stdin.write(request.encode())
+        self.proc.stdin.flush()
+
+        # Read binary response: [u32 H][u32 W][f32*H*W*3][f32*H*W][f32*H*W*3][f32*H*W]
+        n = width * height
+        response_size = 8 + (n * 3 * 4) + (n * 4) + (n * 3 * 4) + (n * 4)
+        response = b""
+        while len(response) < response_size:
+            chunk = self.proc.stdout.read(response_size - len(response))
+            if not chunk:
+                # Drain stderr for error info
+                err = self.proc.stderr.read().decode("utf-8", errors="replace")
+                raise RuntimeError(f"Server process died. stderr:\n{err}")
+            response += chunk
+
+        # Read the sentinel newline
+        self.proc.stdout.read(1)
+
+        # Parse response
+        H = struct.unpack("<I", response[0:4])[0]
+        W = struct.unpack("<I", response[4:8])[0]
+        offset = 8
+        pts1 = np.frombuffer(response[offset:offset + n * 3 * 4], dtype=np.float32).reshape(n, 3).copy()
+        offset += n * 3 * 4
+        conf1 = np.frombuffer(response[offset:offset + n * 4], dtype=np.float32).copy()
+        offset += n * 4
+        pts2 = np.frombuffer(response[offset:offset + n * 3 * 4], dtype=np.float32).reshape(n, 3).copy()
+        offset += n * 3 * 4
+        conf2 = np.frombuffer(response[offset:offset + n * 4], dtype=np.float32).copy()
+
+        return H, W, pts1, conf1, pts2, conf2
+
+    def close(self):
+        """Shut down the server process."""
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        self.proc.wait(timeout=10)
+
+    def drain_stderr(self):
+        """Read and print any accumulated stderr."""
+        import select
+        while select.select([self.proc.stderr], [], [], 0.0)[0]:
+            line = self.proc.stderr.readline()
+            if not line:
+                break
+            print(f"  [server] {line.decode('utf-8', errors='replace').rstrip()}")
 
 
 # ---------------------------------------------------------------------------
@@ -400,11 +482,11 @@ def filter_faces_by_confidence(conf, faces, conf_thresh):
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline
+# Legacy single-pair subprocess (fallback)
 # ---------------------------------------------------------------------------
 
 def run_pair(binary, weights_path, ppm1, ppm2, resolution, output_bin):
-    """Run MUSt3R on one pair of frames."""
+    """Run MUSt3R on one pair of frames (spawns a new process)."""
     cmd = [binary, weights_path, ppm1, ppm2, str(resolution)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -483,6 +565,11 @@ def main():
     parser.add_argument("--pairs", choices=["consecutive", "dense", "all"],
                         default="consecutive",
                         help="Pair selection mode (default: consecutive)")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of parallel server workers (default: 1 for consecutive, 4 for dense/all)")
+    parser.add_argument("--gpu", action="store_true", help="Use Metal GPU acceleration")
+    parser.add_argument("--no-server", action="store_true",
+                        help="Use legacy subprocess-per-pair mode (no server)")
     args = parser.parse_args()
 
     weights_path = args.weights or f"weights/must3r_{args.resolution}.bin"
@@ -492,6 +579,11 @@ def main():
     if not os.path.exists(args.binary):
         print(f"Binary not found: {args.binary}  (run: cargo build --example must3r --release)", file=sys.stderr)
         sys.exit(1)
+
+    # Default workers: 1 for consecutive, 4 for dense/all
+    n_workers = args.workers
+    if n_workers is None:
+        n_workers = 1 if args.pairs == "consecutive" else 4
 
     video_stem = os.path.splitext(os.path.basename(args.video))[0]
     output_html = args.output or f"vids/{video_stem}_multiview.html"
@@ -512,18 +604,87 @@ def main():
         view_colors = {}    # view_idx -> (H*W, 3) uint8
         H = W = None
 
-        for pi, (i, j) in enumerate(pairs):
-            print(f"\nPair {pi+1}/{len(pairs)}: frame {i} + frame {j}")
-            out_bin = os.path.join(tmp_dir, f"pair_{i}_{j}.bin")
-            run_pair(args.binary, weights_path, ppm_paths[i], ppm_paths[j],
-                     args.resolution, out_bin)
-            pH, pW, pts1, conf1, pts2, conf2 = load_pointmaps(out_bin)
-            H, W = pH, pW
-            pair_results[(i, j)] = (pts1, conf1, pts2, conf2, H, W)
-            if i not in view_colors:
-                view_colors[i] = load_ppm(ppm_paths[i]).reshape(-1, 3)
-            if j not in view_colors:
-                view_colors[j] = load_ppm(ppm_paths[j]).reshape(-1, 3)
+        if args.no_server:
+            # Legacy mode: one subprocess per pair
+            for pi, (i, j) in enumerate(pairs):
+                print(f"\nPair {pi+1}/{len(pairs)}: frame {i} + frame {j}")
+                out_bin = os.path.join(tmp_dir, f"pair_{i}_{j}.bin")
+                run_pair(args.binary, weights_path, ppm_paths[i], ppm_paths[j],
+                         args.resolution, out_bin)
+                pH, pW, pts1, conf1, pts2, conf2 = load_pointmaps(out_bin)
+                H, W = pH, pW
+                pair_results[(i, j)] = (pts1, conf1, pts2, conf2, H, W)
+                if i not in view_colors:
+                    view_colors[i] = load_ppm(ppm_paths[i]).reshape(-1, 3)
+                if j not in view_colors:
+                    view_colors[j] = load_ppm(ppm_paths[j]).reshape(-1, 3)
+        else:
+            # Server mode: persistent processes with optional parallelism
+            print(f"Starting {n_workers} server worker(s)...")
+            servers = []
+            try:
+                for wi in range(n_workers):
+                    print(f"  Worker {wi}: starting...")
+                    srv = MUSt3RServer(args.binary, weights_path, gpu=args.gpu)
+                    servers.append(srv)
+                    print(f"  Worker {wi}: ready")
+
+                if n_workers == 1:
+                    # Sequential: single server, simple loop
+                    server = servers[0]
+                    for pi, (i, j) in enumerate(pairs):
+                        print(f"\nPair {pi+1}/{len(pairs)}: frame {i} + frame {j}")
+                        pH, pW, pts1, conf1, pts2, conf2 = server.run_pair(
+                            ppm_paths[i], ppm_paths[j],
+                            args.resolution, args.resolution,
+                        )
+                        H, W = pH, pW
+                        pair_results[(i, j)] = (pts1, conf1, pts2, conf2, H, W)
+                        if i not in view_colors:
+                            view_colors[i] = load_ppm(ppm_paths[i]).reshape(-1, 3)
+                        if j not in view_colors:
+                            view_colors[j] = load_ppm(ppm_paths[j]).reshape(-1, 3)
+                else:
+                    # Parallel: distribute pairs across workers via ThreadPoolExecutor
+                    # Each thread talks to its own dedicated server (no sharing)
+                    def process_pair(server_idx, pair_idx, i, j):
+                        srv = servers[server_idx]
+                        pH, pW, pts1, conf1, pts2, conf2 = srv.run_pair(
+                            ppm_paths[i], ppm_paths[j],
+                            args.resolution, args.resolution,
+                        )
+                        return pair_idx, i, j, pH, pW, pts1, conf1, pts2, conf2
+
+                    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                        futures = {}
+                        for pi, (i, j) in enumerate(pairs):
+                            server_idx = pi % n_workers
+                            fut = pool.submit(process_pair, server_idx, pi, i, j)
+                            futures[fut] = (pi, i, j)
+
+                        for fut in as_completed(futures):
+                            pi, i, j = futures[fut]
+                            try:
+                                _, _, _, pH, pW, pts1, conf1, pts2, conf2 = fut.result()
+                            except Exception as e:
+                                print(f"ERROR on pair ({i}, {j}): {e}", file=sys.stderr)
+                                sys.exit(1)
+                            H, W = pH, pW
+                            pair_results[(i, j)] = (pts1, conf1, pts2, conf2, H, W)
+                            print(f"  Pair {pi+1}/{len(pairs)}: frame {i} + frame {j} done")
+
+                    # Load view colors after all pairs complete
+                    for (i, j) in pairs:
+                        if i not in view_colors:
+                            view_colors[i] = load_ppm(ppm_paths[i]).reshape(-1, 3)
+                        if j not in view_colors:
+                            view_colors[j] = load_ppm(ppm_paths[j]).reshape(-1, 3)
+            finally:
+                for srv in servers:
+                    try:
+                        srv.close()
+                    except Exception:
+                        pass
 
         # 4. Alignment
         if args.pairs == 'consecutive':
