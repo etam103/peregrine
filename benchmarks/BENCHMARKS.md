@@ -1,6 +1,6 @@
 # Peregrine Benchmarks
 
-**Date**: 2026-02-27
+**Date**: 2026-02-28
 **System**: Apple M1 Max, 10 cores, 64 GB RAM, arm64
 **Frameworks**: Peregrine (Rust), PyTorch 2.10.0, TensorFlow 2.20.0, JAX 0.9.0.1, MLX 0.30.6, TinyGrad
 **All benchmarks**: CPU only, median of 20-50 iterations
@@ -20,6 +20,28 @@ Model: 423M parameters (ViT-L encoder + ViT-B decoder), shared head.
 - **512**: Peregrine is **13% faster** (1.98s vs 2.26s)
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
+### Server Mode & Parallel Workers (v0.15.0)
+
+Server mode (`--server`) loads weights once and processes pairs over stdin/stdout, eliminating subprocess spawn + weight loading overhead per pair.
+
+| Resolution | Subprocess | Server (warm) | Speedup |
+|-----------|----------:|-------------:|--------:|
+| 224x224   | ~0.57s/pair | ~0.51s/pair | 1.1x |
+| 512x384   | ~1.90s/pair | ~1.81s/pair | 1.05x |
+
+With `--workers N` in `reconstruct_video.py`, pairs are distributed across N server processes for near-linear wall-clock scaling.
+
+### Metal GPU Inference (v0.15.0)
+
+GPU mode (`--gpu`, requires `--features metal`) dispatches matmul, layernorm, GELU, add, add_bias to Metal GPU.
+
+| Resolution | CPU (server) | GPU (server) | Note |
+|-----------|------------:|------------:|------|
+| 224x224   | ~0.51s      | ~0.52s      | Parity |
+| 512x384   | ~1.83s      | ~1.82s      | Parity |
+
+GPU is at parity (not faster) due to decoder GPU↔CPU roundtrips in stack/split features and Apple's AMX-based sgemm matching the tiled Metal matmul. GPU output is byte-identical to CPU.
+
 ### Optimizations applied
 1. **Weight loading** (378x): BufReader + bulk tensor reads instead of per-element syscalls
 2. **Batched encoder** (batch=2): Both images processed in a single encoder pass — eliminates warmup and doubles GEMM sizes
@@ -29,6 +51,8 @@ Model: 423M parameters (ViT-L encoder + ViT-B decoder), shared head.
 6. **Parallel chunked GELU**: Per-chunk vvtanhf + NEON combine pipeline via rayon (fixes scalar fallback for large tensors)
 7. **Fused QKV split+reshape**: Single pass from [batch*seq, 3*embed_dim] to [batch, heads, seq, head_dim] — eliminates 3 temp Vec allocations
 8. **Direct transpose loops**: Replaces Tensor::transpose() which allocated + copied full 4D tensors
+9. **Server mode**: Load weights once, process all pairs over stdin/stdout — eliminates ~0.5s overhead per pair
+10. **Metal GPU dispatch**: GELU, matmul, layernorm, add, add_bias on GPU (with `precise::tanh()` fix for GELU correctness)
 
 ## Op-Level Benchmarks — 6 Frameworks
 
@@ -309,9 +333,18 @@ python3 scripts/bench_jax.py
 python3 scripts/bench_mlx.py
 python3 scripts/bench_tinygrad.py
 
-# MUSt3R inference
+# MUSt3R inference (single pair)
 cargo run --example must3r --release -- weights/must3r_224.bin img1.ppm img2.ppm
-cargo run --example must3r --release -- weights/must3r_512.bin img1.ppm img2.ppm 512x448
+cargo run --example must3r --release -- weights/must3r_512.bin img1.ppm img2.ppm 512x384
+
+# MUSt3R server mode (multiple pairs, load weights once)
+echo -e "img1.ppm\timg2.ppm\t224\t224" | cargo run --example must3r --release -- weights/must3r_224.bin --server
+
+# MUSt3R with Metal GPU
+cargo run --example must3r --release --features metal -- weights/must3r_224.bin img1.ppm img2.ppm --gpu
+
+# Multi-view pipeline with parallel workers
+python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all --workers 4
 ```
 
 ## Raw Data
