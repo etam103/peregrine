@@ -7,6 +7,45 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.14.0] - 2026-02-28
+
+### Added — Multi-view global pose optimization for MUSt3R reconstruction
+
+New `reconstruct_video.py` script for multi-view 3D reconstruction from video using Peregrine's MUSt3R inference. Replaces pairwise Procrustes chaining with joint global optimization, eliminating drift and enabling loop closures.
+
+**Dense pair selection** (`reconstruct_video.py`)
+- `--pairs` flag: `consecutive` (N-1 pairs, original), `dense` (~3N pairs), `all` (N*(N-1)/2 pairs)
+- Dense mode adds skip-1 and skip-2 connections; all mode runs every pair
+- Ensures every view appears as first image in at least one pair for canonical pointmaps
+
+**Global pose optimization** (`reconstruct_video.py`)
+- Per-view parameters: rotation (axis-angle), translation, log-scale — 7 × (N-1) variables
+- Initialized from Procrustes chain on consecutive pairs
+- Constraints: for each pair (i,j), T_i(pts2) should match T_j(canonical pts1) — subsampled ~500 pixels per constraint
+- Solver: `scipy.optimize.least_squares(method='trf', loss='soft_l1')` — robust to outliers
+- Canonical pair selection: picks pair with highest mean confidence for each view
+
+**Point fusion** (`reconstruct_video.py`)
+- Confidence-weighted average of all predictions for each view's pixels across all pairs
+- Produces one clean fused pointmap per view, reducing noise from individual pair predictions
+
+**Visualization**
+- Plotly HTML output with scroll zoom enabled
+- Configurable confidence filtering (`--conf-percentile`), face limits (`--max-faces`), point cloud mode (`--points`)
+
+### Benchmark Results (MUSt3R multi-view, 12 frames, CPU, Apple Silicon)
+
+| Mode | Pairs | Inference | Optimization | Total |
+|------|------:|----------:|-------------:|------:|
+| consecutive (224) | 11 | ~7s | — | ~8s |
+| dense (224) | 31 | ~21s | ~1s | ~23s |
+| all (224) | 67 | ~45s | ~2s | ~48s |
+| all (512) | 67 | ~3min | ~3s | ~3.2min |
+
+Global optimization converges in 20-42 function evaluations. Cost reduction: 8-9x from initial Procrustes estimate.
+
+---
+
 ## [0.13.0] - 2026-02-27
 
 ### Added — MUSt3R inference performance sprint

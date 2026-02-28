@@ -42,7 +42,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::metal`** | Metal GPU backend — 98 compute shaders, 30 dispatch methods, command batching, autograd integration, buffer pool (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
-| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512) |
+| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
 
 The entire library is ~25,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
@@ -219,6 +219,20 @@ Geometric mean ratio across 133 ops (lower = Peregrine faster): **PyTorch 0.95x*
 
 Peregrine matches PyTorch at 224 and is 13% faster at 512 on this 423M parameter ViT model, using the same Accelerate BLAS. Optimizations: batched encoder/decoder, parallel multi-head attention, NEON+vvexpf softmax, chunked parallel GELU, fused QKV reshape.
 
+### Multi-View Reconstruction Pipeline
+
+`reconstruct_video.py` extracts frames from video, runs all-pairs MUSt3R inference via Peregrine, then jointly optimizes camera poses and fuses pointmaps into a coherent 3D reconstruction.
+
+```
+python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all
+```
+
+| Mode | Pairs | Inference (12 frames) |
+|------|------:|----------------------:|
+| consecutive | 11 | ~7s (224) |
+| dense | 31 | ~21s (224) |
+| all | 67 | ~45s (224), ~3min (512) |
+
 | Optimization | Impact |
 |-------------|--------|
 | Hand-tuned NEON intrinsics | 24 vectorized kernels — 4-6x speedup on elementwise ops |
@@ -253,6 +267,8 @@ src/
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
   wallclock.rs    wall-clock comparison benchmark (JSON output)
+reconstruct_video.py  multi-view 3D reconstruction pipeline (global pose optimization + point fusion)
+visualize_must3r.py   single-pair MUSt3R visualization utility
 scripts/
   bench_compare.sh    orchestrator: builds + runs all framework benchmarks
   bench_pytorch.py    PyTorch wall-clock benchmark

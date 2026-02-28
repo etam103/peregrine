@@ -4,3 +4,8 @@
 .env
 *.claude/worktrees/
 .claude/worktrees/
+vids/
+weights/
+__pycache__/
+.DS_Store
+*.pyc
