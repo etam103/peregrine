@@ -11,6 +11,8 @@ pub mod init;
 pub mod fft;
 pub mod linalg;
 pub mod transforms;
+pub mod rl;
+pub mod envs;
 
 #[cfg(feature = "metal")]
 pub mod metal;

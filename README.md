@@ -39,12 +39,15 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::transforms`** | Functional autograd utilities — grad, value_and_grad, checkpoint |
 | **`peregrine::serial`** | Save/load model weights in compact binary format |
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
+| **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
+| **`peregrine::envs`** | 10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe |
 | **`peregrine::metal`** | Metal GPU backend — 98 compute shaders, 30 dispatch methods, command batching, autograd integration, buffer pool (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 | **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), optional Metal GPU (`--gpu`). Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
+| **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
 
-The entire library is ~25,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
+The entire library is ~30,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
 ---
 
@@ -265,6 +268,8 @@ src/
   transforms.rs   functional autograd utilities (grad, value_and_grad, checkpoint)
   debug.rs        model summary + training health diagnostics
   serial.rs       model weight save/load (binary format)
+  rl.rs           RL algorithms — PPO, DQN, REINFORCE, replay/rollout buffers, Environment trait (~1,750 lines)
+  envs.rs         10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe (~2,150 lines)
   metal/          Metal GPU backend (98 shaders, 30 dispatch methods, command batching, autograd)
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
@@ -285,6 +290,8 @@ examples/
     main.rs         training loop + wandb visualization
     model.rs        ResNet backbone, RT-DETR net, loss, decode, NMS
     dataset.rs      VOC + COCO dataset loaders
+  rl_demo/        RL training demos with HTML animations
+    main.rs         PPO CartPole, DQN GridWorld, REINFORCE Arithmetic
 tests/
   pytorch_parity.rs   23 numerical parity tests vs PyTorch
   activations.rs      34 activation function tests

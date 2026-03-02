@@ -7,6 +7,54 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.16.0] - 2026-03-02
+
+### Added — Reinforcement learning module and interactive demos
+
+Full RL infrastructure built on Peregrine's tensor and autograd system: algorithms, environments, and interactive HTML visualizations.
+
+**RL algorithms** (`src/rl.rs` — ~1,750 lines)
+- `Environment` trait with `reset()`, `step()`, `render()`, observation/action spaces
+- `ReasoningEnv` trait for math/logic environments with `question()`, `answer()`, `score_answer()`
+- `Space` enum: `Discrete`, `Box`, `MultiDiscrete`, `MultiBinary` with `sample()` and `n()`
+- `ReplayBuffer` for off-policy methods (DQN) — ring buffer with batch sampling
+- `RolloutBuffer` for on-policy methods (PPO) — GAE advantage estimation, minibatch iteration
+- **REINFORCE** — Monte Carlo policy gradient with optional baseline (running mean return)
+  - `train_batch()` for batched episode collection and gradient updates
+- **PPO** (Proximal Policy Optimization) — clipped surrogate objective with GAE
+  - Configurable rollout steps, batch size, epochs, clip epsilon, entropy/value coefficients, max grad norm
+- **DQN** (Deep Q-Network) — epsilon-greedy exploration with target network
+  - Configurable epsilon decay, buffer size, batch size, gamma, target update frequency
+
+**RL environments** (`src/envs.rs` — ~2,150 lines)
+- Classic control: `CartPole`, `MountainCar`
+- Grid/navigation: `GridWorld` (configurable size, obstacles), `FrozenLake` (slippery grid)
+- Reasoning/math: `BasicArithmetic` (addition/subtraction/multiplication), `ChainArithmetic`, `NumberSorting`, `SequenceCompletion`
+- Logic: `PropositionalLogic` (boolean expression evaluation)
+- Game: `TicTacToe` (self-play)
+
+**Interactive demo** (`examples/rl_demo/main.rs`)
+- PPO on CartPole: pole-balancing animation (canvas), learning curves (Chart.js)
+- DQN on GridWorld: agent pathfinding animation with trail, grid visualization, step-by-step controls
+- REINFORCE on BasicArithmetic: flash-card style quiz animation with score tracking
+- All animations: play/pause, restart, speed controls (0.5x/1x/2x), dark theme
+- HTML output: `rl_cartpole.html`, `rl_cartpole_anim.html`, `rl_gridworld.html`, `rl_gridworld_anim.html`, `rl_arithmetic.html`, `rl_arithmetic_anim.html`
+
+```
+cargo run --example rl_demo --release               # PPO on CartPole
+cargo run --example rl_demo --release -- gridworld   # DQN on GridWorld
+cargo run --example rl_demo --release -- arithmetic  # REINFORCE on BasicArithmetic
+```
+
+### Stats
+
+- ~30,000 lines of Rust (up from ~25,000)
+- 3 RL algorithms (PPO, DQN, REINFORCE)
+- 10 RL environments
+- 6 interactive HTML visualizations (3 learning curves + 3 animations)
+
+---
+
 ## [0.15.0] - 2026-02-28
 
 ### Added — MUSt3R server mode, parallel workers, and Metal GPU inference

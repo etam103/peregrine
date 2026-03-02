@@ -53,3 +53,7 @@ path = "examples/mnist/main.rs"
 [[example]]
 name = "must3r"
 path = "examples/must3r/main.rs"
+
+[[example]]
+name = "rl_demo"
+path = "examples/rl_demo/main.rs"
