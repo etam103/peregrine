@@ -7,6 +7,57 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.17.0] - 2026-03-02
+
+### Added — Grok-1 (314B MoE Transformer) example
+
+Full implementation of the Grok-1 architecture as a Peregrine inference example, following the open-source JAX/Haiku reference model from xAI.
+
+**Architecture** (`examples/grok1/`)
+- 314B parameter Mixture-of-Experts autoregressive transformer
+- 64 decoder layers, 6144 model dim, 128 head dim
+- Grouped Query Attention: 48 query heads, 8 KV heads with RoPE (base 10000)
+- Attention logit capping: `30 * tanh(score / 30)` with causal masking
+- 8 experts per layer, top-2 routing via softmax router
+- SwiGLU FFN (DenseBlock): `gelu(x @ gate) * (x @ v) @ out`, 32768 hidden dim
+- 4 RMSNorms per layer (pre/post attention, pre/post MoE) with residual connections
+- Tied embedding weights with scaling: input `* 78.384`, output `* 0.577`
+- KV cache for autoregressive generation
+
+**SentencePiece tokenizer** (`examples/grok1/tokenizer.rs`)
+- Pure Rust protobuf wire format parser — reads `.model` files directly, no external crate
+- BPE encode with greedy merge (matches Python SentencePiece output exactly)
+- Decode with `▁` → space conversion and byte fallback (`<0xHH>` pieces)
+- 131072-token vocabulary, BOS/EOS detection, streaming decode during generation
+
+**Weight converter** (`scripts/convert_grok1.py`)
+- Loads JAX distributed checkpoint with `QuantizedWeight8bit` (int8 + scales)
+- Dequantizes to float32, transposes 2D weights (JAX `[out, in]` → Peregrine `[in, out]`)
+- Maps JAX nested names to flat Peregrine convention (`layers.{i}.attention.q_proj`, etc.)
+- Handles 3D expert weights by splitting per-expert (`[num_experts, in, out]` → per-expert `[in, out]`)
+- `--random` flag generates random weights for the small test config
+
+**CLI** (`examples/grok1/main.rs`)
+- `--small` flag for testing with random weights (2 layers, 256 dim, 4 experts)
+- `--tokenizer PATH` for SentencePiece model (auto-detects `tokenizer.model` in working dir)
+- `--max-tokens N` and `--temperature T` for generation control
+- Streaming text output during generation
+- Accepts raw text (tokenized via BPE) or space-separated token IDs
+
+```
+# Test with small random-weight config
+cargo run --example grok1 --release -- --small "Hello"
+
+# With SentencePiece tokenizer
+cargo run --example grok1 --release -- --small --tokenizer tokenizer.model "The meaning of life is"
+
+# Full model (requires converted weights)
+python3 scripts/convert_grok1.py ~/path/to/checkpoints/ weights/grok1.bin
+cargo run --example grok1 --release -- --tokenizer tokenizer.model weights/grok1.bin "The meaning of life is"
+```
+
+---
+
 ## [0.16.0] - 2026-03-02
 
 ### Added — Reinforcement learning module and interactive demos

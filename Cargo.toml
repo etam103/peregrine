@@ -57,3 +57,7 @@ path = "examples/must3r/main.rs"
 [[example]]
 name = "rl_demo"
 path = "examples/rl_demo/main.rs"
+
+[[example]]
+name = "grok1"
+path = "examples/grok1/main.rs"
