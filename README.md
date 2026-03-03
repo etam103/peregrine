@@ -46,6 +46,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 | **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), optional Metal GPU (`--gpu`). Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
 | **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint |
+| **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint |
 | **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
 
 The entire library is ~30,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
@@ -298,10 +299,18 @@ examples/
     attention.rs    GroupedQueryAttention — GQA, RoPE, logit capping, KV cache
     moe.rs          MoELayer — top-k router, DenseBlock (SwiGLU FFN) experts
     tokenizer.rs    SentencePiece BPE tokenizer (pure Rust protobuf parser)
+  deepseek/       DeepSeek-V3/R1 (671B MoE) inference
+    main.rs         CLI, tokenizer integration, greedy/temperature generation
+    model.rs        DeepSeekConfig (full/small), top-level Transformer
+    decoder.rs      Block — pre-norm MLA + FFN/MoE with residuals
+    attention.rs    MLA — Multi-head Latent Attention, compressed KV cache, YaRN RoPE
+    moe.rs          MoE — sigmoid gate, group-limited top-k, shared experts
+    tokenizer.rs    HuggingFace tokenizer.json BPE parser (pure Rust)
   rl_demo/        RL training demos with HTML animations
     main.rs         PPO CartPole, DQN GridWorld, REINFORCE Arithmetic
 scripts/
   convert_grok1.py  Grok-1 JAX checkpoint → Peregrine binary format (dequantize 8-bit, transpose, rename)
+  convert_deepseek.py  DeepSeek HuggingFace SafeTensors → Peregrine binary format (transpose, rename)
 tests/
   pytorch_parity.rs   23 numerical parity tests vs PyTorch
   activations.rs      34 activation function tests

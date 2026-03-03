@@ -61,3 +61,7 @@ path = "examples/rl_demo/main.rs"
 [[example]]
 name = "grok1"
 path = "examples/grok1/main.rs"
+
+[[example]]
+name = "deepseek"
+path = "examples/deepseek/main.rs"

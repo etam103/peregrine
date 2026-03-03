@@ -7,6 +7,55 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.18.0] - 2026-03-02
+
+### Added — DeepSeek-V3/R1 (671B MoE Transformer) example
+
+Full implementation of the DeepSeek-V3/R1 architecture as a Peregrine inference example, based on the open-source PyTorch reference from DeepSeek.
+
+**Architecture** (`examples/deepseek/`)
+- 671B parameter Mixture-of-Experts autoregressive transformer
+- 61 layers (3 dense + 58 MoE), 7168 model dim, 128 attention heads
+- **Multi-head Latent Attention (MLA)**: compressed KV cache via low-rank projection
+  - Query LoRA: `x → wq_a(7168,1536) → RMSNorm → wq_b(1536, 128*192)`
+  - KV compression: `x → wkv_a(7168, 576)` → split into 512-dim latent + 64-dim RoPE key
+  - Absorb mode: folds W_kv_b into query-side, caches only 576 floats/token/layer (vs 32768 for standard MHA)
+- 256 routed experts + 1 shared expert, top-8 activation with sigmoid scoring
+- Group-limited routing: 8 groups, top-4 groups selected before expert selection
+- SwiGLU FFN for both dense layers and experts
+- YaRN RoPE for context extension (4K → 16K+ positions)
+- Route scaling (2.5x) and bias correction for expert routing
+
+**HuggingFace tokenizer** (`examples/deepseek/tokenizer.rs`)
+- Pure Rust parser for `tokenizer.json` format — no serde, no external crate
+- Byte-level BPE encode/decode with GPT-2 style byte-to-unicode mapping
+- Handles `added_tokens`, `merges`, and `vocab` sections
+- Auto-detects BOS/EOS tokens from added_tokens
+
+**Weight converter** (`scripts/convert_deepseek.py`)
+- Loads HuggingFace SafeTensors checkpoint files
+- Maps HF names to Peregrine names (self_attn→attn, mlp→ffn, etc.)
+- Transposes 2D weights (PyTorch `[out, in]` → Peregrine `[in, out]`)
+- Skips FP8 scale tensors
+- `--random` flag generates random weights for the small test config
+
+**CLI** (`examples/deepseek/main.rs`)
+- `--small` flag for testing with random weights (2 layers, 256 dim, 8 experts)
+- `--tokenizer PATH` for HuggingFace tokenizer.json
+- `--max-tokens N` and `--temperature T` for generation control
+- Streaming text output during generation
+
+```
+# Test with small random-weight config
+cargo run --example deepseek --release -- --small "Hello"
+
+# Full model (requires converted weights)
+python3 scripts/convert_deepseek.py --hf-path /path/to/DeepSeek-R1/ --output weights/deepseek_r1.bin
+cargo run --example deepseek --release -- --tokenizer tokenizer.json weights/deepseek_r1.bin "The meaning of life is"
+```
+
+---
+
 ## [0.17.0] - 2026-03-02
 
 ### Added — Grok-1 (314B MoE Transformer) example
