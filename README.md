@@ -48,6 +48,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint |
 | **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint |
 | **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
+| **`examples/moba`** | MOBA 3v3 with LSTM-based PPO and self-play — single-lane map (32x16), heroes, towers, creeps, bases. Train, selfplay, watch (HTML replay), video (MP4 export via FFmpeg) |
 
 The entire library is ~30,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
@@ -308,6 +309,13 @@ examples/
     tokenizer.rs    HuggingFace tokenizer.json BPE parser (pure Rust)
   rl_demo/        RL training demos with HTML animations
     main.rs         PPO CartPole, DQN GridWorld, REINFORCE Arithmetic
+  moba/           MOBA 3v3 with LSTM PPO and self-play
+    main.rs         train, selfplay, watch, video subcommands
+    game.rs         MobaGame — 32x16 grid, heroes, towers, creeps, bases
+    entities.rs     Hero, Tower, Creep, Base entity types
+    env.rs          MobaEnv — RL environment wrapper, opponent policies
+    policy.rs       RecurrentActorCritic (LSTM), SelfPlayManager
+    render.rs       HTML replay animation + MP4 video export (software rasterizer → FFmpeg)
 scripts/
   convert_grok1.py  Grok-1 JAX checkpoint → Peregrine binary format (dequantize 8-bit, transpose, rename)
   convert_deepseek.py  DeepSeek HuggingFace SafeTensors → Peregrine binary format (transpose, rename)
