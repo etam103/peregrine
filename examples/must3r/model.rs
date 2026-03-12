@@ -57,7 +57,7 @@ impl MUSt3R {
     /// Run two-view inference.
     /// img1, img2: [1, 3, H, W] tensors (normalized to [0,1], then ImageNet-standardized)
     /// Returns (pointmap1, pointmap2) for the two views.
-    pub fn forward(&self, img1: &Tensor, img2: &Tensor, height: usize, width: usize, use_gpu: bool) -> (Pointmap, Pointmap) {
+    pub fn forward(&self, img1: &Tensor, img2: &Tensor, height: usize, width: usize, use_gpu: bool, pipeline: bool) -> (Pointmap, Pointmap) {
         let h_patches = height / self.patch_size;
         let w_patches = width / self.patch_size;
         let seq_len = h_patches * w_patches;
@@ -98,7 +98,7 @@ impl MUSt3R {
 
         eprintln!("  Decoding...");
         let t = Instant::now();
-        let (dec1, dec2) = self.decoder.forward(&enc1, &enc2, &pos, &pos, 1, seq_len, use_gpu);
+        let (dec1, dec2) = self.decoder.forward(&enc1, &enc2, &pos, &pos, 1, seq_len, use_gpu, pipeline);
         let dec_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         eprintln!("  Computing pointmaps...");

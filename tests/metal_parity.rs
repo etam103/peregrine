@@ -562,3 +562,57 @@ fn parity_matmul_simd_db() {
             "matmul_simd_db [{n}x{n}]: max_abs_err={err}");
     }
 }
+
+// --- het_execute: concurrent GPU + CPU matmul ---
+
+#[test]
+fn parity_het_execute() {
+    peregrine::metal::init_gpu().unwrap();
+
+    let m = 128;
+    let k = 64;
+    let n = 128;
+    let a_data = random_data(m * k);
+    let b_data = random_data(k * n);
+    let c_data = random_data(m * k);
+    let d_data = random_data(k * n);
+
+    // Reference: sequential CPU matmul for both pairs
+    let a_cpu = Tensor::new(a_data.clone(), vec![m, k], false);
+    let b_cpu = Tensor::new(b_data.clone(), vec![k, n], false);
+    let ref_gpu = a_cpu.matmul(&b_cpu).data();
+
+    let c_cpu = Tensor::new(c_data.clone(), vec![m, k], false);
+    let d_cpu = Tensor::new(d_data.clone(), vec![k, n], false);
+    let ref_cpu = c_cpu.matmul(&d_cpu).data();
+
+    // het_execute: GPU matmul + CPU matmul concurrently
+    let a_het = Tensor::new(a_data.clone(), vec![m, k], false);
+    let b_het = Tensor::new(b_data.clone(), vec![k, n], false);
+    a_het.to_gpu();
+    b_het.to_gpu();
+
+    let c_het = Tensor::new(c_data.clone(), vec![m, k], false);
+    let d_het = Tensor::new(d_data.clone(), vec![k, n], false);
+
+    let (gpu_result, cpu_result) = peregrine::metal::het_execute(
+        || {
+            // GPU path: matmul dispatches to GPU because tensors are GPU-resident
+            a_het.matmul(&b_het)
+        },
+        || {
+            // CPU path: matmul runs on CPU because tensors are CPU-only
+            c_het.matmul(&d_het)
+        },
+    );
+
+    let gpu_out = gpu_result.data();
+    let cpu_out = cpu_result.data();
+
+    let gpu_err = max_abs_error(&ref_gpu, &gpu_out);
+    let cpu_err = max_abs_error(&ref_cpu, &cpu_out);
+
+    // GPU matmul may have slightly larger error due to different accumulation
+    assert!(gpu_err < 0.01, "het_execute GPU matmul: max_abs_err={gpu_err}");
+    assert!(cpu_err < 1e-6, "het_execute CPU matmul: max_abs_err={cpu_err}");
+}

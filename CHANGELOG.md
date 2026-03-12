@@ -7,6 +7,47 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.22.0] - 2026-03-12
+
+### Added — Heterogeneous GPU + CPU scheduling (two-view decoder overlap)
+
+Overlap feat1 (GPU) and feat2 (CPU/AMX) processing in the MUSt3R decoder loop using `MTLSharedEvent` signaling. Each decoder block processes two independent views through self-attn, cross-attn, and FFN — the GPU executes asynchronously while the CPU does concurrent work. Single-threaded design avoids `Send`/`Sync` requirements.
+
+**New module** (`src/metal/sched.rs`)
+- `het_execute(gpu_work, cpu_work) -> (R1, R2)` — queues GPU work, commits with signal event, runs CPU work concurrently, waits for GPU completion
+- `het_calibrate(gpu_fn, cpu_fn) -> bool` — times both paths, returns whether overlap ratio > 0.3
+
+**Extended modules**
+- `src/metal/context.rs` — `MTLSharedEvent` event + counter fields on `GpuContext`; `commit_and_signal()` (non-blocking commit with event signal), `wait_for(ticket)` (spin-wait), `is_done(ticket)` (poll); thread-local wrappers `gpu_commit_and_signal()`, `gpu_wait_for()`, `gpu_is_done()`
+- `src/metal/mod.rs` — `pub mod sched` + re-exports
+- `Cargo.toml` — `"MTLEvent"` feature added to objc2-metal
+- `examples/must3r/decoder.rs` — pipelined decoder loop when `pipeline=true`: feat2 synced to CPU, each phase uses `het_execute` to overlap GPU feat1 with CPU/AMX feat2
+- `examples/must3r/model.rs` — `pipeline: bool` parameter passthrough
+- `examples/must3r/main.rs` — `--pipeline` CLI flag
+
+**New tests & benchmarks**
+- `tests/metal_parity.rs` — `parity_het_execute`: concurrent GPU + CPU matmul via `het_execute`, verifies both results match sequential
+- `benches/wallclock.rs` — `bench_het_decoder`: sequential GPU+GPU vs pipelined GPU+CPU matmul timing
+
+### Benchmark Results
+
+MUSt3R 3D reconstruction (423M params, Apple Silicon):
+
+| Resolution | CPU | GPU | GPU+Pipeline |
+|-----------|----:|----:|-------------:|
+| 224x224 | 0.66s | **0.53s** | 0.53s |
+| 512x512 | 2.66s | 2.05s | **1.79s** |
+
+Op-level benchmarks (141 ops, CPU, all frameworks):
+- **Peregrine vs PyTorch: 0.90x** (Peregrine faster)
+- **Peregrine vs MLX: 0.60x** (Peregrine faster)
+- **Peregrine vs TensorFlow: 0.53x** (Peregrine faster)
+- **Peregrine vs JAX: 0.62x** (Peregrine faster)
+- **Peregrine vs tinygrad: 0.10x** (Peregrine faster)
+- Peregrine wins 68/141 ops
+
+---
+
 ## [0.21.0] - 2026-03-12
 
 ### Added — Int8 quantized inference path (NEON i8 GEMM + Metal dequant matmul)

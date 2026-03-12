@@ -525,6 +525,7 @@ impl MUSt3RDecoder {
     /// - batch: batch size
     /// - seq_len: number of patches per image
     /// - use_gpu: whether GPU acceleration is active
+    /// - pipeline: if true, overlap feat1 (GPU) and feat2 (CPU/AMX) via het_execute
     ///
     /// Returns: (decoded_feat1, decoded_feat2), each [batch * seq_len, embed_dim]
     pub fn forward(
@@ -536,6 +537,7 @@ impl MUSt3RDecoder {
         batch: usize,
         seq_len: usize,
         use_gpu: bool,
+        pipeline: bool,
     ) -> (Tensor, Tensor) {
         let total_tokens = batch * seq_len;
         let embed_dim = self.embed_dim;
@@ -558,40 +560,103 @@ impl MUSt3RDecoder {
             let mut total_cross_attn = 0.0f64;
             let mut total_ffn = 0.0f64;
 
-            for block in &self.blocks {
-                // Self-attention on each view separately (no stacking needed)
-                let t0 = Instant::now();
-                feat1 = block.forward_self_attn(
-                    &feat1, pos1, &self.rope, batch, seq_len, self.num_heads, true,
-                );
-                feat2 = block.forward_self_attn(
-                    &feat2, pos1, &self.rope, batch, seq_len, self.num_heads, true,
-                );
-                total_self_attn += t0.elapsed().as_secs_f64() * 1000.0;
+            if pipeline {
+                // Pipelined mode: overlap feat1 (GPU) with feat2 (CPU/AMX).
+                // Bring feat2 to CPU for the CPU/AMX path — weights are
+                // StorageModeShared so CPU can read them directly.
+                peregrine::metal::gpu_sync();
+                feat2.to_cpu();
 
-                // Cross-attention (already separate — each view attends to the other)
-                let t0 = Instant::now();
-                let mem1 = feat1.clone();
-                let mem2 = feat2.clone();
-                feat1 = block.forward_cross_attn(
-                    &feat1, &mem2, batch, seq_len, seq_len, self.num_heads, true,
-                );
-                feat2 = block.forward_cross_attn(
-                    &feat2, &mem1, batch, seq_len, seq_len, self.num_heads, true,
-                );
-                total_cross_attn += t0.elapsed().as_secs_f64() * 1000.0;
+                for block in &self.blocks {
+                    // --- Self-attention: feat1 on GPU, feat2 on CPU/AMX ---
+                    let t0 = Instant::now();
+                    let (new_feat1, new_feat2) = peregrine::metal::het_execute(
+                        || block.forward_self_attn(
+                            &feat1, pos1, &self.rope, batch, seq_len, self.num_heads, true,
+                        ),
+                        || block.forward_self_attn(
+                            &feat2, pos1, &self.rope, batch, seq_len, self.num_heads, false,
+                        ),
+                    );
+                    feat1 = new_feat1;
+                    feat2 = new_feat2;
+                    total_self_attn += t0.elapsed().as_secs_f64() * 1000.0;
 
-                // FFN on each view separately (no stacking needed)
-                let t0 = Instant::now();
-                feat1 = block.forward_ffn(&feat1);
-                feat2 = block.forward_ffn(&feat2);
-                total_ffn += t0.elapsed().as_secs_f64() * 1000.0;
+                    // --- Cross-attention: feat1(GPU) attends to mem2, feat2(CPU) attends to mem1 ---
+                    let t0 = Instant::now();
+                    // Get mem1 from GPU→CPU for feat2's CPU cross-attention
+                    peregrine::metal::gpu_sync();
+                    let mem1_data = feat1.data();
+                    let mem1_cpu = Tensor::new(mem1_data, vec![total_tokens, embed_dim], false);
+                    // Upload mem2 (CPU) to GPU for feat1's GPU cross-attention
+                    let mem2_data = feat2.data();
+                    let mem2_gpu = Tensor::new(mem2_data, vec![total_tokens, embed_dim], false);
+                    mem2_gpu.to_gpu();
+                    let (new_feat1, new_feat2) = peregrine::metal::het_execute(
+                        || block.forward_cross_attn(
+                            &feat1, &mem2_gpu, batch, seq_len, seq_len, self.num_heads, true,
+                        ),
+                        || block.forward_cross_attn(
+                            &feat2, &mem1_cpu, batch, seq_len, seq_len, self.num_heads, false,
+                        ),
+                    );
+                    feat1 = new_feat1;
+                    feat2 = new_feat2;
+                    total_cross_attn += t0.elapsed().as_secs_f64() * 1000.0;
+
+                    // --- FFN: feat1 on GPU, feat2 on CPU/AMX ---
+                    let t0 = Instant::now();
+                    let (new_feat1, new_feat2) = peregrine::metal::het_execute(
+                        || block.forward_ffn(&feat1),
+                        || block.forward_ffn(&feat2),
+                    );
+                    feat1 = new_feat1;
+                    feat2 = new_feat2;
+                    total_ffn += t0.elapsed().as_secs_f64() * 1000.0;
+                }
+
+                eprintln!("    [Decoder profile (pipelined)] self_attn={:.1}ms cross_attn={:.1}ms ffn={:.1}ms",
+                         total_self_attn, total_cross_attn, total_ffn);
+            } else {
+                for block in &self.blocks {
+                    // Self-attention on each view separately (no stacking needed)
+                    let t0 = Instant::now();
+                    feat1 = block.forward_self_attn(
+                        &feat1, pos1, &self.rope, batch, seq_len, self.num_heads, true,
+                    );
+                    feat2 = block.forward_self_attn(
+                        &feat2, pos1, &self.rope, batch, seq_len, self.num_heads, true,
+                    );
+                    total_self_attn += t0.elapsed().as_secs_f64() * 1000.0;
+
+                    // Cross-attention (already separate — each view attends to the other)
+                    let t0 = Instant::now();
+                    let mem1 = feat1.clone();
+                    let mem2 = feat2.clone();
+                    feat1 = block.forward_cross_attn(
+                        &feat1, &mem2, batch, seq_len, seq_len, self.num_heads, true,
+                    );
+                    feat2 = block.forward_cross_attn(
+                        &feat2, &mem1, batch, seq_len, seq_len, self.num_heads, true,
+                    );
+                    total_cross_attn += t0.elapsed().as_secs_f64() * 1000.0;
+
+                    // FFN on each view separately (no stacking needed)
+                    let t0 = Instant::now();
+                    feat1 = block.forward_ffn(&feat1);
+                    feat2 = block.forward_ffn(&feat2);
+                    total_ffn += t0.elapsed().as_secs_f64() * 1000.0;
+                }
+
+                eprintln!("    [Decoder profile] self_attn={:.1}ms cross_attn={:.1}ms ffn={:.1}ms",
+                         total_self_attn, total_cross_attn, total_ffn);
             }
 
-            eprintln!("    [Decoder profile] self_attn={:.1}ms cross_attn={:.1}ms ffn={:.1}ms",
-                     total_self_attn, total_cross_attn, total_ffn);
-
             // Final layer norm on each view separately
+            // If pipelined, bring feat2 back to GPU for consistent output
+            if pipeline {
+                feat2.to_gpu();
+            }
             let out1 = feat1.layer_norm(&self.norm_weight, &self.norm_bias, embed_dim);
             let out2 = feat2.layer_norm(&self.norm_weight, &self.norm_bias, embed_dim);
 
@@ -664,6 +729,9 @@ impl MUSt3RDecoder {
 
         eprintln!("    [Decoder profile] self_attn={:.1}ms cross_attn={:.1}ms ffn={:.1}ms",
                  total_self_attn, total_cross_attn, total_ffn);
+
+        // Suppress unused variable warning when metal feature is off
+        let _ = pipeline;
 
         // Batched final layer norm
         let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, false);

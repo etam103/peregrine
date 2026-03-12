@@ -1050,6 +1050,60 @@ fn bench_gpu_training_step_fused() -> Vec<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Het decoder benchmark: sequential vs pipelined GPU+CPU overlap
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metal")]
+fn bench_het_decoder() -> Vec<serde_json::Value> {
+    use peregrine::tensor::Tensor;
+    let mut results = Vec::new();
+
+    // Simulate decoder-like workload: matmul on GPU + matmul on CPU
+    let m = 1024;
+    let k = 768;
+    let n = 768;
+
+    let a_data: Vec<f32> = (0..m*k).map(|i| (i as f32 * 0.001) % 1.0).collect();
+    let b_data: Vec<f32> = (0..k*n).map(|i| (i as f32 * 0.002) % 1.0).collect();
+
+    // Sequential: GPU matmul + GPU matmul (current decoder behavior)
+    {
+        let a1 = Tensor::new(a_data.clone(), vec![m, k], false);
+        let b1 = Tensor::new(b_data.clone(), vec![k, n], false);
+        let a2 = Tensor::new(a_data.clone(), vec![m, k], false);
+        let b2 = Tensor::new(b_data.clone(), vec![k, n], false);
+        a1.to_gpu(); b1.to_gpu(); a2.to_gpu(); b2.to_gpu();
+
+        let times = bench(|| {
+            let _r1 = a1.matmul(&b1);
+            let _r2 = a2.matmul(&b2);
+            peregrine::metal::gpu_sync();
+        }, ITERS_SLOW);
+        results.push(make_result("het_sequential_gpu_gpu", times));
+    }
+
+    // Pipelined: GPU matmul + CPU matmul via het_execute
+    {
+        let a1 = Tensor::new(a_data.clone(), vec![m, k], false);
+        let b1 = Tensor::new(b_data.clone(), vec![k, n], false);
+        let a2 = Tensor::new(a_data.clone(), vec![m, k], false);
+        let b2 = Tensor::new(b_data.clone(), vec![k, n], false);
+        a1.to_gpu(); b1.to_gpu();
+        // a2, b2 stay on CPU
+
+        let times = bench(|| {
+            let (_r1, _r2) = peregrine::metal::het_execute(
+                || a1.matmul(&b1),
+                || a2.matmul(&b2),
+            );
+        }, ITERS_SLOW);
+        results.push(make_result("het_pipelined_gpu_cpu", times));
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1107,6 +1161,7 @@ fn main() {
             ("bench_gpu_mlp_forward", bench_gpu_mlp_forward),
             ("bench_gpu_training_step", bench_gpu_training_step),
             ("bench_gpu_training_fused", bench_gpu_training_step_fused),
+            ("bench_het_decoder", bench_het_decoder),
         ];
 
         for (name, f) in gpu_benchmarks {

@@ -16,6 +16,7 @@ fn main() {
     // Check for flags in args
     let has_server = args.iter().any(|a| a == "--server");
     let has_gpu = args.iter().any(|a| a == "--gpu");
+    let has_pipeline = args.iter().any(|a| a == "--pipeline");
 
     // Filter out flags for positional arg parsing
     let positional: Vec<&String> = args.iter().skip(1).filter(|a| !a.starts_with("--")).collect();
@@ -27,22 +28,23 @@ fn main() {
             std::process::exit(1);
         }
         let weights_path = positional[0];
-        run_server(weights_path, has_gpu);
+        run_server(weights_path, has_gpu, has_pipeline);
     } else {
-        // Single-pair mode: <weights.bin> <image1> <image2> [size] [--gpu]
+        // Single-pair mode: <weights.bin> <image1> <image2> [size] [--gpu] [--pipeline]
         if positional.len() < 3 {
-            eprintln!("Usage: must3r <weights.bin> <image1> <image2> [size] [--gpu]");
-            eprintln!("       must3r <weights.bin> --server [--gpu]");
+            eprintln!("Usage: must3r <weights.bin> <image1> <image2> [size] [--gpu] [--pipeline]");
+            eprintln!("       must3r <weights.bin> --server [--gpu] [--pipeline]");
             eprintln!();
             eprintln!("Convert PyTorch weights first:");
             eprintln!("  python scripts/convert_must3r.py MUSt3R_224_cvpr.pth weights/must3r_224.bin");
             eprintln!();
             eprintln!("Flags:");
-            eprintln!("  --server  Server mode: read pairs from stdin, write binary to stdout");
-            eprintln!("  --gpu     Use Metal GPU acceleration (requires --features metal)");
+            eprintln!("  --server    Server mode: read pairs from stdin, write binary to stdout");
+            eprintln!("  --gpu       Use Metal GPU acceleration (requires --features metal)");
+            eprintln!("  --pipeline  Overlap GPU+CPU decoder (requires --gpu)");
             std::process::exit(1);
         }
-        run_single_pair(&positional, has_gpu);
+        run_single_pair(&positional, has_gpu, has_pipeline);
     }
 }
 
@@ -72,7 +74,7 @@ fn init_model(weights_path: &str, use_gpu: bool) -> MUSt3R {
     model
 }
 
-fn run_single_pair(positional: &[&String], use_gpu: bool) {
+fn run_single_pair(positional: &[&String], use_gpu: bool, pipeline: bool) {
     let weights_path = positional[0];
     let img1_path = positional[1];
     let img2_path = positional[2];
@@ -97,6 +99,7 @@ fn run_single_pair(positional: &[&String], use_gpu: bool) {
     println!("Model: MUSt3R (ViT-L encoder + ViT-B decoder)");
     println!("Image size: {}x{}", img_w, img_h);
     if use_gpu { println!("GPU: enabled"); }
+    if pipeline { println!("Pipeline: enabled (GPU+CPU overlap)"); }
     println!();
 
     // Load and preprocess images
@@ -117,7 +120,7 @@ fn run_single_pair(positional: &[&String], use_gpu: bool) {
     // Run inference
     println!("Running inference...");
     let t0 = Instant::now();
-    let (pm1, pm2) = model.forward(&img1, &img2, img_h, img_w, use_gpu);
+    let (pm1, pm2) = model.forward(&img1, &img2, img_h, img_w, use_gpu, pipeline);
     let elapsed = t0.elapsed().as_secs_f32();
     println!("  Inference time: {:.2}s", elapsed);
 
@@ -138,7 +141,7 @@ fn run_single_pair(positional: &[&String], use_gpu: bool) {
     println!("Pointmaps saved to {}", out_path);
 }
 
-fn run_server(weights_path: &str, use_gpu: bool) {
+fn run_server(weights_path: &str, use_gpu: bool, pipeline: bool) {
     eprintln!("MUSt3R server mode");
     let model = init_model(weights_path, use_gpu);
     eprintln!("Ready, reading pairs from stdin...");
@@ -173,7 +176,7 @@ fn run_server(weights_path: &str, use_gpu: bool) {
 
         let img1 = load_image(img1_path, width, height);
         let img2 = load_image(img2_path, width, height);
-        let (pm1, pm2) = model.forward(&img1, &img2, height, width, use_gpu);
+        let (pm1, pm2) = model.forward(&img1, &img2, height, width, use_gpu, pipeline);
 
         let elapsed = t0.elapsed().as_secs_f32();
         eprintln!("  Done in {:.2}s", elapsed);

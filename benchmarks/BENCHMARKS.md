@@ -35,11 +35,21 @@ With `--workers N` in `reconstruct_video.py`, pairs are distributed across N ser
 
 GPU mode (`--gpu`, requires `--features metal`) now keeps the entire attention pipeline on GPU: QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape — with no CPU round-trips. Inference-mode `layer_norm` skips backward cache sync.
 
-| Resolution | CPU | GPU | Speedup |
-|-----------|----:|----:|---------|
-| 512x512   | 2.81s | **2.05s** | **1.37x** |
+| Resolution | CPU | GPU | GPU+Pipeline | Speedup (GPU vs CPU) |
+|-----------|----:|----:|-------------:|---------|
+| 224x224   | 0.66s | **0.53s** | 0.53s | **1.25x** |
+| 512x512   | 2.66s | 2.05s | **1.79s** | **1.49x** (pipeline) |
 
-GPU output is byte-identical to CPU. The encoder+decoder dispatch in ~110ms total; the head's `.data()` call triggers the actual GPU execution (~809ms), which represents the full pipelined GPU compute.
+### Heterogeneous GPU+CPU Pipeline (v0.22.0)
+
+Pipeline mode (`--pipeline`) overlaps the two independent decoder views: feat1 runs on GPU while feat2 runs on CPU/AMX concurrently. Uses `MTLSharedEvent` signaling — single-threaded, no `Send`/`Sync` needed.
+
+| Resolution | Decoder (GPU) | Decoder (Pipeline) | Decoder (CPU) |
+|-----------|------:|------:|------:|
+| 224x224 | **12.3ms** | 164.0ms | 187.9ms |
+| 512x512 | **57.3ms** | 562.4ms | 778.7ms |
+
+At 224x224, the GPU decoder is already very fast (12.3ms) so there's little overlap benefit. At 512x512, pipeline mode reduces total inference time from 2.05s to **1.79s** (1.15x faster). The decoder itself is slower in pipeline mode due to cross-attention GPU→CPU sync points, but the total benefits from overlapped head postprocessing.
 
 Previous GPU results (v0.15.0, before GPU-resident attention):
 
@@ -61,6 +71,7 @@ Previous GPU results (v0.15.0, before GPU-resident attention):
 10. **Metal GPU dispatch**: GELU, matmul, layernorm, add, add_bias on GPU (with `precise::tanh()` fix for GELU correctness)
 11. **GPU-resident attention** (v0.19.0): 4 new Metal kernels (QKV reshape, RoPE2D, attention output reshape, separate reshape) + composed SDPA (scale → batched matmul → softmax → batched matmul) — eliminates all GPU↔CPU round-trips in attention blocks
 12. **Inference-mode layer_norm** (v0.19.0): skips GPU sync + backward cache computation when gamma doesn't require grad — removes the dominant GPU stall point
+13. **Heterogeneous GPU+CPU scheduling** (v0.22.0): `het_execute` overlaps GPU and CPU/AMX work via `MTLSharedEvent` signaling — decoder feat1 on GPU while feat2 on CPU/AMX concurrently, single-threaded (no Send/Sync needed)
 
 ## Op-Level Benchmarks — 6 Frameworks
 
@@ -69,26 +80,26 @@ Winner column: PG=Peregrine, PT=PyTorch, TF=TensorFlow, JAX=JAX, MLX=MLX.
 
 ### Summary
 
-| Framework | Wins (of 171 total ops) |
+| Framework | Wins (of 141 total ops) |
 |-----------|------------------------|
-| Peregrine | 97 |
-| PyTorch | 23 |
-| JAX | 23 |
-| TensorFlow | 14 |
-| MLX | 13 |
+| Peregrine | 68 |
+| PyTorch | 33 |
+| MLX | 14 |
+| TensorFlow | 13 |
+| JAX | 12 |
 | TinyGrad | 1 |
 
-Peregrine wins the majority of ops (97/171). Geometric mean ratio vs PyTorch: 0.84x (Peregrine faster), vs MLX: 0.67x, vs TF: 0.48x, vs JAX: 0.62x, vs tinygrad: 0.09x.
+Peregrine wins 68/141 ops. Geometric mean ratio vs PyTorch: 0.90x (Peregrine faster), vs MLX: 0.60x, vs TF: 0.53x, vs JAX: 0.62x, vs tinygrad: 0.10x.
 
 ### Matmul
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| matmul_128x128 | 6.08 | **5.96** | 60.9 | 58.8 | 21.0 | 474.0 | PT |
-| matmul_256x256 | 32.2 | **31.8** | 195.5 | 168.4 | 44.0 | 461.7 | PT |
-| matmul_512x512 | 159.9 | **142.7** | 765.7 | 575.8 | 246.4 | 477.1 | PT |
-| matmul_1024x1024 | **1230.4** | - | - | - | - | - | PG |
-| matmul_2048x2048 | **9654.0** | - | - | - | - | - | PG |
+| matmul_128x128 | 6.0 | **5.9** | 52.8 | 58.3 | 20.8 | 426.6 | PT |
+| matmul_256x256 | 70.1 | **30.5** | 166.9 | 183.7 | 43.4 | 430.1 | PT |
+| matmul_512x512 | 216.6 | **156.9** | 701.9 | 555.0 | 180.2 | 426.7 | PT |
+| matmul_1024x1024 | **997.7** | - | - | - | - | - | PG |
+| matmul_2048x2048 | **9477.6** | - | - | - | - | - | PG |
 
 ### Add
 

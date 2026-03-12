@@ -2,7 +2,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use super::buffer::GpuBuffer;
@@ -25,6 +25,8 @@ pub struct GpuContext {
     pipelines: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     pub(crate) pool: BufferPool,
     pending_cmd: RefCell<Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+    event_counter: Cell<u64>,
 }
 
 impl GpuContext {
@@ -115,7 +117,10 @@ impl GpuContext {
 
         let pool = BufferPool::new(&device);
 
-        Ok(GpuContext { device, queue, pipelines, pool, pending_cmd: RefCell::new(None) })
+        let event = device.newSharedEvent()
+            .ok_or_else(|| "Failed to create MTLSharedEvent".to_string())?;
+
+        Ok(GpuContext { device, queue, pipelines, pool, pending_cmd: RefCell::new(None), event, event_counter: Cell::new(0) })
     }
 
     /// Reference to the underlying MTLDevice.
@@ -179,6 +184,40 @@ impl GpuContext {
             cmd.commit();
             cmd.waitUntilCompleted();
         }
+    }
+
+    /// Commit the pending command buffer with a signal event (non-blocking).
+    /// Returns a ticket that can be used with `wait_for()` or `is_done()`.
+    /// Unlike `sync()`, this does NOT wait for GPU completion — the CPU can
+    /// do other work while the GPU executes.
+    pub fn commit_and_signal(&self) -> u64 {
+        let ticket = self.event_counter.get() + 1;
+        self.event_counter.set(ticket);
+
+        let cmd = self.pending_cmd.borrow_mut().take();
+        if let Some(cmd) = cmd {
+            // Upcast MTLSharedEvent → MTLEvent for the command buffer API
+            let event_ref: &ProtocolObject<dyn MTLEvent> =
+                ProtocolObject::from_ref(&*self.event);
+            cmd.encodeSignalEvent_value(event_ref, ticket);
+            cmd.commit();
+        } else {
+            // No pending work — signal immediately
+            self.event.setSignaledValue(ticket);
+        }
+        ticket
+    }
+
+    /// Spin-wait until the GPU has signaled the given ticket.
+    pub fn wait_for(&self, ticket: u64) {
+        while self.event.signaledValue() < ticket {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Check whether the GPU has completed work for the given ticket (non-blocking).
+    pub fn is_done(&self, ticket: u64) -> bool {
+        self.event.signaledValue() >= ticket
     }
 
     // --- Dispatch helpers ---
@@ -2057,5 +2096,32 @@ pub fn gpu_sync() {
         if let Some(ref gpu) = *ctx {
             gpu.sync();
         }
+    })
+}
+
+/// Commit pending GPU commands with a signal event (non-blocking).
+/// Returns a ticket for `gpu_wait_for()` / `gpu_is_done()`.
+pub fn gpu_commit_and_signal() -> u64 {
+    GPU_CONTEXT.with(|ctx| {
+        let ctx = ctx.borrow();
+        ctx.as_ref().map(|gpu| gpu.commit_and_signal()).unwrap_or(0)
+    })
+}
+
+/// Spin-wait until GPU work for the given ticket completes.
+pub fn gpu_wait_for(ticket: u64) {
+    GPU_CONTEXT.with(|ctx| {
+        let ctx = ctx.borrow();
+        if let Some(ref gpu) = *ctx {
+            gpu.wait_for(ticket);
+        }
+    })
+}
+
+/// Check whether GPU work for the given ticket has completed (non-blocking).
+pub fn gpu_is_done(ticket: u64) -> bool {
+    GPU_CONTEXT.with(|ctx| {
+        let ctx = ctx.borrow();
+        ctx.as_ref().map(|gpu| gpu.is_done(ticket)).unwrap_or(true)
     })
 }
