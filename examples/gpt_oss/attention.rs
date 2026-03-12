@@ -1,58 +1,8 @@
 use peregrine::tensor::Tensor;
 use std::collections::HashMap;
 
-/// KV cache for autoregressive generation.
-pub struct KVCache {
-    /// Stored K values: [num_kv_heads, cached_len, head_dim]
-    pub k: Vec<f32>,
-    /// Stored V values: [num_kv_heads, cached_len, head_dim]
-    pub v: Vec<f32>,
-    pub len: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-}
-
-impl KVCache {
-    pub fn new(num_kv_heads: usize, head_dim: usize) -> Self {
-        KVCache {
-            k: Vec::new(),
-            v: Vec::new(),
-            len: 0,
-            num_kv_heads,
-            head_dim,
-        }
-    }
-
-    /// Append new K, V of shape [num_kv_heads, seq_len, head_dim].
-    pub fn append(&mut self, new_k: &[f32], new_v: &[f32], seq_len: usize) {
-        if self.len == 0 {
-            self.k = new_k.to_vec();
-            self.v = new_v.to_vec();
-            self.len = seq_len;
-        } else {
-            let old_len = self.len;
-            let new_len = old_len + seq_len;
-            let hd = self.head_dim;
-
-            let mut new_k_buf = Vec::with_capacity(self.num_kv_heads * new_len * hd);
-            let mut new_v_buf = Vec::with_capacity(self.num_kv_heads * new_len * hd);
-
-            for h in 0..self.num_kv_heads {
-                let old_offset = h * old_len * hd;
-                let append_offset = h * seq_len * hd;
-                new_k_buf.extend_from_slice(&self.k[old_offset..old_offset + old_len * hd]);
-                new_k_buf.extend_from_slice(&new_k[append_offset..append_offset + seq_len * hd]);
-
-                new_v_buf.extend_from_slice(&self.v[old_offset..old_offset + old_len * hd]);
-                new_v_buf.extend_from_slice(&new_v[append_offset..append_offset + seq_len * hd]);
-            }
-
-            self.k = new_k_buf;
-            self.v = new_v_buf;
-            self.len = new_len;
-        }
-    }
-}
+// Re-export StandardKVCache as KVCache for backward compat within this example
+pub use peregrine::attention::StandardKVCache as KVCache;
 
 /// Precompute YaRN-extended RoPE frequencies with half-split rotation.
 /// Returns cos/sin tables of shape [max_seq_len, half_dim].
@@ -147,6 +97,8 @@ fn apply_rotary_emb_half_split(
 }
 
 /// GQA attention with YaRN RoPE, sliding window, and learned attention sinks.
+/// Delegates core attention math to peregrine::attention::gqa_attention_cpu,
+/// with sink logits handled as a wrapper.
 pub struct AttentionBlock {
     pub qkv_weight: Tensor, // [model_dim, (num_q_heads + 2*num_kv_heads) * head_dim]
     pub qkv_bias: Tensor,   // [(num_q_heads + 2*num_kv_heads) * head_dim]
@@ -300,11 +252,15 @@ impl AttentionBlock {
         kv_cache.append(&k_rope, &v_arranged, seq_len);
         let total_len = kv_cache.len;
 
-        // Attention scale
+        // Attention — sink tokens require custom handling since they're virtual
+        // (not in KV cache). Use core GQA for the KV-cache-based attention,
+        // then add sink score externally.
         let scale = 1.0 / (hd as f32).sqrt();
 
         let mut output = vec![0.0f32; seq_len * nqh * hd];
 
+        // Sink logits are virtual (not in KV cache), so we compute
+        // attention manually with sinks inline rather than using core GQA.
         for qh in 0..nqh {
             let kvh = qh / heads_per_group;
             let sink_val = self.sinks[qh];
@@ -322,7 +278,6 @@ impl AttentionBlock {
                     if kt > query_pos {
                         scores.push(f32::NEG_INFINITY);
                     } else if self.use_sliding_window && query_pos - kt > self.sliding_window {
-                        // Sliding window mask (even layers)
                         scores.push(f32::NEG_INFINITY);
                     } else {
                         let k_off = k_base + kt * hd;

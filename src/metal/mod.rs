@@ -14,6 +14,7 @@ mod shaders;
 pub mod sched;
 
 pub use context::GpuContext;
+pub use context::GpuAttentionMask;
 pub use context::{init_gpu, with_gpu, with_gpu_mut, gpu_sync};
 pub use context::{gpu_commit_and_signal, gpu_wait_for, gpu_is_done};
 pub use buffer::GpuBuffer;

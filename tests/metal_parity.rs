@@ -616,3 +616,167 @@ fn parity_het_execute() {
     assert!(gpu_err < 0.01, "het_execute GPU matmul: max_abs_err={gpu_err}");
     assert!(cpu_err < 1e-6, "het_execute CPU matmul: max_abs_err={cpu_err}");
 }
+
+// --- Causal SDPA parity ---
+
+#[test]
+fn parity_gpu_cpu_causal_sdpa() {
+    let gpu = GpuContext::new().unwrap();
+    let head_dim = 16;
+    let num_heads = 2;
+    let seq_q = 4;
+    let seq_kv = 8;
+    let total_bh = num_heads;
+
+    let q_data = random_data(total_bh * seq_q * head_dim);
+    let k_data = random_data(total_bh * seq_kv * head_dim);
+    let v_data = random_data(total_bh * seq_kv * head_dim);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // GPU path: use dispatch_sdpa_masked with causal mask
+    let q_gpu = gpu.upload(&q_data);
+    let k_gpu = gpu.upload(&k_data);
+    let v_gpu = gpu.upload(&v_data);
+    let scores_gpu = gpu.alloc::<f32>(total_bh * seq_q * seq_kv);
+    let output_gpu = gpu.alloc::<f32>(total_bh * seq_q * head_dim);
+
+    gpu.dispatch_sdpa_masked(
+        &q_gpu, &k_gpu, &v_gpu, &scores_gpu, &output_gpu,
+        1, num_heads, num_heads,
+        seq_q, seq_kv, head_dim,
+        scale,
+        &peregrine::metal::GpuAttentionMask::Causal { offset: 0 },
+    );
+    gpu.sync();
+    let gpu_out = output_gpu.read();
+
+    // CPU path: naive causal attention per head
+    let mut cpu_out = vec![0.0f32; total_bh * seq_q * head_dim];
+    for bh in 0..total_bh {
+        for qt in 0..seq_q {
+            let q_off = bh * seq_q * head_dim + qt * head_dim;
+            let q_slice = &q_data[q_off..q_off + head_dim];
+
+            let mut scores = vec![0.0f32; seq_kv];
+            for kt in 0..seq_kv {
+                if kt > qt {
+                    scores[kt] = f32::NEG_INFINITY;
+                } else {
+                    let k_off = bh * seq_kv * head_dim + kt * head_dim;
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q_slice[d] * scale * k_data[k_off + d];
+                    }
+                    scores[kt] = dot;
+                }
+            }
+
+            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut exp_sum = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - max_s).exp();
+                exp_sum += *s;
+            }
+            for s in &mut scores {
+                *s /= exp_sum;
+            }
+
+            let o_off = bh * seq_q * head_dim + qt * head_dim;
+            for kt in 0..seq_kv {
+                let w = scores[kt];
+                if w > 0.0 {
+                    let v_off = bh * seq_kv * head_dim + kt * head_dim;
+                    for d in 0..head_dim {
+                        cpu_out[o_off + d] += w * v_data[v_off + d];
+                    }
+                }
+            }
+        }
+    }
+
+    let err = max_abs_error(&gpu_out, &cpu_out);
+    assert!(err < 0.01, "Causal SDPA GPU/CPU parity: max_abs_err={err}");
+}
+
+#[test]
+fn parity_gpu_cpu_sdpa_gqa() {
+    let gpu = GpuContext::new().unwrap();
+    let head_dim = 16;
+    let num_q_heads = 4;
+    let num_kv_heads = 2;
+    let seq_q = 4;
+    let seq_kv = 8;
+    let batch_size = 1;
+    let total_q_bh = batch_size * num_q_heads;
+    let total_kv_bh = batch_size * num_kv_heads;
+    let heads_per_group = num_q_heads / num_kv_heads;
+
+    let q_data = random_data(total_q_bh * seq_q * head_dim);
+    let k_data = random_data(total_kv_bh * seq_kv * head_dim);
+    let v_data = random_data(total_kv_bh * seq_kv * head_dim);
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // GPU path
+    let q_gpu = gpu.upload(&q_data);
+    let k_gpu = gpu.upload(&k_data);
+    let v_gpu = gpu.upload(&v_data);
+    let scores_gpu = gpu.alloc::<f32>(total_q_bh * seq_q * seq_kv);
+    let output_gpu = gpu.alloc::<f32>(total_q_bh * seq_q * head_dim);
+
+    gpu.dispatch_sdpa_masked(
+        &q_gpu, &k_gpu, &v_gpu, &scores_gpu, &output_gpu,
+        batch_size, num_q_heads, num_kv_heads,
+        seq_q, seq_kv, head_dim,
+        scale,
+        &peregrine::metal::GpuAttentionMask::None,
+    );
+    gpu.sync();
+    let gpu_out = output_gpu.read();
+
+    // CPU path: GQA attention
+    let mut cpu_out = vec![0.0f32; total_q_bh * seq_q * head_dim];
+    for bh in 0..total_q_bh {
+        let b = bh / num_q_heads;
+        let qh = bh % num_q_heads;
+        let kv_bh = b * num_kv_heads + (qh / heads_per_group);
+
+        for qt in 0..seq_q {
+            let q_off = bh * seq_q * head_dim + qt * head_dim;
+            let q_slice = &q_data[q_off..q_off + head_dim];
+
+            let mut scores = vec![0.0f32; seq_kv];
+            for kt in 0..seq_kv {
+                let k_off = kv_bh * seq_kv * head_dim + kt * head_dim;
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_slice[d] * scale * k_data[k_off + d];
+                }
+                scores[kt] = dot;
+            }
+
+            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut exp_sum = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - max_s).exp();
+                exp_sum += *s;
+            }
+            for s in &mut scores {
+                *s /= exp_sum;
+            }
+
+            let o_off = bh * seq_q * head_dim + qt * head_dim;
+            for kt in 0..seq_kv {
+                let w = scores[kt];
+                if w > 0.0 {
+                    let v_off = kv_bh * seq_kv * head_dim + kt * head_dim;
+                    for d in 0..head_dim {
+                        cpu_out[o_off + d] += w * v_data[v_off + d];
+                    }
+                }
+            }
+        }
+    }
+
+    let err = max_abs_error(&gpu_out, &cpu_out);
+    assert!(err < 0.01, "GQA SDPA GPU/CPU parity: max_abs_err={err}");
+}

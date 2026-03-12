@@ -14,6 +14,8 @@ pub mod linalg;
 pub mod transforms;
 pub mod rl;
 pub mod envs;
+pub mod attention;
+pub mod speculative;
 
 #[cfg(feature = "metal")]
 pub mod metal;

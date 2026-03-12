@@ -17,7 +17,7 @@ Tensors, reverse-mode autograd, neural network layers, optimizers, and working m
 
 ```
 cargo build --release                          # build the library
-cargo test                                     # 409 tests
+cargo test                                     # 625 tests
 cargo run --example mnist --release            # train MNIST digit classifier (97.5% accuracy)
 cargo run --example rt_detr --release          # train RT-DETR on COCO images
 ./scripts/bench_compare.sh                     # wall-clock benchmark vs PyTorch, MLX, TF, tinygrad, JAX
@@ -30,6 +30,8 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | Module | What it does |
 |--------|-------------|
 | **`peregrine::tensor`** | N-dimensional tensor with reverse-mode autograd, ~220 ops, NumPy-style broadcasting, Apple Accelerate BLAS, NEON intrinsics, rayon parallelism |
+| **`peregrine::attention`** | Core GQA attention — `StandardKVCache` (append/rollback), `gqa_attention_cpu`, `AttentionMask` (None/Causal/SlidingWindow/LocalGlobal), `PostScoreTransform` (None/LogitCap) |
+| **`peregrine::speculative`** | Speculative decoding — `CausalLM` trait, draft-propose/target-verify with stochastic acceptance (Leviathan 2023) |
 | **`peregrine::nn`** | Linear, Embedding, MultiHeadAttention, Transformer{Encoder,Decoder}, RNN/LSTM/GRU, Conv1d/2d, ConvTranspose1d/2d, MaxPool1d/2d, AvgPool, AdaptiveAvgPool, BatchNorm/LayerNorm/GroupNorm/InstanceNorm/RMSNorm, Dropout/Dropout2d/AlphaDropout, Upsample, PixelShuffle, padding layers, RoPE, Module trait, Sequential, 14 loss functions |
 | **`peregrine::optim`** | SGD, Adam/AdamW, RMSprop, Adagrad, Adamax, AdaDelta, Lion, Adafactor, LR schedulers (Step, Cosine, Warmup, Exponential, Linear, Join), gradient clipping |
 | **`peregrine::random`** | Xoshiro256++ PRNG — uniform, normal, bernoulli, categorical, gumbel, laplace, truncated normal, permutation, exponential, gamma, beta, poisson, multinomial |
@@ -42,16 +44,16 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
 | **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
 | **`peregrine::envs`** | 10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe |
-| **`peregrine::metal`** | Metal GPU backend — 105 compute shaders, 39 dispatch methods, fused op pipelines, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling (`--features metal`) |
+| **`peregrine::metal`** | Metal GPU backend — 106 compute shaders, 40 dispatch methods, fused op pipelines, causal masked SDPA with GQA, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 | **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
-| **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint |
-| **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint |
+| **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
+| **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
 | **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
 | **`examples/moba`** | MOBA 3v3 with LSTM-based PPO and self-play — single-lane map (32x16), heroes, towers, creeps, bases. Train, selfplay, watch (HTML replay), video (MP4 export via FFmpeg) |
 
-The entire library is ~30,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
+The entire library is ~35,000 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
 ---
 
@@ -111,11 +113,11 @@ Model: MLP (784 → 128 → 64 → 10) with ReLU, trained with CrossEntropyLoss 
 
 ## PyTorch numerical parity
 
-23 integration tests cross-validate Peregrine against PyTorch reference data, covering matmul, softmax, log_softmax, layernorm, cross_entropy_loss, 14 element-wise ops, Adam optimizer, and a full 10-step MLP training loop. All pass within 1e-4 to 1e-7 absolute error. 34 additional activation tests and 352 unit tests cover the full op suite.
+23 integration tests cross-validate Peregrine against PyTorch reference data, covering matmul, softmax, log_softmax, layernorm, cross_entropy_loss, 14 element-wise ops, Adam optimizer, and a full 10-step MLP training loop. All pass within 1e-4 to 1e-7 absolute error. 34 additional activation tests, 8 GQA attention tests, 4 speculative decoding tests, and 352 unit tests cover the full op suite.
 
 ```
 $ cargo test
-running 491 tests ... ok (356 unit + 34 activation + 23 parity + 4 quantization)
+running 625 tests ... ok (356 unit + 34 activation + 23 parity + 4 quantization + 8 attention + 4 speculative + 34 metal parity + 12 metal basics + 17 metal autograd + ...)
 ```
 
 To regenerate reference data: `.venv/bin/python tests/generate_reference.py`
@@ -203,29 +205,32 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | **6.0** | 5.9 | 20.8 | 52.8 | 426.6 | 58.3 |
-| matmul 512x512 | 216.6 | **156.9** | 180.2 | 701.9 | 426.7 | 555.0 |
-| add 100k | **12.7** | 45.0 | 29.1 | 47.6 | 188.7 | 39.9 |
-| mul 100k | **12.5** | 42.6 | 32.8 | 47.8 | 188.8 | 37.1 |
-| relu 100k | **8.8** | 39.8 | 28.1 | 43.2 | 338.4 | 95.3 |
-| softmax 8x128 | **1.2** | 39.3 | 20.5 | 12.0 | 631.3 | 46.7 |
-| silu 100k | 64.0 | **49.5** | 88.1 | 195.4 | 328.5 | 52.5 |
-| rfft 1k | **2.2** | 4.5 | 24.6 | 43.0 | — | 57.2 |
-| cross_entropy | **2.6** | 40.4 | 67.8 | 627.3 | 3705.2 | 74.2 |
-| train step 64 | **810.6** | 1395.7 | 1134.1 | 9515.0 | 24222.4 | 5672.2 |
-| matmul+bias+gelu 196x768x3072 | **1091** | 3784 | — | 2396 | 1306 | 2183 |
-| add+layernorm 196x768 | **112** | 293 | — | 1255 | 1298 | 253 |
+| matmul 128x128 | **5.7** | 5.9 | 28.4 | 96.3 | 428.9 | 80.3 |
+| matmul 512x512 | 219.9 | **142.5** | 221.2 | 660.2 | 449.7 | 505.4 |
+| add 100k | **12.7** | 40.3 | 32.4 | 56.0 | 193.4 | 33.8 |
+| mul 100k | **12.5** | 39.8 | 33.0 | 49.7 | 192.5 | 35.1 |
+| relu 100k | **8.8** | 38.6 | 27.0 | 40.3 | 349.2 | 99.2 |
+| softmax 8x128 | **1.2** | 32.1 | 19.0 | 11.7 | 631.8 | 31.6 |
+| silu 100k | 65.3 | 77.0 | 89.8 | 251.4 | 340.3 | **52.6** |
+| rfft 1k | **2.2** | 4.5 | 20.6 | 44.7 | — | 50.0 |
+| cross_entropy | **2.6** | 35.9 | 24.0 | 638.0 | 3387.7 | 54.7 |
+| train step 64 | **819.3** | 1284.8 | 869.1 | 8635.0 | 24367.6 | 5173.8 |
+| matmul+bias+gelu 196x768x3072 | 1070.7 | **921.8** | — | 2377.5 | 1253.7 | 2172.8 |
+| add+layernorm 196x768 | 111.5 | **102.8** | — | 1211.4 | 1147.2 | 231.8 |
 
-Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.90x**, **MLX 0.60x**, TensorFlow 0.53x, tinygrad 0.10x, JAX 0.62x. Peregrine wins 68 of 141 ops.
+Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.94x**, **MLX 0.68x**, TensorFlow 0.51x, tinygrad 0.10x, JAX 0.65x. Peregrine wins 64 of 141 ops.
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
 | Resolution | CPU | GPU | GPU+Pipeline | PyTorch CPU |
 |-----------|----:|----:|-------------:|------------:|
-| 224x224 | 0.66s | **0.53s** | 0.53s | 0.67s |
-| 512x512 | 2.66s | 2.05s | **1.79s** | — |
-| 512x384 | **1.98s** | — | — | 2.26s |
+| 224x224 | 0.65s | 0.53s | **0.50s** | 0.67s |
+| 512x384 | 1.89s | 1.55s | **1.36s** | 2.26s |
 | Weight load | **0.6s** | 0.6s | 0.6s | 1.6s |
+
+- **224**: Peregrine is **3% faster** on CPU (0.65s vs 0.67s), **33% faster** with GPU+Pipeline (0.50s)
+- **512**: Peregrine is **16% faster** on CPU (1.89s vs 2.26s), **40% faster** with GPU+Pipeline (1.36s)
+- **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
 GPU mode (`--gpu`) keeps the entire attention pipeline on Metal — QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape all run as GPU kernels with no CPU round-trips. Pipeline mode (`--pipeline`) overlaps feat1 (GPU) and feat2 (CPU/AMX) decoder processing via `MTLSharedEvent` signaling — single-threaded, no `Send`/`Sync` needed.
 
@@ -255,7 +260,7 @@ Server mode (`--server` flag on the Rust binary) loads weights once and processe
 | Rayon threshold tuning | Dual thresholds (500K cheap / 100K expensive) — avoids spawn overhead |
 | Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
 | Int8 quantized inference | Per-column symmetric weight quantization, per-row dynamic activation quantization, NEON i8 GEMM (vmull+vpadalq, 16 MACs/iter, 4-row blocking), Metal dequant matmul (scalar 16×16 + simdgroup 32×32) |
-| Metal GPU backend | 107 compute shaders with fused op pipelines (matmul+bias+gelu, add+layernorm, double-buffered matmul, int8 dequant matmul), command batching, full autograd integration, GPU-resident attention (QKV reshape, RoPE2D, SDPA), and heterogeneous GPU+CPU scheduling via MTLSharedEvent |
+| Metal GPU backend | 106 compute shaders with fused op pipelines (matmul+bias+gelu, add+layernorm, double-buffered matmul, int8 dequant matmul), causal masked SDPA with GQA support, command batching, full autograd integration, GPU-resident attention (QKV reshape, RoPE2D, SDPA), and heterogeneous GPU+CPU scheduling via MTLSharedEvent |
 
 ---
 
@@ -277,9 +282,11 @@ src/
   debug.rs        model summary + training health diagnostics
   quant.rs        int8 quantized inference — per-column weight quantization, per-row activation quantization, NEON i8 GEMM, Metal dequant matmul
   serial.rs       model weight save/load (binary format, f32 + int8)
+  attention.rs    core GQA attention — StandardKVCache, gqa_attention_cpu, AttentionMask, PostScoreTransform
+  speculative.rs  speculative decoding — CausalLM trait, draft-propose/target-verify with stochastic acceptance
   rl.rs           RL algorithms — PPO, DQN, REINFORCE, replay/rollout buffers, Environment trait (~1,750 lines)
   envs.rs         10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe (~2,150 lines)
-  metal/          Metal GPU backend (107 shaders, 40 dispatch methods, fused pipelines, command batching, autograd, het scheduling)
+  metal/          Metal GPU backend (106 shaders, 40 dispatch methods, fused pipelines, causal masked SDPA with GQA, command batching, autograd, het scheduling)
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
   wallclock.rs    wall-clock comparison benchmark (JSON output)
@@ -303,7 +310,7 @@ examples/
     main.rs         CLI, tokenizer integration, greedy/temperature generation
     model.rs        Grok1Config (full/small), top-level model, tied embeddings
     decoder.rs      DecoderLayer — pre/post-norm attention + MoE with residuals
-    attention.rs    GroupedQueryAttention — GQA, RoPE, logit capping, KV cache
+    attention.rs    GroupedQueryAttention — GQA via core attention module, RoPE, logit capping, KV cache
     moe.rs          MoELayer — top-k router, DenseBlock (SwiGLU FFN) experts
     tokenizer.rs    SentencePiece BPE tokenizer (pure Rust protobuf parser)
   deepseek/       DeepSeek-V3/R1 (671B MoE) inference
@@ -329,7 +336,9 @@ scripts/
 tests/
   pytorch_parity.rs   23 numerical parity tests vs PyTorch
   activations.rs      34 activation function tests
-  metal_parity.rs     32 CPU vs Metal parity tests (incl. het_execute)
+  attention.rs        8 GQA attention tests (MHA, GQA, MQA, causal, sliding window, logit cap, rollback)
+  speculative.rs      4 speculative decoding tests (greedy, acceptance, EOS, rollback)
+  metal_parity.rs     34 CPU vs Metal parity tests (incl. het_execute, causal SDPA, GQA)
   metal_basics.rs     12 Metal compute shader tests
   metal_autograd.rs   17 GPU autograd integration tests
   quant_parity.rs     4 int8 quantization tests (roundtrip, matmul parity, Metal parity, serialization)

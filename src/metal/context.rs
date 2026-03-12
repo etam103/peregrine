@@ -29,6 +29,17 @@ pub struct GpuContext {
     event_counter: Cell<u64>,
 }
 
+/// GPU attention mask enum (Rust-side mirror of Metal kernel bit flags).
+#[derive(Clone, Debug)]
+pub enum GpuAttentionMask {
+    /// No masking (plain softmax).
+    None,
+    /// Causal mask only.
+    Causal { offset: usize },
+    /// Causal + sliding window + optional sink tokens.
+    CausalSlidingWindow { offset: usize, window: usize, sink_tokens: usize },
+}
+
 impl GpuContext {
     /// Initialize Metal: get default device, compile shaders, create pipelines.
     pub fn new() -> Result<Self, String> {
@@ -101,6 +112,8 @@ impl GpuContext {
             "attn_output_reshape_f32", "separate_reshape_f32",
             // Int8 dequant matmul
             "matmul_dequant_i8", "matmul_dequant_simd_i8",
+            // Causal-masked softmax
+            "causal_mask_softmax_f32",
         ];
 
         let mut pipelines = HashMap::new();
@@ -1916,6 +1929,250 @@ impl GpuContext {
             for bh in 0..total_bh {
                 let s_offset = bh * head_s_size * 4;
                 let v_offset = bh * head_kv_size * 4;
+                let o_offset = bh * head_q_size * 4;
+
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(scores.raw()), s_offset, 0);
+                    enc.setBuffer_offset_atIndex(Some(v.raw()), v_offset, 1);
+                    enc.setBuffer_offset_atIndex(Some(output.raw()), o_offset, 2);
+                    enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 3);
+                    enc.setBytes_length_atIndex(
+                        std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                        std::mem::size_of::<MatmulParams>(), 4,
+                    );
+                }
+
+                if use_simd {
+                    let threads_per_group = 128usize;
+                    let tile = 32usize;
+                    let threadgroup_size = MTLSize { width: threads_per_group, height: 1, depth: 1 };
+                    let num_groups = MTLSize {
+                        width: (head_dim + tile - 1) / tile,
+                        height: (seq_q + tile - 1) / tile,
+                        depth: 1,
+                    };
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+                } else {
+                    let tile_size = 16usize;
+                    let threadgroup_size = MTLSize { width: tile_size, height: tile_size, depth: 1 };
+                    let num_groups = MTLSize {
+                        width: (head_dim + tile_size - 1) / tile_size,
+                        height: (seq_q + tile_size - 1) / tile_size,
+                        depth: 1,
+                    };
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+                }
+            }
+            enc.endEncoding();
+        }
+    }
+
+    /// Dispatch causal-masked softmax kernel.
+    pub fn dispatch_causal_mask_softmax(
+        &self,
+        input: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        batch: u32,
+        dim: u32,
+        seq_q: u32,
+        seq_kv: u32,
+        mask_type: u32,
+        offset: u32,
+        window: u32,
+        sink_tokens: u32,
+    ) {
+        #[repr(C)]
+        struct CausalMaskSoftmaxParams {
+            batch: u32,
+            dim: u32,
+            seq_q: u32,
+            seq_kv: u32,
+            mask_type: u32,
+            offset: u32,
+            window: u32,
+            sink_tokens: u32,
+        }
+
+        let params = CausalMaskSoftmaxParams {
+            batch, dim, seq_q, seq_kv, mask_type, offset, window, sink_tokens,
+        };
+
+        let pipeline = &self.pipelines["causal_mask_softmax_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<CausalMaskSoftmaxParams>(),
+                2,
+            );
+        }
+
+        let threads_per_row = (dim as usize).next_power_of_two().min(1024);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: batch as usize, height: 1, depth: 1 },
+            MTLSize { width: threads_per_row, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+    }
+
+    /// Composed SDPA with GQA support and optional causal masking.
+    /// Q: [batch_size * num_q_heads, seq_q, head_dim]
+    /// K: [batch_size * num_kv_heads, seq_kv, head_dim]
+    /// V: [batch_size * num_kv_heads, seq_kv, head_dim]
+    /// scores: [batch_size * num_q_heads, seq_q, seq_kv]
+    /// output: [batch_size * num_q_heads, seq_q, head_dim]
+    pub fn dispatch_sdpa_masked(
+        &self,
+        q: &GpuBuffer<f32>,
+        k: &GpuBuffer<f32>,
+        v: &GpuBuffer<f32>,
+        scores: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        batch_size: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        seq_q: usize,
+        seq_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        mask: &GpuAttentionMask,
+    ) {
+        let total_q_bh = batch_size * num_q_heads;
+        let heads_per_group = num_q_heads / num_kv_heads;
+
+        // 1. Scale Q
+        let q_len = total_q_bh * seq_q * head_dim;
+        let q_scaled = self.alloc::<f32>(q_len);
+        self.dispatch_scale(q, &q_scaled, scale);
+
+        // 2. Batched Q @ K^T -> scores [total_q_bh, seq_q, seq_kv]
+        let head_q_size = seq_q * head_dim;
+        let head_kv_size = seq_kv * head_dim;
+        let head_s_size = seq_q * seq_kv;
+
+        {
+            let cmd_ref = self.ensure_cmd();
+            let cmd = cmd_ref.as_ref().unwrap();
+            let enc = cmd.computeCommandEncoder().expect("encoder");
+
+            #[repr(C)]
+            struct MatmulParams { m: u32, n: u32, k: u32, fuse_bias: u32, fuse_relu: u32, trans_a: u32, trans_b: u32 }
+            let params = MatmulParams {
+                m: seq_q as u32, n: seq_kv as u32, k: head_dim as u32,
+                fuse_bias: 0, fuse_relu: 0, trans_a: 0, trans_b: 1,
+            };
+
+            let use_simd = seq_q >= 64 && seq_kv >= 64
+                && (seq_q as u64) * (seq_kv as u64) >= 1024 * 1024;
+            let kernel_name = if use_simd { "matmul_simd_f32" } else { "matmul_f32" };
+            let pipeline = &self.pipelines[kernel_name];
+            enc.setComputePipelineState(pipeline);
+
+            for bh in 0..total_q_bh {
+                // GQA: map Q head to KV head
+                let b = bh / num_q_heads;
+                let qh = bh % num_q_heads;
+                let kv_bh = b * num_kv_heads + (qh / heads_per_group);
+
+                let q_offset = bh * head_q_size * 4;
+                let k_offset = kv_bh * head_kv_size * 4;
+                let s_offset = bh * head_s_size * 4;
+
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(q_scaled.raw()), q_offset, 0);
+                    enc.setBuffer_offset_atIndex(Some(k.raw()), k_offset, 1);
+                    enc.setBuffer_offset_atIndex(Some(scores.raw()), s_offset, 2);
+                    enc.setBuffer_offset_atIndex(Some(scores.raw()), 0, 3);
+                    enc.setBytes_length_atIndex(
+                        std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                        std::mem::size_of::<MatmulParams>(), 4,
+                    );
+                }
+
+                if use_simd {
+                    let threads_per_group = 128usize;
+                    let tile = 32usize;
+                    let threadgroup_size = MTLSize { width: threads_per_group, height: 1, depth: 1 };
+                    let num_groups = MTLSize {
+                        width: (seq_kv + tile - 1) / tile,
+                        height: (seq_q + tile - 1) / tile,
+                        depth: 1,
+                    };
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+                } else {
+                    let tile_size = 16usize;
+                    let threadgroup_size = MTLSize { width: tile_size, height: tile_size, depth: 1 };
+                    let num_groups = MTLSize {
+                        width: (seq_kv + tile_size - 1) / tile_size,
+                        height: (seq_q + tile_size - 1) / tile_size,
+                        depth: 1,
+                    };
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+                }
+            }
+            enc.endEncoding();
+        }
+
+        // 3. Softmax (with optional masking) over scores
+        match mask {
+            GpuAttentionMask::None => {
+                self.dispatch_softmax(
+                    scores, scores,
+                    (total_q_bh * seq_q) as u32, seq_kv as u32,
+                );
+            }
+            GpuAttentionMask::Causal { offset } => {
+                self.dispatch_causal_mask_softmax(
+                    scores, scores,
+                    (total_q_bh * seq_q) as u32, seq_kv as u32,
+                    seq_q as u32, seq_kv as u32,
+                    1, // bit0 = causal
+                    *offset as u32, 0, 0,
+                );
+            }
+            GpuAttentionMask::CausalSlidingWindow { offset, window, sink_tokens } => {
+                self.dispatch_causal_mask_softmax(
+                    scores, scores,
+                    (total_q_bh * seq_q) as u32, seq_kv as u32,
+                    seq_q as u32, seq_kv as u32,
+                    1 | 2 | if *sink_tokens > 0 { 4 } else { 0 },
+                    *offset as u32, *window as u32, *sink_tokens as u32,
+                );
+            }
+        }
+
+        // 4. Batched scores @ V -> output [total_q_bh, seq_q, head_dim]
+        {
+            let cmd_ref = self.ensure_cmd();
+            let cmd = cmd_ref.as_ref().unwrap();
+            let enc = cmd.computeCommandEncoder().expect("encoder");
+
+            #[repr(C)]
+            struct MatmulParams { m: u32, n: u32, k: u32, fuse_bias: u32, fuse_relu: u32, trans_a: u32, trans_b: u32 }
+            let params = MatmulParams {
+                m: seq_q as u32, n: head_dim as u32, k: seq_kv as u32,
+                fuse_bias: 0, fuse_relu: 0, trans_a: 0, trans_b: 0,
+            };
+
+            let use_simd = seq_q >= 64 && head_dim >= 64
+                && (seq_q as u64) * (head_dim as u64) >= 1024 * 1024;
+            let kernel_name = if use_simd { "matmul_simd_f32" } else { "matmul_f32" };
+            let pipeline = &self.pipelines[kernel_name];
+            enc.setComputePipelineState(pipeline);
+
+            for bh in 0..total_q_bh {
+                let b = bh / num_q_heads;
+                let qh = bh % num_q_heads;
+                let kv_bh = b * num_kv_heads + (qh / heads_per_group);
+
+                let s_offset = bh * head_s_size * 4;
+                let v_offset = kv_bh * head_kv_size * 4;
                 let o_offset = bh * head_q_size * 4;
 
                 unsafe {

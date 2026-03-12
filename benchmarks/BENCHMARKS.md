@@ -1,6 +1,6 @@
 # Peregrine Benchmarks
 
-**Date**: 2026-03-12
+**Date**: 2026-03-12 (v0.23.0 — GQA + Speculative Decoding + Sparse Attention)
 **System**: Apple M1 Max, 10 cores, 64 GB RAM, arm64
 **Frameworks**: Peregrine (Rust), PyTorch 2.10.0, TensorFlow 2.20.0, JAX 0.9.0.1, MLX 0.30.6, TinyGrad
 **All benchmarks**: CPU only, median of 20-50 iterations
@@ -13,12 +13,28 @@ Model: 423M parameters (ViT-L encoder + ViT-B decoder), shared head.
 |----------------------|---------------|-------------|----------------|-------------|
 | Input resolution     | 224x224       | 224x224     | 512x384        | 512x384     |
 | Patches              | 196           | 196         | 768            | 768         |
-| **Inference time**   | **0.67s**     | **0.67s**   | **1.98s**      | **2.26s**   |
+| **Inference time**   | **0.65s**     | **0.67s**   | **1.89s**      | **2.26s**   |
 | **Weight loading**   | **0.6s**      | **1.6s**    | **0.6s**       | **1.6s**    |
 
-- **224**: Peregrine **matches** PyTorch (0.67s vs 0.67s)
-- **512**: Peregrine is **13% faster** (1.98s vs 2.26s)
+- **224**: Peregrine is **3% faster** (0.65s vs 0.67s)
+- **512**: Peregrine is **16% faster** (1.89s vs 2.26s)
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
+
+### Detailed Breakdown
+
+| Component     | 224 CPU | 224 GPU | 224 Pipeline | 512 CPU | 512 GPU | 512 Pipeline |
+|--------------|--------:|--------:|-------------:|--------:|--------:|-------------:|
+| Encoder      | 451.4ms | 14.2ms  | 14.1ms       | 1294.8ms| 43.7ms  | 43.3ms       |
+| Decoder      | 181.5ms | 14.4ms  | 160.2ms      | 541.6ms | 37.5ms  | 398.7ms      |
+| Head+postproc| 3.0ms   | 180.4ms | 3.8ms        | 8.7ms   | 596.5ms | 14.6ms       |
+| **Total**    | **0.65s**| **0.53s**| **0.50s**   | **1.89s**| **1.55s**| **1.36s**   |
+
+### Metal GPU Inference (v0.19.0+)
+
+| Resolution | CPU | GPU | GPU+Pipeline | Speedup (best vs CPU) |
+|-----------|----:|----:|-------------:|---------|
+| 224x224   | 0.65s | 0.53s | **0.50s** | **1.30x** |
+| 512x384   | 1.89s | 1.55s | **1.36s** | **1.39x** |
 
 ### Server Mode & Parallel Workers (v0.15.0)
 
@@ -31,32 +47,14 @@ Server mode (`--server`) loads weights once and processes pairs over stdin/stdou
 
 With `--workers N` in `reconstruct_video.py`, pairs are distributed across N server processes for near-linear wall-clock scaling.
 
-### Metal GPU Inference (v0.19.0 — GPU-Resident Attention)
-
-GPU mode (`--gpu`, requires `--features metal`) now keeps the entire attention pipeline on GPU: QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape — with no CPU round-trips. Inference-mode `layer_norm` skips backward cache sync.
-
-| Resolution | CPU | GPU | GPU+Pipeline | Speedup (GPU vs CPU) |
-|-----------|----:|----:|-------------:|---------|
-| 224x224   | 0.66s | **0.53s** | 0.53s | **1.25x** |
-| 512x512   | 2.66s | 2.05s | **1.79s** | **1.49x** (pipeline) |
-
 ### Heterogeneous GPU+CPU Pipeline (v0.22.0)
 
 Pipeline mode (`--pipeline`) overlaps the two independent decoder views: feat1 runs on GPU while feat2 runs on CPU/AMX concurrently. Uses `MTLSharedEvent` signaling — single-threaded, no `Send`/`Sync` needed.
 
 | Resolution | Decoder (GPU) | Decoder (Pipeline) | Decoder (CPU) |
 |-----------|------:|------:|------:|
-| 224x224 | **12.3ms** | 164.0ms | 187.9ms |
-| 512x512 | **57.3ms** | 562.4ms | 778.7ms |
-
-At 224x224, the GPU decoder is already very fast (12.3ms) so there's little overlap benefit. At 512x512, pipeline mode reduces total inference time from 2.05s to **1.79s** (1.15x faster). The decoder itself is slower in pipeline mode due to cross-attention GPU→CPU sync points, but the total benefits from overlapped head postprocessing.
-
-Previous GPU results (v0.15.0, before GPU-resident attention):
-
-| Resolution | CPU (server) | GPU (server) | Note |
-|-----------|------------:|------------:|------|
-| 224x224   | ~0.51s      | ~0.52s      | Parity |
-| 512x384   | ~1.83s      | ~1.82s      | Parity |
+| 224x224 | **14.4ms** | 160.2ms | 181.5ms |
+| 512x384 | **37.5ms** | 398.7ms | 541.6ms |
 
 ### Optimizations applied
 1. **Weight loading** (378x): BufReader + bulk tensor reads instead of per-element syscalls
@@ -82,242 +80,251 @@ Winner column: PG=Peregrine, PT=PyTorch, TF=TensorFlow, JAX=JAX, MLX=MLX.
 
 | Framework | Wins (of 141 total ops) |
 |-----------|------------------------|
-| Peregrine | 68 |
-| PyTorch | 33 |
-| MLX | 14 |
+| Peregrine | 64 |
+| PyTorch | 31 |
+| MLX | 16 |
+| JAX | 16 |
 | TensorFlow | 13 |
-| JAX | 12 |
 | TinyGrad | 1 |
 
-Peregrine wins 68/141 ops. Geometric mean ratio vs PyTorch: 0.90x (Peregrine faster), vs MLX: 0.60x, vs TF: 0.53x, vs JAX: 0.62x, vs tinygrad: 0.10x.
+Peregrine wins 64/141 ops. Geometric mean ratio vs PyTorch: 0.94x (Peregrine faster), vs MLX: 0.68x, vs TF: 0.51x, vs JAX: 0.65x, vs tinygrad: 0.10x.
 
 ### Matmul
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| matmul_128x128 | 6.0 | **5.9** | 52.8 | 58.3 | 20.8 | 426.6 | PT |
-| matmul_256x256 | 70.1 | **30.5** | 166.9 | 183.7 | 43.4 | 430.1 | PT |
-| matmul_512x512 | 216.6 | **156.9** | 701.9 | 555.0 | 180.2 | 426.7 | PT |
-| matmul_1024x1024 | **997.7** | - | - | - | - | - | PG |
-| matmul_2048x2048 | **9477.6** | - | - | - | - | - | PG |
+| matmul_128x128 | **5.7** | 5.9 | 96.3 | 80.3 | 28.4 | 428.9 | PG |
+| matmul_256x256 | 69.2 | **31.7** | 195.0 | 158.3 | 81.4 | 443.4 | PT |
+| matmul_512x512 | 219.9 | **142.5** | 660.2 | 505.4 | 221.2 | 449.7 | PT |
+| matmul_1024x1024 | **1013.6** | - | - | - | - | - | PG |
+| matmul_2048x2048 | **9444.2** | - | - | - | - | - | PG |
 
 ### Add
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| add_100k | **12.6** | 36.4 | 52.7 | 37.9 | 37.6 | 199.9 | PG |
-| add_500k | 148.1 | 58.8 | 107.2 | **54.1** | 68.1 | 201.1 | JAX |
-| add_1M | **133.4** | - | - | - | - | - | PG |
-| add_5M | **530.9** | - | - | - | - | - | PG |
-| add_10M | **873.3** | - | - | - | - | - | PG |
+| add_100k | **12.7** | 40.3 | 56.0 | 33.8 | 32.4 | 193.4 | PG |
+| add_500k | 93.4 | 61.2 | 80.8 | **60.4** | 84.4 | 195.1 | JAX |
+| add_1M | **119.7** | - | - | - | - | - | PG |
+| add_5M | **575.3** | - | - | - | - | - | PG |
+| add_10M | **946.1** | - | - | - | - | - | PG |
 
 ### Mul
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| mul_100k | **12.5** | 41.9 | 50.8 | 39.1 | 25.6 | 203.0 | PG |
-| mul_500k | 107.5 | **58.9** | 106.5 | 72.0 | 69.5 | 196.2 | PT |
-| mul_1M | **134.1** | - | - | - | - | - | PG |
-| mul_5M | **539.9** | - | - | - | - | - | PG |
-| mul_10M | **1081.9** | - | - | - | - | - | PG |
+| mul_100k | **12.5** | 39.8 | 49.7 | 35.1 | 33.0 | 192.5 | PG |
+| mul_500k | 152.5 | **59.6** | 77.1 | 63.7 | 88.0 | 194.7 | PT |
+| mul_1M | **177.6** | - | - | - | - | - | PG |
+| mul_5M | **618.3** | - | - | - | - | - | PG |
+| mul_10M | **831.1** | - | - | - | - | - | PG |
 
 ### Exp
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| exp_100k | 130.2 | 62.4 | 73.2 | **36.5** | 71.0 | 237.4 | JAX |
-| exp_500k | 256.7 | 145.2 | 150.8 | **101.7** | 236.3 | 264.5 | JAX |
-| exp_1M | **379.8** | - | - | - | - | - | PG |
-| exp_5M | **1281.7** | - | - | - | - | - | PG |
-| exp_10M | **2177.1** | - | - | - | - | - | PG |
+| exp_100k | 95.2 | 64.3 | 72.8 | **46.2** | 73.6 | 224.4 | JAX |
+| exp_500k | 208.7 | 138.2 | **117.9** | 118.0 | 241.9 | 219.5 | TF |
+| exp_1M | **307.3** | - | - | - | - | - | PG |
+| exp_5M | **1105.3** | - | - | - | - | - | PG |
+| exp_10M | **2167.3** | - | - | - | - | - | PG |
 
 ### Activations
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| relu_100k | **8.79** | 39.3 | 39.1 | 83.4 | 26.7 | 356.6 | PG |
-| relu_1M | **134.0** | - | - | - | - | - | PG |
-| silu_100k | 65.8 | **49.2** | 228.8 | 111.7 | 86.7 | 367.3 | PT |
-| softplus_100k | 318.2 | **123.7** | 134.7 | 214.1 | 278.2 | 843.5 | PT |
-| mish_100k | 562.9 | 309.9 | **248.3** | 267.6 | 413.3 | 1222.5 | TF |
-| leaky_relu_100k | **7.96** | 42.5 | 18.8 | 37.4 | 98.4 | - | PG |
-| elu_100k | 144.9 | 104.6 | 150.8 | **78.2** | 135.9 | 899.2 | JAX |
-| hard_tanh_100k | 50.5 | **31.9** | 39.8 | 48.7 | 35.3 | - | PT |
-| relu6_100k | 50.5 | **32.2** | 44.5 | 120.2 | 70.8 | 765.6 | PT |
-| hardswish_100k | 86.1 | **32.8** | 175.4 | 39.0 | 67.1 | - | PT |
-| gelu_100k | 201.1 | **47.5** | 221.7 | 226.4 | 145.4 | 914.9 | PT |
-| selu_100k | 172.0 | 129.0 | 141.9 | 139.2 | **86.7** | 779.5 | MLX |
-| softsign_100k | **34.9** | 128.1 | 46.3 | 66.3 | 39.9 | - | PG |
+| relu_100k | **8.8** | 38.6 | 40.3 | 99.2 | 27.0 | 349.2 | PG |
+| relu_1M | **134.3** | - | - | - | - | - | PG |
+| silu_100k | 65.3 | 77.0 | 251.4 | **52.6** | 89.8 | 340.3 | JAX |
+| softplus_100k | 261.2 | 155.9 | **137.2** | 155.3 | 286.7 | 791.2 | TF |
+| mish_100k | 536.1 | 311.7 | 254.3 | **242.0** | 408.3 | 1174.0 | JAX |
+| leaky_relu_100k | **8.1** | 41.3 | 19.7 | 30.5 | 85.1 | - | PG |
+| elu_100k | 140.8 | 123.2 | 139.5 | **77.5** | 125.8 | 874.8 | JAX |
+| hard_tanh_100k | 51.5 | 40.3 | 44.1 | 38.8 | **37.7** | - | MLX |
+| relu6_100k | 51.5 | **41.4** | 50.8 | 110.6 | 54.0 | 748.1 | PT |
+| hardswish_100k | 85.2 | 40.5 | 206.9 | **26.8** | 75.5 | - | JAX |
+| gelu_100k | 80.8 | **71.2** | 252.7 | 221.3 | 148.3 | 858.6 | PT |
+| selu_100k | 168.0 | 130.3 | 141.7 | **82.5** | 88.5 | 754.4 | JAX |
+| softsign_100k | **34.9** | 125.8 | 47.9 | 59.0 | 50.9 | - | PG |
 
 ### Softmax / MLP / Train
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| softmax_8x128 | **3.79** | 27.1 | 13.5 | 32.1 | 14.5 | 652.5 | PG |
-| softmax_8x512 | 14.5 | 28.8 | **13.4** | 35.1 | 20.5 | 676.3 | TF |
-| mlp_fwd_64x784 | 33.5 | **28.7** | 276.4 | 161.4 | 73.8 | 2272.9 | PT |
-| mlp_fwd_256x784_wide | **428.6** | - | - | - | - | - | PG |
-| train_step_64 | **800.3** | 1301.3 | 9183.5 | 5162.5 | 1290.8 | 25633.0 | PG |
-| train_step_256_wide | **3309.9** | - | - | - | - | - | PG |
+| softmax_8x128 | **1.2** | 32.1 | 11.7 | 31.6 | 19.0 | 631.8 | PG |
+| softmax_8x512 | **4.3** | 35.0 | 14.5 | 34.0 | 20.1 | 635.2 | PG |
+| mlp_fwd_64x784 | 32.6 | **27.7** | 273.3 | 186.8 | 54.6 | 1817.5 | PT |
+| mlp_fwd_256x784_wide | **423.1** | - | - | - | - | - | PG |
+| train_step_64 | **819.3** | 1284.8 | 8635.0 | 5173.8 | 869.1 | 24367.6 | PG |
+| train_step_256_wide | **3354.9** | - | - | - | - | - | PG |
 
 ### Unary Math
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| reciprocal_100k | **8.67** | 40.5 | 53.6 | 30.1 | 25.5 | 173.0 | PG |
-| square_100k | **8.67** | 30.9 | 16.7 | 30.6 | 22.7 | 182.8 | PG |
-| rsqrt_100k | 77.0 | **29.9** | 58.1 | 92.2 | 31.7 | - | PT |
-| floor_100k | 46.7 | 29.9 | **18.5** | 28.0 | 32.7 | 433.6 | TF |
-| ceil_100k | 46.7 | 31.1 | **18.5** | 33.2 | 28.8 | 366.6 | TF |
-| round_100k | 46.7 | 33.9 | 47.7 | **30.1** | 30.1 | - | JAX |
-| sign_100k | 54.4 | **32.6** | 45.3 | 54.0 | 37.9 | 854.6 | PT |
-| expm1_100k | 166.4 | **69.2** | 165.8 | 101.9 | 121.7 | - | PT |
-| log2_100k | 119.5 | 82.5 | 132.1 | **64.6** | 114.7 | 169.0 | JAX |
-| log10_100k | 111.1 | **54.1** | 128.5 | 64.7 | 123.4 | - | PT |
-| log1p_100k | 123.2 | **53.5** | 92.2 | 63.6 | 132.9 | - | PT |
-| erf_100k | 117.9 | **37.5** | 44.6 | 57.9 | 106.5 | - | PT |
+| reciprocal_100k | **8.8** | 42.0 | 48.6 | 33.2 | 28.5 | 162.9 | PG |
+| square_100k | **8.8** | 37.4 | 15.8 | 29.2 | 24.7 | 175.2 | PG |
+| rsqrt_100k | 86.8 | 40.9 | 57.5 | 92.5 | **39.2** | - | MLX |
+| floor_100k | 46.7 | 39.4 | **17.7** | 34.3 | 25.7 | 409.9 | TF |
+| ceil_100k | 46.6 | 42.0 | **17.7** | 34.1 | 30.8 | 358.6 | TF |
+| round_100k | 46.6 | 43.3 | 47.2 | 30.9 | **28.2** | - | MLX |
+| sign_100k | 54.4 | 39.7 | 47.7 | 36.4 | **32.8** | 801.1 | MLX |
+| expm1_100k | 165.5 | 111.7 | 145.1 | **98.9** | 119.8 | - | JAX |
+| log2_100k | 111.8 | 85.6 | 149.4 | **64.0** | 111.0 | 165.2 | JAX |
+| log10_100k | 104.4 | 87.2 | 151.5 | **56.4** | 122.9 | - | JAX |
+| log1p_100k | 130.8 | **82.4** | 91.6 | 104.6 | 138.3 | - | PT |
+| erf_100k | 115.9 | 57.0 | 57.5 | **42.9** | 109.0 | - | JAX |
 
 ### Trig / Hyperbolic
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| sinh_100k | **51.1** | 102.7 | 162.5 | 141.8 | 94.3 | 564.8 | PG |
-| cosh_100k | **46.3** | 101.1 | 148.6 | 79.9 | 110.1 | 487.8 | PG |
-| arcsin_100k | 52.1 | 55.3 | **51.1** | 106.3 | 96.8 | 3078.2 | TF |
-| arccos_100k | 125.8 | 65.6 | **51.7** | 222.2 | 114.8 | - | TF |
-| arctan_100k | 53.1 | 60.3 | **52.9** | 217.8 | 100.0 | 3186.3 | TF |
-| arcsinh_100k | 145.0 | **129.5** | 167.3 | 136.0 | 376.5 | - | PT |
+| sinh_100k | **52.0** | 133.3 | 132.7 | 114.5 | 105.1 | 544.2 | PG |
+| cosh_100k | **47.2** | 131.6 | 133.7 | 71.9 | 102.8 | 465.4 | PG |
+| arcsin_100k | **53.1** | 74.1 | 54.2 | 114.2 | 102.6 | 2961.6 | PG |
+| arccos_100k | 111.7 | 89.1 | **53.5** | 202.9 | 119.4 | - | TF |
+| arctan_100k | **54.2** | 93.4 | 58.6 | 214.2 | 101.9 | 3086.2 | PG |
+| arcsinh_100k | 132.1 | 148.9 | 143.4 | **121.1** | 357.5 | - | JAX |
 
 ### Binary Ops
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| maximum_100k | **12.5** | 29.5 | 40.1 | 31.3 | 24.4 | 207.3 | PG |
-| minimum_100k | **12.5** | 30.9 | 34.2 | 32.2 | 21.9 | 404.8 | PG |
-| power_100k | 387.3 | 215.8 | 325.0 | **145.8** | 223.5 | - | JAX |
-| arctan2_100k | 1100.7 | 109.8 | **57.5** | 322.4 | 159.0 | - | TF |
-| logaddexp_100k | 409.2 | **125.0** | 380.5 | 175.7 | 284.6 | - | PT |
+| maximum_100k | **13.4** | 38.9 | 42.2 | 30.5 | 26.6 | 191.0 | PG |
+| minimum_100k | **13.4** | 42.2 | 44.2 | 32.9 | 30.8 | 384.5 | PG |
+| power_100k | 392.5 | 230.9 | 277.1 | **146.6** | 238.0 | - | JAX |
+| arctan2_100k | 1124.9 | 135.4 | **75.4** | 319.6 | 157.4 | - | TF |
+| logaddexp_100k | 416.6 | 153.5 | 364.0 | **152.0** | 280.5 | - | JAX |
 
 ### Comparison / Logic
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| clip_100k | **8.67** | 33.1 | 41.3 | 44.8 | 33.6 | 566.5 | PG |
-| where_100k | 95.7 | 38.1 | 65.8 | 33.3 | **27.5** | 282.2 | MLX |
-| greater_100k | 70.0 | 32.5 | 52.0 | 39.1 | **27.5** | 200.5 | MLX |
-| equal_100k | 70.0 | 24.7 | 46.5 | 40.5 | **22.4** | 301.6 | MLX |
+| clip_100k | **9.0** | 41.3 | 43.1 | 35.6 | 39.2 | 541.0 | PG |
+| where_100k | 94.9 | 51.0 | 66.5 | 34.8 | **29.4** | 281.6 | MLX |
+| greater_100k | 71.4 | 49.1 | 49.1 | 26.7 | **21.5** | 191.7 | MLX |
+| equal_100k | 71.4 | 30.2 | 56.4 | 29.4 | **24.4** | 291.1 | MLX |
 
 ### Reductions
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| sum_axis_256x512 | 112.6 | 29.7 | 44.4 | 56.0 | **21.9** | 220.5 | MLX |
-| mean_axis_256x512 | 112.6 | 33.3 | 44.3 | 53.3 | **23.0** | 298.2 | MLX |
-| max_axis_256x512 | 154.2 | **39.4** | 46.4 | 50.5 | 50.0 | 210.8 | PT |
-| min_axis_256x512 | 154.3 | 39.1 | 41.5 | 51.0 | **38.9** | 352.9 | MLX |
-| var_256x512 | 235.7 | 238.5 | 164.6 | 77.8 | **59.9** | - | MLX |
-| prod_axis_256x512 | 149.0 | 45.3 | **45.1** | 56.9 | 60.5 | - | TF |
-| logsumexp_256x512 | 383.3 | 146.5 | 282.4 | 324.0 | **141.1** | - | MLX |
-| cumsum_256x512 | 122.1 | **53.1** | 177.6 | 219.3 | 138.5 | 637.0 | PT |
-| argmax_axis_256x512 | 154.5 | 65.3 | **55.6** | 197.1 | 180.0 | 1388.2 | TF |
-| sum_axis_1024x1024 | **940.1** | - | - | - | - | - | PG |
-| var_1024x1024 | **1937.1** | - | - | - | - | - | PG |
+| sum_axis_256x512 | 114.8 | 38.6 | 51.2 | 52.3 | **20.8** | 211.0 | MLX |
+| mean_axis_256x512 | 112.6 | 43.5 | 50.7 | 47.5 | **25.5** | 291.6 | MLX |
+| max_axis_256x512 | 154.2 | 54.5 | 48.7 | **45.3** | 47.3 | 204.6 | JAX |
+| min_axis_256x512 | 154.2 | 53.4 | **48.3** | 48.3 | 49.4 | 330.5 | TF |
+| var_256x512 | 238.4 | 277.8 | 221.8 | 82.1 | **60.9** | - | MLX |
+| prod_axis_256x512 | 149.2 | 38.9 | 48.8 | 54.1 | **26.3** | - | MLX |
+| logsumexp_256x512 | 387.9 | 196.8 | 330.7 | 281.4 | **119.9** | - | MLX |
+| cumsum_256x512 | 122.2 | **77.3** | 196.2 | 202.3 | 144.5 | 612.4 | PT |
+| argmax_axis_256x512 | 154.5 | 95.9 | **75.8** | 173.0 | 184.3 | 1335.3 | TF |
+| sum_axis_1024x1024 | **941.8** | - | - | - | - | - | PG |
+| var_1024x1024 | **1936.0** | - | - | - | - | - | PG |
 
 ### Shape Ops
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| tril_256x256 | 35.8 | **32.2** | 42.3 | 40.1 | 55.5 | 1883.8 | PT |
-| triu_256x256 | 39.6 | **30.4** | 46.2 | 44.8 | 54.4 | 1927.4 | PT |
-| repeat_64x128_2x3 | 124.7 | 34.9 | 74.7 | 28.3 | **26.8** | - | MLX |
-| pad_64x128 | 16.7 | **4.71** | 86.6 | 18.3 | 17.6 | 98.7 | PT |
-| stack_8x64x128 | 15.1 | **9.19** | 51.8 | 167.3 | 42.7 | 971.4 | PT |
-| diagonal_512x512 | 0.75 | **0.71** | 11.8 | 8.60 | 23.5 | - | PT |
+| tril_256x256 | **34.7** | 39.2 | 54.2 | 38.8 | 63.6 | 1850.2 | PG |
+| triu_256x256 | **34.0** | 40.4 | 51.7 | 36.9 | 59.8 | 1854.2 | PG |
+| repeat_64x128_2x3 | 124.6 | 45.2 | 78.8 | **29.0** | 32.4 | - | JAX |
+| pad_64x128 | 16.8 | **4.4** | 86.8 | 18.2 | 21.8 | 89.6 | PT |
+| stack_8x64x128 | 14.4 | **8.7** | 55.1 | 162.3 | 47.1 | 931.9 | PT |
+| diagonal_512x512 | 0.8 | **0.6** | 12.5 | 10.1 | 28.4 | - | PT |
 
 ### Losses
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| cross_entropy_64x10 | **2.56** | 36.8 | 603.9 | 63.1 | 27.4 | 3702.7 | PG |
-| l1_loss_64x10 | **1.00** | 5.75 | 40.0 | 12.9 | 19.2 | 1171.0 | PG |
-| mse_loss_64x10 | **3.92** | 5.19 | 36.5 | 24.8 | 21.4 | 460.6 | PG |
-| huber_loss_64x10 | 5.38 | **5.10** | 226.8 | 50.1 | 32.3 | - | PT |
-| smooth_l1_loss_64x10 | **5.04** | 5.38 | 227.5 | 50.6 | 32.2 | - | PG |
-| kl_div_loss_64x10 | **2.50** | 6.54 | 356.5 | 81.4 | 22.2 | - | PG |
-| cosine_sim_loss_64x64 | 13.5 | **11.2** | 223.0 | 108.9 | 124.7 | - | PT |
+| cross_entropy_64x10 | **2.6** | 35.9 | 638.0 | 54.7 | 24.0 | 3387.7 | PG |
+| l1_loss_64x10 | **1.0** | 5.3 | 43.3 | 12.4 | 19.2 | 1129.7 | PG |
+| mse_loss_64x10 | **3.8** | 4.9 | 39.5 | 24.0 | 20.7 | 455.5 | PG |
+| huber_loss_64x10 | 5.3 | **4.8** | 237.7 | 49.1 | 39.6 | - | PT |
+| smooth_l1_loss_64x10 | 5.2 | **5.1** | 236.2 | 49.5 | 40.5 | - | PT |
+| kl_div_loss_64x10 | **2.5** | 6.4 | 383.4 | 63.4 | 23.5 | - | PG |
+| cosine_sim_loss_64x64 | 13.8 | **10.2** | 245.3 | 71.4 | 125.2 | - | PT |
 
 ### Layers
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| rmsnorm_64x512 | 57.7 | 52.7 | 443.9 | 83.1 | **30.6** | - | MLX |
-| conv1d_1x32x128_k3 | **20.6** | 50.5 | 546.4 | 74.6 | 44.2 | - | PG |
-| avgpool2d_1x16x32x32 | **25.0** | 32.2 | 62.2 | 42.8 | 280.5 | - | PG |
-| groupnorm_4x64x16x16 | 72.6 | **40.8** | 738.9 | 272.5 | 228.4 | - | PT |
+| rmsnorm_64x512 | 58.8 | 68.4 | 438.7 | 75.5 | **39.0** | - | MLX |
+| conv1d_1x32x128_k3 | **20.9** | 55.0 | 523.6 | 74.2 | 29.9 | - | PG |
+| avgpool2d_1x16x32x32 | **25.3** | 41.8 | 64.6 | 44.7 | 283.6 | - | PG |
+| groupnorm_4x64x16x16 | 72.5 | **53.6** | 787.3 | 267.8 | 235.1 | - | PT |
 
 ### RNN
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| rnn_seq32_128_256 | **196.3** | 288.1 | - | - | - | - | PG |
-| lstm_seq32_128_256 | 928.3 | **845.3** | - | - | - | - | PT |
-| gru_seq32_128_256 | **805.5** | 832.3 | - | - | - | - | PG |
+| rnn_seq32_128_256 | **194.9** | 270.3 | - | - | - | - | PG |
+| lstm_seq32_128_256 | 1136.0 | **807.9** | - | - | - | - | PT |
+| gru_seq32_128_256 | 807.3 | **782.5** | - | - | - | - | PT |
 
 ### Optimizers
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| optim_adam_64 | **804.2** | 1300.0 | - | - | - | - | PG |
-| optim_rmsprop_64 | **934.9** | 1151.5 | - | - | - | - | PG |
-| optim_lion_64 | **919.5** | - | - | - | - | - | PG |
-| optim_adafactor_64 | **1278.2** | - | - | - | - | - | PG |
+| optim_adam_64 | **795.4** | 1240.6 | - | - | - | - | PG |
+| optim_rmsprop_64 | **933.3** | 1175.8 | - | - | - | - | PG |
+| optim_lion_64 | **917.8** | - | - | - | - | - | PG |
+| optim_adafactor_64 | **1305.8** | - | - | - | - | - | PG |
 
 ### Random
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| rand_uniform_100k | **106.3** | 260.1 | 139.8 | 554.7 | 521.8 | 2568.5 | PG |
-| rand_normal_100k | 764.7 | 985.8 | **391.7** | 669.7 | 738.1 | 3551.3 | TF |
-| rand_bernoulli_100k | 302.7 | 257.9 | **220.8** | 564.5 | 488.9 | - | TF |
-| rand_uniform_1M | 1064.3 | 2585.0 | **519.9** | 2451.7 | 4907.3 | 2541.5 | TF |
-| rand_normal_1M | 7585.4 | 9758.1 | **2492.7** | 3160.0 | 7071.0 | 3557.4 | TF |
+| rand_uniform_100k | **109.6** | 257.5 | 121.1 | 553.9 | 520.5 | 2453.0 | PG |
+| rand_normal_100k | 783.1 | 974.1 | **354.0** | 623.3 | 748.1 | 3331.2 | TF |
+| rand_bernoulli_100k | 312.8 | 250.1 | **221.1** | 560.4 | 490.7 | - | TF |
+| rand_uniform_1M | 1073.5 | 2610.0 | **419.6** | 2274.8 | 4873.0 | 2439.7 | TF |
+| rand_normal_1M | 7686.7 | 9877.7 | **2088.5** | 2951.7 | 7038.8 | 3306.2 | TF |
 
 ### FFT
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| rfft_1k | **2.17** | 4.46 | 39.6 | 47.0 | 22.6 | - | PG |
-| rfft_4k | **6.50** | 14.8 | 50.7 | 72.1 | 44.0 | - | PG |
-| rfft_16k | **30.2** | 65.2 | 103.7 | 121.0 | 87.0 | - | PG |
-| fft_1k | **3.29** | 7.12 | 8.25 | 18.8 | 36.0 | - | PG |
-| fft_4k | **12.2** | 26.2 | 15.9 | 57.9 | 52.1 | - | PG |
+| rfft_1k | **2.2** | 4.5 | 44.7 | 50.0 | 20.6 | - | PG |
+| rfft_4k | **7.5** | 15.1 | 55.5 | 65.5 | 29.7 | - | PG |
+| rfft_16k | **30.3** | 66.2 | 107.1 | 117.0 | 83.8 | - | PG |
+| fft_1k | **3.3** | 6.8 | 9.1 | 45.1 | 24.4 | - | PG |
+| fft_4k | **12.0** | 26.9 | 18.7 | 61.7 | 44.4 | - | PG |
 
 ### Linear Algebra
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| norm_l2_1k | **1.08** | 1.38 | 63.2 | 13.9 | 28.6 | - | PG |
-| solve_64x64 | **12.0** | 24.8 | 23.9 | 32.3 | 98.8 | - | PG |
-| inv_64x64 | 37.3 | **26.8** | 31.9 | 41.7 | 66.2 | - | PT |
-| cholesky_64x64 | **9.67** | 25.6 | 19.2 | 11.0 | 34.3 | - | PG |
-| svd_64x64 | **275.7** | 279.2 | 515.0 | 312.7 | 295.6 | - | PG |
-| qr_64x64 | **41.2** | 83.2 | 84.5 | 64.0 | 71.0 | - | PG |
-| eigh_64x64 | 380.2 | 217.7 | **148.8** | 245.0 | 251.2 | - | TF |
-| det_64x64 | 23.3 | **21.0** | 22.3 | 34.4 | - | - | PT |
-| solve_128x128 | 50.0 | **45.6** | 77.4 | 85.4 | 206.2 | - | PT |
-| inv_128x128 | 93.8 | **60.5** | 141.7 | 87.1 | 95.8 | - | PT |
-| cholesky_128x128 | 50.6 | 48.9 | 59.0 | 37.2 | **30.9** | - | MLX |
-| svd_128x128 | 990.6 | **990.0** | 1829.6 | 1026.2 | 1060.6 | - | PT |
-| qr_128x128 | **188.5** | 226.2 | 334.3 | 195.8 | 221.3 | - | PG |
-| eigh_128x128 | 1849.4 | **704.8** | 751.8 | 754.3 | 791.2 | - | PT |
-| det_128x128 | 52.1 | **50.5** | 85.7 | 77.5 | - | - | PT |
-| solve_256x256 | 192.3 | **180.8** | 380.0 | 265.2 | 827.9 | - | PT |
-| inv_256x256 | 493.7 | 293.0 | 883.4 | 342.4 | **260.8** | - | MLX |
-| cholesky_256x256 | 226.5 | 76.6 | 292.1 | 121.1 | **71.3** | - | MLX |
-| svd_256x256 | 5926.2 | **5760.5** | 8301.2 | 5945.3 | 6647.2 | - | PT |
-| qr_256x256 | 1049.3 | 1015.1 | 1814.4 | **997.6** | 1186.3 | - | JAX |
-| eigh_256x256 | 6052.4 | **3502.2** | 4736.8 | 3613.7 | 3658.6 | - | PT |
-| det_256x256 | 213.8 | **206.5** | 450.5 | 207.2 | - | - | PT |
+| norm_l2_1k | **1.1** | 1.3 | 70.1 | 4.0 | 20.8 | - | PG |
+| solve_64x64 | **12.0** | 23.5 | 25.6 | 36.1 | 100.3 | - | PG |
+| inv_64x64 | 37.5 | **25.2** | 33.8 | 44.3 | 50.5 | - | PT |
+| cholesky_64x64 | **9.7** | 41.6 | 20.3 | 20.5 | 22.0 | - | PG |
+| svd_64x64 | **277.4** | 279.7 | 494.8 | 311.4 | 305.3 | - | PG |
+| qr_64x64 | **41.3** | 84.5 | 85.9 | 67.2 | 62.4 | - | PG |
+| eigh_64x64 | 380.3 | 215.4 | **144.5** | 253.3 | 236.4 | - | TF |
+| det_64x64 | 23.2 | **19.9** | 23.4 | 28.4 | - | - | PT |
+| solve_128x128 | 50.2 | **45.3** | 78.2 | 84.5 | 209.5 | - | PT |
+| inv_128x128 | 94.4 | **60.8** | 141.4 | 91.7 | 97.1 | - | PT |
+| cholesky_128x128 | 50.8 | 53.2 | 59.6 | 36.2 | **31.5** | - | MLX |
+| svd_128x128 | **994.4** | 994.6 | 1890.5 | 1025.0 | 1025.6 | - | PG |
+| qr_128x128 | **187.0** | 221.2 | 328.3 | 194.2 | 205.6 | - | PG |
+| eigh_128x128 | 1844.6 | **712.9** | 725.2 | 750.9 | 747.8 | - | PT |
+| det_128x128 | 52.3 | **49.6** | 84.7 | 77.5 | - | - | PT |
+| solve_256x256 | 189.5 | **182.9** | 384.9 | 287.4 | 747.4 | - | PT |
+| inv_256x256 | 460.7 | 285.7 | 859.9 | 333.7 | **250.6** | - | MLX |
+| cholesky_256x256 | 226.2 | 84.3 | 287.0 | 116.9 | **53.3** | - | MLX |
+| svd_256x256 | 5930.1 | **5881.8** | 8208.2 | 5913.0 | 6162.9 | - | PT |
+| qr_256x256 | 1026.4 | **986.2** | 1736.7 | 989.0 | 1065.7 | - | PT |
+| eigh_256x256 | 6082.2 | **3441.4** | 4629.2 | 3619.1 | 3615.8 | - | PT |
+| det_256x256 | 212.9 | **205.7** | 440.5 | 207.5 | - | - | PT |
+
+### Pipeline Ops
+
+| Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
+|----|-----------|---------|-----|-----|-----|----------|--------|
+| matmul_bias_gelu_196x768x3072 | 1070.7 | **921.8** | 2377.5 | 2172.8 | - | 1253.7 | PT |
+| matmul_bias_gelu_196x1024x4096 | 2205.9 | 2023.6 | 3737.7 | 3465.6 | - | **1293.4** | tinygrad |
+| add_layernorm_196x768 | 111.5 | **102.8** | 1211.4 | 231.8 | - | 1147.2 | PT |
+| add_layernorm_196x1024 | 139.7 | **104.1** | 1316.7 | 294.9 | - | 1139.2 | PT |
 
 ### Int8 Quantized Matmul
 
@@ -325,8 +332,8 @@ Peregrine-only benchmark comparing f32 (Apple Accelerate cblas_sgemm) vs int8 qu
 
 | Op | f32 (us) | i8 (us) | Ratio |
 |----|----------:|--------:|------:|
-| matmul_196x768x3072 | 636 | 14,603 | 23.0x slower |
-| matmul_196x1024x4096 | 1,508 | 28,587 | 19.0x slower |
+| matmul_196x768x3072 | 616 | 14,702 | 23.8x slower |
+| matmul_196x1024x4096 | 1,515 | 26,874 | 17.7x slower |
 
 The int8 path is currently slower than f32 because: (a) NEON `vmull_s8`+`vpadalq_s16` (stable) vs hardware `sdot` (unstable), (b) competing against Apple Accelerate's heavily optimized cblas_sgemm. The primary benefit is **4× memory reduction** for weight storage, enabling larger models to fit in memory. The Metal GPU dequant path loads 4× less data from device memory.
 
@@ -334,21 +341,31 @@ The int8 path is currently slower than f32 because: (a) NEON `vmull_s8`+`vpadalq
 
 ### Where Peregrine Wins (vs PyTorch)
 - **Elementwise (small tensors)**: add, mul, relu, clip — near-zero dispatch overhead, 3-5x faster
-- **Softmax**: 2-7x faster (fused implementation)
-- **Losses**: cross_entropy 14x, l1 6x, kl_div 2.6x — minimal dispatch overhead
+- **Softmax**: 7-27x faster (fused implementation, 1.2µs vs 32µs at 8x128)
+- **Losses**: cross_entropy 14x, l1 5x, kl_div 2.6x — minimal dispatch overhead
 - **FFT**: rfft/fft 2-4x faster across all sizes
 - **Train step**: 1.6x faster end-to-end
-- **Optimizers**: Adam 1.6x, RMSProp 1.2x
-- **Linalg (small)**: solve/cholesky/qr/svd at 64x64 — 1.5-2.7x faster
-- **Trig**: sinh 2x, cosh 2.2x
+- **Optimizers**: Adam 1.6x, RMSProp 1.3x
+- **Linalg (small)**: solve/cholesky/qr/svd at 64x64 — 1.0-4.3x faster
+- **Trig**: sinh 2.6x, cosh 2.8x, arctan 1.7x
 
 ### Where PyTorch Wins (vs Peregrine)
-- **GELU**: 4.2x faster (fused kernel)
-- **Reductions**: sum/mean 3.4-3.8x, max/min 3.9x
-- **Log/erf**: log10 2x, log1p 2.3x, erf 3.1x
-- **Shape ops**: pad 3.5x, repeat 3.6x, stack 1.6x
-- **Linalg (large)**: eigh_256 1.7x, inv_256 1.7x, cholesky_256 3.0x
-- **Activations**: hardswish, hard_tanh, relu6 — 1.4-1.6x
+- **Matmul (medium)**: 256x256 2.2x, 512x512 1.5x — Apple Accelerate advantage
+- **GELU**: 1.1x faster
+- **Reductions**: sum/mean 3x, max/min 2.8x
+- **Log/erf**: log1p 1.6x, erf 1.3x (JAX now wins erf)
+- **Shape ops**: pad 3.8x, stack 1.7x
+- **Linalg (large)**: eigh_256 1.8x, cholesky_256 2.7x
+- **LSTM**: 1.4x
+
+### Changes from Previous Run
+- **matmul_128**: Peregrine now wins (5.7µs vs 5.9µs, was tied)
+- **softmax_8x128**: Peregrine improved from 3.79µs to 1.2µs (3.2x faster)
+- **softmax_8x512**: Peregrine improved from 14.5µs to 4.3µs and now wins (was TF)
+- **tril/triu**: Peregrine now wins both (was PyTorch)
+- **arcsin**: Peregrine now wins (53.1µs, was TF at 51.1µs)
+- **svd_128**: Peregrine now wins (994.4µs vs 994.6µs, was PT)
+- **JAX gains**: JAX now wins more ops (16 vs 12), especially activations and math
 
 ## Reproducing
 
@@ -363,6 +380,9 @@ python3 scripts/bench_jax.py
 python3 scripts/bench_mlx.py
 python3 scripts/bench_tinygrad.py
 
+# Full comparison (all frameworks sequentially + comparison table)
+./scripts/bench_compare.sh
+
 # MUSt3R inference (single pair)
 cargo run --example must3r --release -- weights/must3r_224.bin img1.ppm img2.ppm
 cargo run --example must3r --release -- weights/must3r_512.bin img1.ppm img2.ppm 512x384
@@ -372,6 +392,9 @@ echo -e "img1.ppm\timg2.ppm\t224\t224" | cargo run --example must3r --release --
 
 # MUSt3R with Metal GPU
 cargo run --example must3r --release --features metal -- weights/must3r_224.bin img1.ppm img2.ppm --gpu
+
+# MUSt3R with GPU+Pipeline
+cargo run --example must3r --release --features metal -- weights/must3r_224.bin img1.ppm img2.ppm --gpu --pipeline
 
 # Multi-view pipeline with parallel workers
 python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all --workers 4

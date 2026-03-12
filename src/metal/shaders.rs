@@ -2392,4 +2392,97 @@ kernel void matmul_dequant_simd_i8(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Causal-masked softmax (fused into softmax — zero extra memory bandwidth)
+// Mask type via bit flags: bit0=causal, bit1=sliding_window, bit2=sink_tokens
+// Each threadgroup processes one row of [batch, dim]
+// ---------------------------------------------------------------------------
+
+struct CausalMaskSoftmaxParams {
+    uint batch;     // number of rows (total_bh * seq_q)
+    uint dim;       // row width (seq_kv)
+    uint seq_q;     // query sequence length
+    uint seq_kv;    // key/value sequence length
+    uint mask_type; // bit0=causal, bit1=sliding_window, bit2=sink_tokens
+    uint offset;    // position offset for causal masking
+    uint window;    // sliding window size (used if bit1 set)
+    uint sink_tokens; // number of sink tokens (used if bit2 set)
+};
+
+kernel void causal_mask_softmax_f32(
+    device const float* input   [[buffer(0)]],
+    device float* output        [[buffer(1)]],
+    constant CausalMaskSoftmaxParams& p [[buffer(2)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    uint row = gid;
+    if (row >= p.batch) return;
+
+    // Determine query head and query time position from row index
+    // rows are laid out as [bh, seq_q, seq_kv], so row = bh * seq_q + qt
+    uint qt = row % p.seq_q;
+    uint query_pos = p.offset + qt;
+
+    bool causal    = (p.mask_type & 1u) != 0;
+    bool sliding   = (p.mask_type & 2u) != 0;
+    bool use_sinks = (p.mask_type & 4u) != 0;
+
+    device const float* row_in = input + row * p.dim;
+    device float* row_out = output + row * p.dim;
+
+    threadgroup float shared[1024];
+
+    // 1. Find max (with masking)
+    float local_max = -INFINITY;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        bool masked = false;
+        if (causal && i > query_pos) masked = true;
+        if (!masked && sliding && !(use_sinks && i < p.sink_tokens)) {
+            if (query_pos > i && (query_pos - i) > p.window) masked = true;
+        }
+        float val = masked ? -INFINITY : row_in[i];
+        local_max = max(local_max, val);
+    }
+    shared[lid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride && lid + stride < group_size) {
+            shared[lid] = max(shared[lid], shared[lid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = shared[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Compute exp(x - max) and sum (masked positions get 0)
+    float local_sum = 0.0f;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        bool masked = false;
+        if (causal && i > query_pos) masked = true;
+        if (!masked && sliding && !(use_sinks && i < p.sink_tokens)) {
+            if (query_pos > i && (query_pos - i) > p.window) masked = true;
+        }
+        float e = masked ? 0.0f : exp(row_in[i] - row_max);
+        row_out[i] = e;
+        local_sum += e;
+    }
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride && lid + stride < group_size) {
+            shared[lid] += shared[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float total = shared[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Normalize
+    for (uint i = lid; i < p.dim; i += group_size) {
+        row_out[i] = (total > 0.0f) ? row_out[i] / total : 0.0f;
+    }
+}
 "#;

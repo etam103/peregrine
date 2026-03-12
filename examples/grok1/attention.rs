@@ -1,62 +1,15 @@
+use peregrine::attention::{
+    gqa_attention_cpu, AttentionMask, PostScoreTransform,
+};
 use peregrine::nn::RoPE;
 use peregrine::tensor::Tensor;
 use std::collections::HashMap;
 
-/// KV cache for autoregressive generation.
-pub struct KVCache {
-    /// Stored K values: [num_kv_heads, cached_len, head_dim]
-    pub k: Vec<f32>,
-    /// Stored V values: [num_kv_heads, cached_len, head_dim]
-    pub v: Vec<f32>,
-    pub len: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-}
-
-impl KVCache {
-    pub fn new(num_kv_heads: usize, head_dim: usize) -> Self {
-        KVCache {
-            k: Vec::new(),
-            v: Vec::new(),
-            len: 0,
-            num_kv_heads,
-            head_dim,
-        }
-    }
-
-    /// Append new K, V of shape [num_kv_heads, seq_len, head_dim].
-    pub fn append(&mut self, new_k: &[f32], new_v: &[f32], seq_len: usize) {
-        if self.len == 0 {
-            self.k = new_k.to_vec();
-            self.v = new_v.to_vec();
-            self.len = seq_len;
-        } else {
-            // Insert new entries into each head's slice
-            let old_len = self.len;
-            let new_len = old_len + seq_len;
-            let hd = self.head_dim;
-
-            let mut new_k_buf = Vec::with_capacity(self.num_kv_heads * new_len * hd);
-            let mut new_v_buf = Vec::with_capacity(self.num_kv_heads * new_len * hd);
-
-            for h in 0..self.num_kv_heads {
-                let old_offset = h * old_len * hd;
-                let append_offset = h * seq_len * hd;
-                new_k_buf.extend_from_slice(&self.k[old_offset..old_offset + old_len * hd]);
-                new_k_buf.extend_from_slice(&new_k[append_offset..append_offset + seq_len * hd]);
-
-                new_v_buf.extend_from_slice(&self.v[old_offset..old_offset + old_len * hd]);
-                new_v_buf.extend_from_slice(&new_v[append_offset..append_offset + seq_len * hd]);
-            }
-
-            self.k = new_k_buf;
-            self.v = new_v_buf;
-            self.len = new_len;
-        }
-    }
-}
+// Re-export StandardKVCache as KVCache for backward compat within this example
+pub use peregrine::attention::StandardKVCache as KVCache;
 
 /// Grouped Query Attention with RoPE, logit capping, and causal masking.
+/// Delegates core attention math to peregrine::attention::gqa_attention_cpu.
 pub struct GroupedQueryAttention {
     pub q_proj: Tensor, // [model_dim, num_q_heads * head_dim]
     pub k_proj: Tensor, // [model_dim, num_kv_heads * head_dim]
@@ -102,7 +55,6 @@ impl GroupedQueryAttention {
         let hd = self.head_dim;
         let nqh = self.num_q_heads;
         let nkvh = self.num_kv_heads;
-        let heads_per_group = nqh / nkvh;
 
         // Project Q, K, V
         let q_all = x.matmul(&self.q_proj); // [seq_len, nqh * hd]
@@ -165,69 +117,25 @@ impl GroupedQueryAttention {
 
         // Append to KV cache
         kv_cache.append(&k_rope, &v_arranged, seq_len);
-        let total_len = kv_cache.len;
 
-        // Compute attention: Q @ K^T with logit capping and causal mask
-        let cap = self.logit_cap;
-        let scale = self.attn_output_mult;
-
+        // Delegate attention to core GQA
         let mut output = vec![0.0f32; seq_len * nqh * hd];
+        let mask = AttentionMask::Causal { offset };
+        let transform = PostScoreTransform::LogitCap { cap: self.logit_cap };
 
-        for qh in 0..nqh {
-            let kvh = qh / heads_per_group;
-
-            for qt in 0..seq_len {
-                let q_off = qh * seq_len * hd + qt * hd;
-                let q_slice = &q_rope[q_off..q_off + hd];
-
-                // Compute scores against all cached K
-                let mut scores = Vec::with_capacity(total_len);
-                let k_base = kvh * total_len * hd;
-                for kt in 0..total_len {
-                    // Causal mask: only attend to positions <= current query position
-                    let query_pos = offset + qt;
-                    if kt > query_pos {
-                        scores.push(f32::NEG_INFINITY);
-                    } else {
-                        let k_off = k_base + kt * hd;
-                        let mut dot = 0.0f32;
-                        for d in 0..hd {
-                            dot += q_slice[d] * kv_cache.k[k_off + d];
-                        }
-                        // Scale and cap: cap * tanh(score * scale / cap)
-                        let scaled = dot * scale;
-                        let capped = cap * (scaled / cap).tanh();
-                        scores.push(capped);
-                    }
-                }
-
-                // Softmax
-                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut exp_sum = 0.0f32;
-                for s in &mut scores {
-                    *s = (*s - max_score).exp();
-                    exp_sum += *s;
-                }
-                if exp_sum > 0.0 {
-                    for s in &mut scores {
-                        *s /= exp_sum;
-                    }
-                }
-
-                // Weighted sum of V
-                let v_base = kvh * total_len * hd;
-                let out_off = qt * nqh * hd + qh * hd;
-                for kt in 0..total_len {
-                    let w = scores[kt];
-                    if w > 0.0 {
-                        let v_off = v_base + kt * hd;
-                        for d in 0..hd {
-                            output[out_off + d] += w * kv_cache.v[v_off + d];
-                        }
-                    }
-                }
-            }
-        }
+        gqa_attention_cpu(
+            &q_rope,
+            kv_cache,
+            kv_cache,
+            nqh,
+            nkvh,
+            seq_len,
+            hd,
+            self.attn_output_mult,
+            &mask,
+            &transform,
+            &mut output,
+        );
 
         // output is [seq_len, nqh * hd], project to [seq_len, model_dim]
         let attn_out = Tensor::new(output, vec![seq_len, nqh * hd], false);

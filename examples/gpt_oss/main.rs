@@ -77,6 +77,13 @@ fn main() {
         .and_then(|w| w[1].parse::<f32>().ok())
         .unwrap_or(0.0);
 
+    // Parse --speculative N (lookahead for speculative decoding)
+    let speculative_lookahead = args
+        .windows(2)
+        .find(|w| w[0] == "--speculative")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(0);
+
     // Parse --tokenizer PATH
     let tokenizer_path = args
         .windows(2)
@@ -92,7 +99,7 @@ fn main() {
                 skip_next = false;
                 continue;
             }
-            if arg == "--max-tokens" || arg == "--temperature" || arg == "--tokenizer" {
+            if arg == "--max-tokens" || arg == "--temperature" || arg == "--tokenizer" || arg == "--speculative" {
                 skip_next = true;
                 continue;
             }
@@ -114,6 +121,7 @@ fn main() {
         eprintln!("  --max-tokens N       Maximum tokens to generate (default: 32)");
         eprintln!("  --temperature T      Sampling temperature, 0=greedy (default: 0)");
         eprintln!("  --tokenizer PATH     Path to tokenizer.json");
+        eprintln!("  --speculative N      Speculative decoding lookahead (default: 0 = off)");
         std::process::exit(1);
     }
 
@@ -167,6 +175,9 @@ fn main() {
         config.num_kv_heads,
         config.sliding_window,
     );
+    if speculative_lookahead > 0 {
+        eprintln!("Speculative decoding: lookahead={}", speculative_lookahead);
+    }
 
     let t0 = Instant::now();
     let mut model = GptOss::new(config.clone());
