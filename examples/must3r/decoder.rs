@@ -148,6 +148,58 @@ impl CachedDecoderBlock {
 
         // Fused QKV projection: [batch*seq, embed_dim] x [embed_dim, 3*embed_dim]
         let qkv = normed.matmul(&self.qkv_weight).add_bias(&self.qkv_bias);
+
+        // GPU path: reshape + RoPE + SDPA all on GPU, no CPU round-trip
+        #[cfg(feature = "metal")]
+        if use_gpu {
+            let total_bh = batch * num_heads;
+            let head_size = total_bh * seq_len * head_dim;
+            let scores_size = total_bh * seq_len * seq_len;
+
+            // Precompute RoPE tables on CPU (small: seq_len * quarter floats)
+            let (cos_y, sin_y, cos_x, sin_x) = rope.compute_tables(positions, seq_len, head_dim);
+
+            // Dispatch all GPU work using the QKV buffer already on GPU
+            let attn_flat = qkv.with_gpu_buf(|qkv_buf| {
+                peregrine::metal::with_gpu(|gpu| {
+                    let q_buf = gpu.alloc::<f32>(head_size);
+                    let k_buf = gpu.alloc::<f32>(head_size);
+                    let v_buf = gpu.alloc::<f32>(head_size);
+
+                    gpu.dispatch_qkv_reshape(
+                        qkv_buf, &q_buf, &k_buf, &v_buf,
+                        batch as u32, seq_len as u32, num_heads as u32, head_dim as u32, embed_dim as u32,
+                    );
+
+                    let cos_y_buf = gpu.upload(&cos_y);
+                    let sin_y_buf = gpu.upload(&sin_y);
+                    let cos_x_buf = gpu.upload(&cos_x);
+                    let sin_x_buf = gpu.upload(&sin_x);
+
+                    gpu.dispatch_rope2d(&q_buf, &cos_y_buf, &sin_y_buf, &cos_x_buf, &sin_x_buf,
+                        total_bh as u32, seq_len as u32, head_dim as u32);
+                    gpu.dispatch_rope2d(&k_buf, &cos_y_buf, &sin_y_buf, &cos_x_buf, &sin_x_buf,
+                        total_bh as u32, seq_len as u32, head_dim as u32);
+
+                    let scores_buf = gpu.alloc::<f32>(scores_size);
+                    let attn_out_buf = gpu.alloc::<f32>(head_size);
+                    let scale = 1.0 / (head_dim as f32).sqrt();
+                    gpu.dispatch_sdpa(&q_buf, &k_buf, &v_buf, &scores_buf, &attn_out_buf,
+                        total_bh, seq_len, seq_len, head_dim, scale);
+
+                    let attn_flat_buf = gpu.alloc::<f32>(batch * seq_len * embed_dim);
+                    gpu.dispatch_attn_output_reshape(&attn_out_buf, &attn_flat_buf,
+                        batch as u32, seq_len as u32, num_heads as u32, head_dim as u32, embed_dim as u32);
+
+                    // Return GPU-resident tensor — no sync needed, matmul will use this buffer
+                    Tensor::from_gpu(attn_flat_buf, vec![batch * seq_len, embed_dim])
+                }).unwrap()
+            });
+
+            let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
+            return x.add(&attn_proj);
+        }
+
         let qkv_data = qkv.data();
 
         let qkv_stride = 3 * embed_dim;
@@ -225,10 +277,6 @@ impl CachedDecoderBlock {
         }
         let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_len, embed_dim], false);
 
-        // Upload attention output back to GPU for subsequent matmul ops
-        #[cfg(feature = "metal")]
-        if use_gpu { attn_flat.to_gpu(); }
-
         // Output projection
         let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
 
@@ -274,6 +322,51 @@ impl CachedDecoderBlock {
         let v = memory_normed
             .matmul(&self.cross_projv_weight)
             .add_bias(&self.cross_projv_bias); // [batch*seq_kv, embed_dim]
+
+        // GPU path: reshape + SDPA on GPU (no RoPE for cross-attention), no CPU round-trip
+        #[cfg(feature = "metal")]
+        if use_gpu {
+            let total_bh = batch * num_heads;
+            let q_head_size = total_bh * seq_q * head_dim;
+            let kv_head_size = total_bh * seq_kv * head_dim;
+            let scores_size = total_bh * seq_q * seq_kv;
+
+            let attn_flat = q.with_gpu_buf(|q_flat_buf| {
+                k.with_gpu_buf(|k_flat_buf| {
+                    v.with_gpu_buf(|v_flat_buf| {
+                        peregrine::metal::with_gpu(|gpu| {
+                            let q_buf = gpu.alloc::<f32>(q_head_size);
+                            let k_buf = gpu.alloc::<f32>(kv_head_size);
+                            let v_buf = gpu.alloc::<f32>(kv_head_size);
+
+                            gpu.dispatch_separate_reshape(q_flat_buf, &q_buf,
+                                batch as u32, seq_q as u32, num_heads as u32, head_dim as u32, embed_dim as u32);
+                            gpu.dispatch_separate_reshape(k_flat_buf, &k_buf,
+                                batch as u32, seq_kv as u32, num_heads as u32, head_dim as u32, embed_dim as u32);
+                            gpu.dispatch_separate_reshape(v_flat_buf, &v_buf,
+                                batch as u32, seq_kv as u32, num_heads as u32, head_dim as u32, embed_dim as u32);
+
+                            let scores_buf = gpu.alloc::<f32>(scores_size);
+                            let attn_out_buf = gpu.alloc::<f32>(q_head_size);
+                            let scale = 1.0 / (head_dim as f32).sqrt();
+                            gpu.dispatch_sdpa(&q_buf, &k_buf, &v_buf, &scores_buf, &attn_out_buf,
+                                total_bh, seq_q, seq_kv, head_dim, scale);
+
+                            let attn_flat_buf = gpu.alloc::<f32>(batch * seq_q * embed_dim);
+                            gpu.dispatch_attn_output_reshape(&attn_out_buf, &attn_flat_buf,
+                                batch as u32, seq_q as u32, num_heads as u32, head_dim as u32, embed_dim as u32);
+
+                            Tensor::from_gpu(attn_flat_buf, vec![batch * seq_q, embed_dim])
+                        }).unwrap()
+                    })
+                })
+            });
+
+            let attn_proj = attn_flat
+                .matmul(&self.cross_proj_weight)
+                .add_bias(&self.cross_proj_bias);
+            return x.add(&attn_proj);
+        }
 
         let q_data = q.data();
         let k_data = k.data();
@@ -334,10 +427,6 @@ impl CachedDecoderBlock {
             }
         }
         let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_q, embed_dim], false);
-
-        // Upload attention output back to GPU for subsequent matmul ops
-        #[cfg(feature = "metal")]
-        if use_gpu { attn_flat.to_gpu(); }
 
         // Output projection
         let attn_proj = attn_flat
@@ -454,7 +543,65 @@ impl MUSt3RDecoder {
         let total_tokens = batch * seq_len;
         let embed_dim = self.embed_dim;
 
-        // Batch feature embedding: stack both encoder outputs, project once
+        // GPU path: project each view separately, no stack/split round-trips.
+        // All tensors stay GPU-resident throughout the entire decoder.
+        #[cfg(feature = "metal")]
+        if use_gpu {
+            // Project each encoder output to decoder dimension (stays on GPU)
+            let mut feat1 = enc_feat1.matmul(&self.feat_embed_weight).add_bias(&self.feat_embed_bias);
+            let mut feat2 = enc_feat2.matmul(&self.feat_embed_weight).add_bias(&self.feat_embed_bias);
+
+            // Add image2_embed to feat2 via add_bias (image2_embed is [1,1,768] → reshape to [1,768])
+            let img2_data = self.image2_embed.data();
+            let img2_bias = Tensor::new(img2_data, vec![1, embed_dim], false);
+            img2_bias.to_gpu();
+            feat2 = feat2.add_bias(&img2_bias);
+
+            let mut total_self_attn = 0.0f64;
+            let mut total_cross_attn = 0.0f64;
+            let mut total_ffn = 0.0f64;
+
+            for block in &self.blocks {
+                // Self-attention on each view separately (no stacking needed)
+                let t0 = Instant::now();
+                feat1 = block.forward_self_attn(
+                    &feat1, pos1, &self.rope, batch, seq_len, self.num_heads, true,
+                );
+                feat2 = block.forward_self_attn(
+                    &feat2, pos1, &self.rope, batch, seq_len, self.num_heads, true,
+                );
+                total_self_attn += t0.elapsed().as_secs_f64() * 1000.0;
+
+                // Cross-attention (already separate — each view attends to the other)
+                let t0 = Instant::now();
+                let mem1 = feat1.clone();
+                let mem2 = feat2.clone();
+                feat1 = block.forward_cross_attn(
+                    &feat1, &mem2, batch, seq_len, seq_len, self.num_heads, true,
+                );
+                feat2 = block.forward_cross_attn(
+                    &feat2, &mem1, batch, seq_len, seq_len, self.num_heads, true,
+                );
+                total_cross_attn += t0.elapsed().as_secs_f64() * 1000.0;
+
+                // FFN on each view separately (no stacking needed)
+                let t0 = Instant::now();
+                feat1 = block.forward_ffn(&feat1);
+                feat2 = block.forward_ffn(&feat2);
+                total_ffn += t0.elapsed().as_secs_f64() * 1000.0;
+            }
+
+            eprintln!("    [Decoder profile] self_attn={:.1}ms cross_attn={:.1}ms ffn={:.1}ms",
+                     total_self_attn, total_cross_attn, total_ffn);
+
+            // Final layer norm on each view separately
+            let out1 = feat1.layer_norm(&self.norm_weight, &self.norm_bias, embed_dim);
+            let out2 = feat2.layer_norm(&self.norm_weight, &self.norm_bias, embed_dim);
+
+            return (out1, out2);
+        }
+
+        // CPU path: stack views for batched operations
         let enc1_data = enc_feat1.data();
         let enc2_data = enc_feat2.data();
         let enc_dim = enc1_data.len() / total_tokens;
@@ -462,10 +609,6 @@ impl MUSt3RDecoder {
         enc_both_data.extend_from_slice(&enc1_data);
         enc_both_data.extend_from_slice(&enc2_data);
         let enc_both = Tensor::new(enc_both_data, vec![2 * total_tokens, enc_dim], false);
-
-        // Upload encoder features to GPU for the matmul
-        #[cfg(feature = "metal")]
-        if use_gpu { enc_both.to_gpu(); }
 
         let feat_both = enc_both.matmul(&self.feat_embed_weight).add_bias(&self.feat_embed_bias);
 
@@ -490,35 +633,33 @@ impl MUSt3RDecoder {
 
         for block in &self.blocks {
             // Batched self-attention: stack feat1/feat2, run once with batch=2.
-            // Both views use the same positions (same grid), so pos1 works for both.
             let t0 = Instant::now();
-            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, use_gpu);
+            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, false);
             let both = block.forward_self_attn(
-                &both, pos1, &self.rope, 2 * batch, seq_len, self.num_heads, use_gpu,
+                &both, pos1, &self.rope, 2 * batch, seq_len, self.num_heads, false,
             );
-            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim, use_gpu);
+            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim, false);
             feat1 = f1;
             feat2 = f2;
             total_self_attn += t0.elapsed().as_secs_f64() * 1000.0;
 
-            // Cross-attention: img1 attends to img2 as memory, and vice versa.
-            // Cannot batch — each view uses different memory (the other view).
+            // Cross-attention
             let t0 = Instant::now();
             let mem1 = feat1.clone();
             let mem2 = feat2.clone();
             feat1 = block.forward_cross_attn(
-                &feat1, &mem2, batch, seq_len, seq_len, self.num_heads, use_gpu,
+                &feat1, &mem2, batch, seq_len, seq_len, self.num_heads, false,
             );
             feat2 = block.forward_cross_attn(
-                &feat2, &mem1, batch, seq_len, seq_len, self.num_heads, use_gpu,
+                &feat2, &mem1, batch, seq_len, seq_len, self.num_heads, false,
             );
             total_cross_attn += t0.elapsed().as_secs_f64() * 1000.0;
 
             // Batched FFN: stack feat1/feat2, run once
             let t0 = Instant::now();
-            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, use_gpu);
+            let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, false);
             let both = block.forward_ffn(&both);
-            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim, use_gpu);
+            let (f1, f2) = Self::split_features(&both, total_tokens, embed_dim, false);
             feat1 = f1;
             feat2 = f2;
             total_ffn += t0.elapsed().as_secs_f64() * 1000.0;
@@ -528,9 +669,9 @@ impl MUSt3RDecoder {
                  total_self_attn, total_cross_attn, total_ffn);
 
         // Batched final layer norm
-        let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, use_gpu);
+        let both = Self::stack_features(&feat1, &feat2, total_tokens, embed_dim, false);
         let normed = both.layer_norm(&self.norm_weight, &self.norm_bias, embed_dim);
-        let (out1, out2) = Self::split_features(&normed, total_tokens, embed_dim, use_gpu);
+        let (out1, out2) = Self::split_features(&normed, total_tokens, embed_dim, false);
 
         (out1, out2)
     }

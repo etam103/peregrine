@@ -16,3 +16,6 @@ pub mod envs;
 
 #[cfg(feature = "metal")]
 pub mod metal;
+
+#[cfg(feature = "comm")]
+pub mod comm;

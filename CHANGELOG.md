@@ -7,6 +7,60 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.19.0] - 2026-03-11
+
+### Added — GPU-resident attention for MUSt3R (27% faster than CPU at 512x512)
+
+Ports the entire attention pipeline to Metal GPU, eliminating all GPU-CPU round-trips that previously made GPU mode slower than CPU. The encoder and decoder now dispatch QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape entirely on GPU.
+
+**4 new Metal compute kernels** (`src/metal/shaders.rs`)
+- `qkv_reshape_f32` — splits fused `[batch*seq, 3*embed_dim]` into separate Q, K, V buffers in `[batch*heads, seq, head_dim]` layout
+- `rope2d_f32` — in-place 2D rotary position embeddings with precomputed cos/sin tables, rotate-half pairing pattern matching CroCo/DUSt3R/MUSt3R reference
+- `attn_output_reshape_f32` — transposes `[batch*heads, seq, head_dim]` back to `[batch*seq, embed_dim]`
+- `separate_reshape_f32` — reshapes single projection `[batch*seq, embed_dim]` to `[batch*heads, seq, head_dim]` for cross-attention
+
+**5 new dispatch methods** (`src/metal/context.rs`)
+- `dispatch_qkv_reshape` — drives QKV split kernel
+- `dispatch_rope2d` — drives RoPE2D in-place rotation on Q and K
+- `dispatch_separate_reshape` — cross-attention Q/K/V reshape
+- `dispatch_attn_output_reshape` — attention output transpose
+- `dispatch_sdpa` — composed scaled dot-product attention: scale Q → batched Q@K^T (per-head matmul with buffer byte offsets) → softmax → batched scores@V, all within a single command encoder
+
+**GPU attention paths** (`examples/must3r/encoder.rs`, `examples/must3r/decoder.rs`)
+- Encoder self-attention: GPU path uses `with_gpu_buf()` to read QKV buffer directly, dispatches full attention pipeline without CPU sync
+- Decoder self-attention: same pattern with RoPE2D applied to Q and K
+- Decoder cross-attention: separate Q/K/V projections reshaped on GPU via `dispatch_separate_reshape`, then SDPA
+- Decoder forward: processes each view separately (no stacking/splitting), keeping all tensors GPU-resident throughout the 12-block loop
+
+**Tensor GPU utilities** (`src/tensor.rs`)
+- `Tensor::from_gpu()` — create tensor wrapping an existing GPU buffer (inference, no grad)
+- `Tensor::gpu_read()` — read GPU buffer directly without updating CPU cache
+- `Tensor::with_gpu_buf()` — borrow GPU buffer for kernel dispatch without copying
+
+**RoPE2D GPU tables** (`examples/must3r/rope2d.rs`)
+- `compute_tables()` — precomputes (cos_y, sin_y, cos_x, sin_x) tables `[seq_len * quarter]` for GPU upload
+
+**Inference-mode layer_norm optimization** (`src/tensor.rs`)
+- When gamma doesn't require grad (inference), `layer_norm` skips the GPU sync + CPU backward cache computation that was the dominant performance bottleneck — saves one `gpu_sync()` per layer_norm call
+
+### Benchmark Results (MUSt3R 512x512, Apple Silicon)
+
+| Metric | CPU | GPU | Speedup |
+|--------|-----|-----|---------|
+| Encoder | 1902ms | 57ms (dispatch) | — |
+| Decoder | 846ms | 53ms (dispatch) | — |
+| Head+postproc | 14ms | 809ms (GPU sync) | — |
+| **Total** | **2.81s** | **2.05s** | **1.37x** |
+
+GPU output is byte-identical to CPU (same bounding boxes, same confidence values). All 485 lib tests and 27 metal parity tests pass.
+
+### Stats
+
+- 102 Metal compute shaders (up from 98), 35 dispatch methods (up from 30)
+- 27 metal parity tests (up from 23)
+
+---
+
 ## [0.18.0] - 2026-03-02
 
 ### Added — DeepSeek-V3/R1 (671B MoE Transformer) example

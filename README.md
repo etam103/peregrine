@@ -41,10 +41,10 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
 | **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
 | **`peregrine::envs`** | 10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe |
-| **`peregrine::metal`** | Metal GPU backend — 98 compute shaders, 30 dispatch methods, command batching, autograd integration, buffer pool (`--features metal`) |
+| **`peregrine::metal`** | Metal GPU backend — 102 compute shaders, 35 dispatch methods, command batching, autograd integration, buffer pool (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
-| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), optional Metal GPU (`--gpu`). Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
+| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512). Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
 | **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint |
 | **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint |
 | **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
@@ -215,15 +215,16 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 Geometric mean ratio across 133 ops (lower = Peregrine faster): **PyTorch 0.95x**, **MLX 0.74x**, TensorFlow 0.55x, tinygrad 0.09x, JAX 0.68x. Peregrine wins 56 of 133 ops.
 
-### MUSt3R 3D Reconstruction (423M params, CPU, Apple Silicon)
+### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
-| Resolution | Peregrine | PyTorch | Ratio |
-|-----------|-----------|---------|-------|
-| 224x224 | **0.67s** | 0.67s | 1.00x |
-| 512x384 | **1.98s** | 2.26s | 0.88x |
-| Weight load | **0.6s** | 1.6s | 0.38x |
+| Resolution | Peregrine CPU | Peregrine GPU | PyTorch CPU |
+|-----------|--------------|--------------|-------------|
+| 224x224 | **0.67s** | — | 0.67s |
+| 512x512 | 2.81s | **2.05s** | — |
+| 512x384 | **1.98s** | — | 2.26s |
+| Weight load | **0.6s** | 0.6s | 1.6s |
 
-Peregrine matches PyTorch at 224 and is 13% faster at 512 on this 423M parameter ViT model, using the same Accelerate BLAS. Optimizations: batched encoder/decoder, parallel multi-head attention, NEON+vvexpf softmax, chunked parallel GELU, fused QKV reshape.
+GPU mode (`--gpu`) keeps the entire attention pipeline on Metal — QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape all run as GPU kernels with no CPU round-trips. Inference-mode `layer_norm` skips backward cache sync, eliminating the dominant GPU stall. Result: **27% faster** than CPU at 512x512 with byte-identical output.
 
 ### Multi-View Reconstruction Pipeline
 
@@ -250,7 +251,7 @@ Server mode (`--server` flag on the Rust binary) loads weights once and processe
 | Pool bypass for small tensors | Skip HashMap overhead for tensors < 1024 elements |
 | Rayon threshold tuning | Dual thresholds (500K cheap / 100K expensive) — avoids spawn overhead |
 | Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
-| Metal GPU backend | 98 compute shaders with command batching and full autograd integration for end-to-end GPU training |
+| Metal GPU backend | 102 compute shaders with command batching, full autograd integration, and GPU-resident attention (QKV reshape, RoPE2D, SDPA) |
 
 ---
 
@@ -273,7 +274,7 @@ src/
   serial.rs       model weight save/load (binary format)
   rl.rs           RL algorithms — PPO, DQN, REINFORCE, replay/rollout buffers, Environment trait (~1,750 lines)
   envs.rs         10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe (~2,150 lines)
-  metal/          Metal GPU backend (98 shaders, 30 dispatch methods, command batching, autograd)
+  metal/          Metal GPU backend (102 shaders, 35 dispatch methods, command batching, autograd)
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
   wallclock.rs    wall-clock comparison benchmark (JSON output)
@@ -322,7 +323,7 @@ scripts/
 tests/
   pytorch_parity.rs   23 numerical parity tests vs PyTorch
   activations.rs      34 activation function tests
-  metal_parity.rs     23 CPU vs Metal parity tests
+  metal_parity.rs     27 CPU vs Metal parity tests
   metal_basics.rs     12 Metal compute shader tests
   metal_autograd.rs   17 GPU autograd integration tests
   generate_reference.py  script to regenerate PyTorch reference data

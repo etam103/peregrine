@@ -360,3 +360,80 @@ fn parity_matmul_bias_relu_training_loop() {
         opt.zero_grad();
     }
 }
+
+// --- Large matmul: simdgroup kernel parity ---
+
+fn max_rel_error(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| {
+        let err = (x - y).abs();
+        if x.abs() > 1e-6 { err / x.abs() } else { err }
+    }).fold(0.0f32, f32::max)
+}
+
+#[test]
+fn parity_matmul_large_simdgroup() {
+    // 1024x1024 triggers simdgroup kernel (M*N = 1M >= threshold)
+    peregrine::metal::init_gpu().unwrap();
+    for n in [1024, 1536] {
+        let a_data = random_data(n * n);
+        let b_data = random_data(n * n);
+
+        // CPU path
+        let a_cpu = Tensor::new(a_data.clone(), vec![n, n], false);
+        let b_cpu = Tensor::new(b_data.clone(), vec![n, n], false);
+        let c_cpu = a_cpu.matmul(&b_cpu);
+        let cpu_result = c_cpu.data();
+
+        // GPU path (auto-selects simdgroup for n>=1024)
+        let a_gpu = Tensor::new(a_data, vec![n, n], false);
+        let b_gpu = Tensor::new(b_data, vec![n, n], false);
+        a_gpu.to_gpu();
+        b_gpu.to_gpu();
+        let c_gpu = a_gpu.matmul(&b_gpu);
+        peregrine::metal::gpu_sync();
+        let gpu_result = c_gpu.data();
+
+        let abs_err = max_abs_error(&cpu_result, &gpu_result);
+        let rel_err = max_rel_error(&cpu_result, &gpu_result);
+        assert!(rel_err < 0.01,
+            "simdgroup matmul [{n}x{n}]: max_abs_err={abs_err}, max_rel_err={rel_err}");
+    }
+}
+
+#[test]
+fn parity_matmul_large_backward() {
+    // Verify backward pass works with simdgroup kernel on large matrices
+    peregrine::metal::init_gpu().unwrap();
+    let n = 1024;
+    let a_data = random_data(n * n);
+    let b_data = random_data(n * n);
+
+    // CPU backward
+    let a_cpu = Tensor::new(a_data.clone(), vec![n, n], true);
+    let b_cpu = Tensor::new(b_data.clone(), vec![n, n], true);
+    let c_cpu = a_cpu.matmul(&b_cpu);
+    let loss_cpu = c_cpu.sum();
+    loss_cpu.backward();
+    let grad_a_cpu = a_cpu.grad().unwrap();
+    let grad_b_cpu = b_cpu.grad().unwrap();
+
+    // GPU backward
+    let a_gpu = Tensor::new(a_data, vec![n, n], true);
+    let b_gpu = Tensor::new(b_data, vec![n, n], true);
+    a_gpu.to_gpu();
+    b_gpu.to_gpu();
+    let c_gpu = a_gpu.matmul(&b_gpu);
+    let loss_gpu = c_gpu.sum();
+    loss_gpu.backward();
+    peregrine::metal::gpu_sync();
+    let grad_a_gpu = a_gpu.grad().unwrap();
+    let grad_b_gpu = b_gpu.grad().unwrap();
+
+    let rel_a = max_rel_error(&grad_a_cpu, &grad_a_gpu);
+    let rel_b = max_rel_error(&grad_b_cpu, &grad_b_gpu);
+    assert!(rel_a < 0.01,
+        "simdgroup matmul backward grad_a [{n}x{n}]: max_rel_err={rel_a}");
+    assert!(rel_b < 0.01,
+        "simdgroup matmul backward grad_b [{n}x{n}]: max_rel_err={rel_b}");
+}

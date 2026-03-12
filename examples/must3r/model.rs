@@ -89,6 +89,13 @@ impl MUSt3R {
         let enc1 = Tensor::new(enc_data[..half].to_vec(), vec![seq_len, embed_dim], false);
         let enc2 = Tensor::new(enc_data[half..].to_vec(), vec![seq_len, embed_dim], false);
 
+        // Re-upload split tensors to GPU so decoder stays GPU-resident
+        #[cfg(feature = "metal")]
+        if use_gpu {
+            enc1.to_gpu();
+            enc2.to_gpu();
+        }
+
         eprintln!("  Decoding...");
         let t = Instant::now();
         let (dec1, dec2) = self.decoder.forward(&enc1, &enc2, &pos, &pos, 1, seq_len, use_gpu);

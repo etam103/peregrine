@@ -938,6 +938,7 @@ version = "0.9.0"
 dependencies = [
  "criterion",
  "image",
+ "libc",
  "objc2",
  "objc2-foundation",
  "objc2-metal",

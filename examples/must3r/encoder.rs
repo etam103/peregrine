@@ -179,6 +179,7 @@ impl EncoderBlock {
         use_gpu: bool,
     ) -> Tensor {
         let head_dim = self.embed_dim / num_heads;
+        let embed_dim = self.embed_dim;
         let t_block = Instant::now();
 
         // --- Pre-norm + Self-Attention ---
@@ -189,13 +190,115 @@ impl EncoderBlock {
         // Fused QKV projection: [batch*seq, embed_dim] * [embed_dim, 3*embed_dim] -> [batch*seq, 3*embed_dim]
         let t0 = Instant::now();
         let qkv = normed.matmul(&self.qkv_weight).add_bias(&self.qkv_bias);
-        let qkv_data = qkv.data();
         let dt_qkv = t0.elapsed();
 
-        // Fused QKV split + reshape: directly from [batch*seq, 3*embed_dim]
-        // to Q,K,V each in [batch, num_heads, seq_len, head_dim] layout.
+        // GPU path: reshape + RoPE + SDPA all on GPU, no CPU round-trip
         let t0 = Instant::now();
-        let embed_dim = self.embed_dim;
+        #[cfg(feature = "metal")]
+        let gpu_attn_result = if use_gpu {
+            let total_bh = batch * num_heads;
+            let head_size = total_bh * seq_len * head_dim;
+            let scores_size = total_bh * seq_len * seq_len;
+
+            // Precompute RoPE tables on CPU (small)
+            let (cos_y, sin_y, cos_x, sin_x) = rope.compute_tables(positions, seq_len, head_dim);
+
+            Some(qkv.with_gpu_buf(|qkv_buf| {
+                peregrine::metal::with_gpu(|gpu| {
+                    let q_buf = gpu.alloc::<f32>(head_size);
+                    let k_buf = gpu.alloc::<f32>(head_size);
+                    let v_buf = gpu.alloc::<f32>(head_size);
+
+                    gpu.dispatch_qkv_reshape(
+                        qkv_buf, &q_buf, &k_buf, &v_buf,
+                        batch as u32, seq_len as u32, num_heads as u32, head_dim as u32, embed_dim as u32,
+                    );
+
+                    let cos_y_buf = gpu.upload(&cos_y);
+                    let sin_y_buf = gpu.upload(&sin_y);
+                    let cos_x_buf = gpu.upload(&cos_x);
+                    let sin_x_buf = gpu.upload(&sin_x);
+
+                    gpu.dispatch_rope2d(&q_buf, &cos_y_buf, &sin_y_buf, &cos_x_buf, &sin_x_buf,
+                        total_bh as u32, seq_len as u32, head_dim as u32);
+                    gpu.dispatch_rope2d(&k_buf, &cos_y_buf, &sin_y_buf, &cos_x_buf, &sin_x_buf,
+                        total_bh as u32, seq_len as u32, head_dim as u32);
+
+                    let scores_buf = gpu.alloc::<f32>(scores_size);
+                    let attn_out_buf = gpu.alloc::<f32>(head_size);
+                    let scale = 1.0 / (head_dim as f32).sqrt();
+                    gpu.dispatch_sdpa(&q_buf, &k_buf, &v_buf, &scores_buf, &attn_out_buf,
+                        total_bh, seq_len, seq_len, head_dim, scale);
+
+                    let attn_flat_buf = gpu.alloc::<f32>(batch * seq_len * embed_dim);
+                    gpu.dispatch_attn_output_reshape(&attn_out_buf, &attn_flat_buf,
+                        batch as u32, seq_len as u32, num_heads as u32, head_dim as u32, embed_dim as u32);
+
+                    Tensor::from_gpu(attn_flat_buf, vec![batch * seq_len, embed_dim])
+                }).unwrap()
+            }))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "metal")]
+        let attn_flat = if let Some(flat) = gpu_attn_result {
+            flat
+        } else {
+            // CPU fallback (code below)
+            Self::cpu_self_attn(&qkv, rope, batch, seq_len, num_heads, head_dim, embed_dim, positions)
+        };
+
+        #[cfg(not(feature = "metal"))]
+        let attn_flat = Self::cpu_self_attn(&qkv, rope, batch, seq_len, num_heads, head_dim, embed_dim, positions);
+
+        let dt_attn = t0.elapsed();
+
+        // Output projection + residual
+        let t0 = Instant::now();
+        let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
+        let x = x.add(&attn_proj);
+        let dt_proj = t0.elapsed();
+
+        // --- Pre-norm + FFN ---
+        let t0 = Instant::now();
+        let normed = x.layer_norm(&self.norm2_weight, &self.norm2_bias, self.embed_dim);
+        let h = normed.matmul(&self.mlp_fc1_weight).add_bias(&self.mlp_fc1_bias).gelu();
+        let ffn_out = h.matmul(&self.mlp_fc2_weight).add_bias(&self.mlp_fc2_bias);
+
+        // Residual connection
+        let out = x.add(&ffn_out);
+        let dt_ffn = t0.elapsed();
+
+        // Print profile for first encoder block only
+        if !ENCODER_PROFILE_PRINTED.swap(true, Ordering::Relaxed) {
+            let total = t_block.elapsed();
+            eprintln!("    [Encoder block 0 profile] total={:.1}ms", total.as_secs_f64() * 1000.0);
+            eprintln!("      norm1:    {:.2}ms", dt_norm1.as_secs_f64() * 1000.0);
+            eprintln!("      qkv:     {:.2}ms", dt_qkv.as_secs_f64() * 1000.0);
+            eprintln!("      attn:    {:.2}ms", dt_attn.as_secs_f64() * 1000.0);
+            eprintln!("      proj:    {:.2}ms", dt_proj.as_secs_f64() * 1000.0);
+            eprintln!("      ffn:     {:.2}ms", dt_ffn.as_secs_f64() * 1000.0);
+        }
+
+        // Suppress unused variable warning when metal feature is off
+        let _ = use_gpu;
+
+        out
+    }
+
+    /// CPU self-attention fallback: QKV reshape + RoPE + MHA + output reshape.
+    fn cpu_self_attn(
+        qkv: &Tensor,
+        rope: &RoPE2D,
+        batch: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        embed_dim: usize,
+        positions: &[f32],
+    ) -> Tensor {
+        let qkv_data = qkv.data();
         let qkv_stride = 3 * embed_dim;
         let mut q_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
         let mut k_heads = vec![0.0f32; batch * num_heads * seq_len * head_dim];
@@ -218,50 +321,22 @@ impl EncoderBlock {
             }
         }
 
-        let dt_reshape = t0.elapsed();
-
-        // Apply 2D RoPE to Q and K per batch element.
-        // RoPE expects [num_heads, seq_len, head_dim] per batch.
-        let t0 = Instant::now();
         let per_batch = num_heads * seq_len * head_dim;
         for b in 0..batch {
             let start = b * per_batch;
             let end = start + per_batch;
-            let q_rotated = rope.apply(
-                &q_heads[start..end],
-                positions,
-                num_heads,
-                seq_len,
-                head_dim,
-            );
+            let q_rotated = rope.apply(&q_heads[start..end], positions, num_heads, seq_len, head_dim);
             q_heads[start..end].copy_from_slice(&q_rotated);
-
-            let k_rotated = rope.apply(
-                &k_heads[start..end],
-                positions,
-                num_heads,
-                seq_len,
-                head_dim,
-            );
+            let k_rotated = rope.apply(&k_heads[start..end], positions, num_heads, seq_len, head_dim);
             k_heads[start..end].copy_from_slice(&k_rotated);
         }
-        let dt_rope = t0.elapsed();
 
-        // Multi-head attention (parallel for large sequences)
-        let t0 = Instant::now();
         let scale = 1.0 / (head_dim as f32).sqrt();
         let total_bh = batch * num_heads;
-
         let attn_out_data = peregrine::tensor::multi_head_attention(
-            &q_heads, &k_heads, &v_heads,
-            total_bh, seq_len, seq_len, head_dim, scale,
+            &q_heads, &k_heads, &v_heads, total_bh, seq_len, seq_len, head_dim, scale,
         );
 
-        let dt_attn = t0.elapsed();
-
-        // Direct transpose [batch, num_heads, seq_len, head_dim] -> [batch*seq_len, embed_dim]
-        // Avoids Tensor::transpose which allocates + copies the full 4D tensor
-        let t0 = Instant::now();
         let mut attn_flat_data = vec![0.0f32; batch * seq_len * embed_dim];
         for b in 0..batch {
             for s in 0..seq_len {
@@ -274,46 +349,7 @@ impl EncoderBlock {
                 }
             }
         }
-        let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_len, embed_dim], false);
-
-        // Upload attention output back to GPU for subsequent matmul ops
-        #[cfg(feature = "metal")]
-        if use_gpu { attn_flat.to_gpu(); }
-
-        // Output projection
-        let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
-
-        // Residual connection
-        let x = x.add(&attn_proj);
-        let dt_proj = t0.elapsed();
-
-        // --- Pre-norm + FFN ---
-        let t0 = Instant::now();
-        let normed = x.layer_norm(&self.norm2_weight, &self.norm2_bias, self.embed_dim);
-        let h = normed.matmul(&self.mlp_fc1_weight).add_bias(&self.mlp_fc1_bias).gelu();
-        let ffn_out = h.matmul(&self.mlp_fc2_weight).add_bias(&self.mlp_fc2_bias);
-
-        // Residual connection
-        let out = x.add(&ffn_out);
-        let dt_ffn = t0.elapsed();
-
-        // Print profile for first encoder block only
-        if !ENCODER_PROFILE_PRINTED.swap(true, Ordering::Relaxed) {
-            let total = t_block.elapsed();
-            eprintln!("    [Encoder block 0 profile] total={:.1}ms", total.as_secs_f64() * 1000.0);
-            eprintln!("      norm1:    {:.2}ms", dt_norm1.as_secs_f64() * 1000.0);
-            eprintln!("      qkv:     {:.2}ms", dt_qkv.as_secs_f64() * 1000.0);
-            eprintln!("      reshape: {:.2}ms", dt_reshape.as_secs_f64() * 1000.0);
-            eprintln!("      rope:    {:.2}ms", dt_rope.as_secs_f64() * 1000.0);
-            eprintln!("      attn:    {:.2}ms", dt_attn.as_secs_f64() * 1000.0);
-            eprintln!("      proj:    {:.2}ms", dt_proj.as_secs_f64() * 1000.0);
-            eprintln!("      ffn:     {:.2}ms", dt_ffn.as_secs_f64() * 1000.0);
-        }
-
-        // Suppress unused variable warning when metal feature is off
-        let _ = use_gpu;
-
-        out
+        Tensor::new(attn_flat_data, vec![batch * seq_len, embed_dim], false)
     }
 }
 

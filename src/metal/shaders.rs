@@ -1699,4 +1699,288 @@ kernel void var_axis_f32(
     }
     output[idx] = var_acc / float(p.reduce_size - p.ddof);
 }
+
+// ---------------------------------------------------------------------------
+// QKV reshape: split fused [batch*seq, 3*embed_dim] -> Q, K, V in
+// [batch*heads, seq, head_dim] layout. 1 thread per output element.
+// ---------------------------------------------------------------------------
+
+struct QkvReshapeParams {
+    uint batch;
+    uint seq;
+    uint heads;
+    uint head_dim;
+    uint embed_dim;
+};
+
+kernel void qkv_reshape_f32(
+    device const float* qkv [[buffer(0)]],
+    device float* q         [[buffer(1)]],
+    device float* k         [[buffer(2)]],
+    device float* v         [[buffer(3)]],
+    constant QkvReshapeParams& p [[buffer(4)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint total = p.batch * p.heads * p.seq * p.head_dim;
+    if (idx >= total) return;
+
+    // Decompose flat index into (b, h, s, d) in output layout [batch*heads, seq, head_dim]
+    uint d = idx % p.head_dim;
+    uint rem = idx / p.head_dim;
+    uint s = rem % p.seq;
+    uint bh = rem / p.seq;
+    uint b = bh / p.heads;
+    uint h = bh % p.heads;
+
+    // Source index in [batch*seq, 3*embed_dim] layout
+    uint src_token = b * p.seq + s;
+    uint qkv_stride = 3 * p.embed_dim;
+    uint h_offset = h * p.head_dim + d;
+
+    q[idx] = qkv[src_token * qkv_stride + h_offset];
+    k[idx] = qkv[src_token * qkv_stride + p.embed_dim + h_offset];
+    v[idx] = qkv[src_token * qkv_stride + 2 * p.embed_dim + h_offset];
+}
+
+// ---------------------------------------------------------------------------
+// RoPE2D: in-place rotate-half on Q or K in [batch*heads, seq, head_dim]
+// Takes precomputed cos/sin tables [seq * quarter].
+// 1 thread per (batch*head, seq, quarter_idx).
+// ---------------------------------------------------------------------------
+
+struct Rope2dParams {
+    uint batch_heads;
+    uint seq;
+    uint head_dim;
+    uint quarter;  // head_dim / 4
+};
+
+kernel void rope2d_f32(
+    device float* data         [[buffer(0)]],
+    device const float* cos_y  [[buffer(1)]],
+    device const float* sin_y  [[buffer(2)]],
+    device const float* cos_x  [[buffer(3)]],
+    device const float* sin_x  [[buffer(4)]],
+    constant Rope2dParams& p   [[buffer(5)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint total = p.batch_heads * p.seq * p.quarter;
+    if (idx >= total) return;
+
+    uint i = idx % p.quarter;
+    uint rem = idx / p.quarter;
+    uint s = rem % p.seq;
+    uint bh = rem / p.seq;
+
+    uint half_dim = p.quarter * 2;
+    uint base = (bh * p.seq + s) * p.head_dim;
+
+    // Y-half: indices (base+i, base+quarter+i)
+    uint y_table = s * p.quarter + i;
+    float cy = cos_y[y_table];
+    float sy = sin_y[y_table];
+    float ya = data[base + i];
+    float yb = data[base + p.quarter + i];
+    data[base + i]            = ya * cy - yb * sy;
+    data[base + p.quarter + i] = yb * cy + ya * sy;
+
+    // X-half: indices (base+half_dim+i, base+half_dim+quarter+i)
+    uint x_table = s * p.quarter + i;
+    float cx = cos_x[x_table];
+    float sx = sin_x[x_table];
+    float xa = data[base + half_dim + i];
+    float xb = data[base + half_dim + p.quarter + i];
+    data[base + half_dim + i]            = xa * cx - xb * sx;
+    data[base + half_dim + p.quarter + i] = xb * cx + xa * sx;
+}
+
+// ---------------------------------------------------------------------------
+// Attention output reshape: [batch*heads, seq, head_dim] -> [batch*seq, embed_dim]
+// ---------------------------------------------------------------------------
+
+struct AttnReshapeParams {
+    uint batch;
+    uint seq;
+    uint heads;
+    uint head_dim;
+    uint embed_dim;
+};
+
+kernel void attn_output_reshape_f32(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant AttnReshapeParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint total = p.batch * p.seq * p.embed_dim;
+    if (idx >= total) return;
+
+    // Decompose into (b, s, h, d) in output [batch*seq, embed_dim]
+    uint d_all = idx % p.embed_dim;
+    uint bs = idx / p.embed_dim;
+    uint b = bs / p.seq;
+    uint s = bs % p.seq;
+    uint h = d_all / p.head_dim;
+    uint d = d_all % p.head_dim;
+
+    // Source: [batch*heads, seq, head_dim]
+    uint src = ((b * p.heads + h) * p.seq + s) * p.head_dim + d;
+    output[idx] = input[src];
+}
+
+// ---------------------------------------------------------------------------
+// Separate reshape: [batch*seq, embed_dim] -> [batch*heads, seq, head_dim]
+// Used for cross-attention (separate Q, K, V projections).
+// ---------------------------------------------------------------------------
+
+kernel void separate_reshape_f32(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant AttnReshapeParams& p [[buffer(2)]],
+    uint idx [[thread_position_in_grid]])
+{
+    uint total = p.batch * p.heads * p.seq * p.head_dim;
+    if (idx >= total) return;
+
+    // Decompose into (b, h, s, d) in output [batch*heads, seq, head_dim]
+    uint d = idx % p.head_dim;
+    uint rem = idx / p.head_dim;
+    uint s = rem % p.seq;
+    uint bh = rem / p.seq;
+    uint b = bh / p.heads;
+    uint h = bh % p.heads;
+
+    // Source: [batch*seq, embed_dim]
+    uint src = (b * p.seq + s) * p.embed_dim + h * p.head_dim + d;
+    output[idx] = input[src];
+}
+
+// ---------------------------------------------------------------------------
+// Simdgroup matmul: uses Metal's simdgroup_matrix 8x8 hardware multiply.
+// Cooperative threadgroup loads A/B tiles to shared memory, then simdgroups
+// load from shared for data reuse. 4 simdgroups per threadgroup (128 threads),
+// each threadgroup computes a 32x32 output tile.
+// ---------------------------------------------------------------------------
+
+constant uint STILE = 32;   // Threadgroup tile size (output)
+constant uint KTILE = 32;   // K-dimension tile (loaded to shared per iteration)
+
+kernel void matmul_simd_f32(
+    device const float* A       [[buffer(0)]],
+    device const float* B       [[buffer(1)]],
+    device float* C             [[buffer(2)]],
+    device const float* bias    [[buffer(3)]],
+    constant MatmulParams& p    [[buffer(4)]],
+    uint2 group_id              [[threadgroup_position_in_grid]],
+    uint  tid                   [[thread_index_in_threadgroup]],
+    uint  simd_id               [[simdgroup_index_in_threadgroup]])
+{
+    // Each threadgroup computes a 32x32 tile of C.
+    // 4 simdgroups, each computes a 16x16 sub-tile using 2x2 grid of 8x8.
+    uint sg_row = simd_id / 2;  // 0 or 1
+    uint sg_col = simd_id % 2;  // 0 or 1
+
+    uint base_row = group_id.y * STILE;
+    uint base_col = group_id.x * STILE;
+
+    // Shared memory: cooperative load from global, simdgroup_load from here
+    threadgroup float As[STILE][KTILE];   // 32 x 32
+    threadgroup float Bs[KTILE][STILE];   // 32 x 32
+
+    // 2x2 grid of 8x8 accumulators per simdgroup = 16x16 output
+    simdgroup_float8x8 acc[2][2];
+    for (uint i = 0; i < 2; i++)
+        for (uint j = 0; j < 2; j++)
+            acc[i][j] = simdgroup_float8x8(0.0f);
+
+    uint num_k_tiles = (p.K + KTILE - 1) / KTILE;
+
+    for (uint tk = 0; tk < num_k_tiles; tk++) {
+        uint k_base = tk * KTILE;
+
+        // Cooperative load: 128 threads load 32x32 = 1024 elements (8 per thread)
+        for (uint idx = tid; idx < STILE * KTILE; idx += 128) {
+            uint lr = idx / KTILE;
+            uint lc = idx % KTILE;
+            uint gr = base_row + lr;
+            uint gk = k_base + lc;
+            if (gr < p.M && gk < p.K) {
+                uint a_idx = p.trans_a ? (gk * p.M + gr) : (gr * p.K + gk);
+                As[lr][lc] = A[a_idx];
+            } else {
+                As[lr][lc] = 0.0f;
+            }
+        }
+        for (uint idx = tid; idx < KTILE * STILE; idx += 128) {
+            uint lr = idx / STILE;
+            uint lc = idx % STILE;
+            uint gk = k_base + lr;
+            uint gc = base_col + lc;
+            if (gk < p.K && gc < p.N) {
+                uint b_idx = p.trans_b ? (gc * p.K + gk) : (gk * p.N + gc);
+                Bs[lr][lc] = B[b_idx];
+            } else {
+                Bs[lr][lc] = 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each simdgroup processes its 16x16 sub-tile
+        // Walk K in steps of 8 within the loaded KTILE
+        for (uint kk = 0; kk < KTILE; kk += 8) {
+            // Load 2 8x8 tiles from A shared memory
+            simdgroup_float8x8 a_tile[2];
+            for (uint i = 0; i < 2; i++) {
+                simdgroup_load(a_tile[i],
+                    (threadgroup float*)&As[sg_row * 16 + i * 8][kk],
+                    KTILE);
+            }
+
+            // Load 2 8x8 tiles from B shared memory
+            simdgroup_float8x8 b_tile[2];
+            for (uint j = 0; j < 2; j++) {
+                simdgroup_load(b_tile[j],
+                    (threadgroup float*)&Bs[kk][sg_col * 16 + j * 8],
+                    STILE);
+            }
+
+            // 2x2 multiply-accumulate
+            for (uint i = 0; i < 2; i++)
+                for (uint j = 0; j < 2; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], a_tile[i], b_tile[j], acc[i][j]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results — each simdgroup stores its 2x2 grid of 8x8
+    for (uint i = 0; i < 2; i++) {
+        for (uint j = 0; j < 2; j++) {
+            uint r = base_row + sg_row * 16 + i * 8;
+            uint c = base_col + sg_col * 16 + j * 8;
+            if (r < p.M && c < p.N) {
+                simdgroup_store(acc[i][j], C + r * p.N + c, p.N);
+            }
+        }
+    }
+
+    // Fused bias + relu
+    if (p.fuse_bias || p.fuse_relu) {
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint i = tid; i < STILE * STILE; i += 128) {
+            uint lr = i / STILE;
+            uint lc = i % STILE;
+            uint r = base_row + lr;
+            uint c = base_col + lc;
+            if (r < p.M && c < p.N) {
+                uint idx = r * p.N + c;
+                float val = C[idx];
+                if (p.fuse_bias) val += bias[c];
+                if (p.fuse_relu) val = max(val, 0.0f);
+                C[idx] = val;
+            }
+        }
+    }
+}
 "#;

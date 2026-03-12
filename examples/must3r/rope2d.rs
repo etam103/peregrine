@@ -101,6 +101,43 @@ impl RoPE2D {
         }
     }
 
+    /// Precompute cos/sin tables for GPU dispatch.
+    ///
+    /// Returns (cos_y, sin_y, cos_x, sin_x), each [seq_len * quarter].
+    pub fn compute_tables(
+        &self,
+        positions: &[f32],
+        seq_len: usize,
+        head_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let half_dim = head_dim / 2;
+        let quarter = half_dim / 2;
+
+        let inv_freq: Vec<f32> = (0..quarter)
+            .map(|i| 1.0 / self.freq.powf(2.0 * i as f32 / half_dim as f32))
+            .collect();
+
+        let mut cos_y = vec![0.0f32; seq_len * quarter];
+        let mut sin_y = vec![0.0f32; seq_len * quarter];
+        let mut cos_x = vec![0.0f32; seq_len * quarter];
+        let mut sin_x = vec![0.0f32; seq_len * quarter];
+
+        for t in 0..seq_len {
+            let pos_y = positions[t * 2];
+            let pos_x = positions[t * 2 + 1];
+            for i in 0..quarter {
+                let theta_y = pos_y * inv_freq[i];
+                let theta_x = pos_x * inv_freq[i];
+                cos_y[t * quarter + i] = theta_y.cos();
+                sin_y[t * quarter + i] = theta_y.sin();
+                cos_x[t * quarter + i] = theta_x.cos();
+                sin_x[t * quarter + i] = theta_x.sin();
+            }
+        }
+
+        (cos_y, sin_y, cos_x, sin_x)
+    }
+
     /// Apply 2D RoPE to tensor data.
     ///
     /// Uses the rotate_half pairing pattern from CroCo/DUSt3R/MUSt3R:

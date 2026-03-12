@@ -665,16 +665,21 @@ impl LSTM {
         let seq_len = shape[0];
         assert_eq!(shape[1], self.input_size);
 
-        let x_data = x.data();
         let mut h = h0.clone();
         let mut c = c0.clone();
-        let mut outputs = Vec::with_capacity(seq_len * self.hidden_size);
         let hs = self.hidden_size;
 
+        // Pre-compute index ranges for gate splitting
+        let i_indices: Vec<usize> = (0..hs).collect();
+        let f_indices: Vec<usize> = (hs..2 * hs).collect();
+        let g_indices: Vec<usize> = (2 * hs..3 * hs).collect();
+        let o_indices: Vec<usize> = (3 * hs..4 * hs).collect();
+
+        let mut h_steps: Vec<Tensor> = Vec::with_capacity(seq_len);
+
         for t in 0..seq_len {
-            let start = t * self.input_size;
-            let x_t_data = x_data[start..start + self.input_size].to_vec();
-            let x_t = Tensor::new(x_t_data, vec![1, self.input_size], false);
+            // Extract x_t preserving autograd into input
+            let x_t = x.index_select(0, &[t]); // [1, input_size]
 
             // gates = x_t @ W_ih + b_ih + h @ W_hh + b_hh  [1, 4*hidden_size]
             let gates = x_t
@@ -682,28 +687,22 @@ impl LSTM {
                 .add_bias(&self.bias_ih)
                 .add(&h.matmul(&self.weight_hh).add_bias(&self.bias_hh));
 
-            let gates_data = gates.data();
-
-            // Split into i, f, g, o gates
-            let i_data: Vec<f32> = gates_data[0..hs].to_vec();
-            let f_data: Vec<f32> = gates_data[hs..2 * hs].to_vec();
-            let g_data: Vec<f32> = gates_data[2 * hs..3 * hs].to_vec();
-            let o_data: Vec<f32> = gates_data[3 * hs..4 * hs].to_vec();
-
-            let i_gate = Tensor::new(i_data, vec![1, hs], false).sigmoid();
-            let f_gate = Tensor::new(f_data, vec![1, hs], false).sigmoid();
-            let g_gate = Tensor::new(g_data, vec![1, hs], false).tanh();
-            let o_gate = Tensor::new(o_data, vec![1, hs], false).sigmoid();
+            // Split into i, f, g, o gates preserving autograd
+            let i_gate = gates.index_select(1, &i_indices).sigmoid();
+            let f_gate = gates.index_select(1, &f_indices).sigmoid();
+            let g_gate = gates.index_select(1, &g_indices).tanh();
+            let o_gate = gates.index_select(1, &o_indices).sigmoid();
 
             // c = f * c + i * g
             c = f_gate.mul(&c).add(&i_gate.mul(&g_gate));
             // h = o * tanh(c)
             h = o_gate.mul(&c.tanh());
 
-            outputs.extend(h.data());
+            h_steps.push(h.clone());
         }
 
-        let output = Tensor::new(outputs, vec![seq_len, self.hidden_size], false);
+        // Stack all hidden states preserving autograd
+        let output = Tensor::stack(&h_steps, 0).reshape(vec![seq_len, hs]);
         (output, h, c)
     }
 

@@ -6,9 +6,11 @@ edition = "2021"
 [features]
 default = []
 metal = ["objc2", "objc2-foundation", "objc2-metal"]
+comm = ["libc"]
 
 [dependencies]
 rayon = "1"
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
@@ -65,3 +67,20 @@ path = "examples/grok1/main.rs"
 [[example]]
 name = "deepseek"
 path = "examples/deepseek/main.rs"
+
+[[example]]
+name = "gpt_oss"
+path = "examples/gpt_oss/main.rs"
+
+[[example]]
+name = "moba"
+path = "examples/moba/main.rs"
+
+[[example]]
+name = "systolic_bench"
+path = "examples/systolic_bench.rs"
+
+[[example]]
+name = "comm_bench"
+path = "examples/comm_bench.rs"
+required-features = ["comm"]

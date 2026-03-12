@@ -88,6 +88,11 @@ impl GpuContext {
             "prod_axis_f32", "argmax_axis_f32", "argmin_axis_f32",
             "cumsum_f32", "cumprod_f32",
             "logsumexp_axis_f32", "var_axis_f32",
+            // Simdgroup matmul
+            "matmul_simd_f32",
+            // Attention reshape + RoPE kernels
+            "qkv_reshape_f32", "rope2d_f32",
+            "attn_output_reshape_f32", "separate_reshape_f32",
         ];
 
         let mut pipelines = HashMap::new();
@@ -105,6 +110,11 @@ impl GpuContext {
         let pool = BufferPool::new(&device);
 
         Ok(GpuContext { device, queue, pipelines, pool, pending_cmd: RefCell::new(None) })
+    }
+
+    /// Reference to the underlying MTLDevice.
+    pub fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
+        &self.device
     }
 
     /// Device name (e.g. "Apple M2 Max").
@@ -428,9 +438,36 @@ impl GpuContext {
         enc.endEncoding();
     }
 
+    /// Dispatch matmul with automatic kernel selection.
+    /// Uses simdgroup 8x8 kernel for large matrices (min(M,N) >= 64 and M*N >= 1024*1024),
+    /// falls back to scalar 16x16 tiled kernel otherwise.
+    /// Note: simdgroup kernel does not support fused bias/relu, so those always use scalar.
+    pub fn dispatch_matmul_auto(
+        &self,
+        a: &GpuBuffer<f32>,
+        b: &GpuBuffer<f32>,
+        c: &GpuBuffer<f32>,
+        bias: Option<&GpuBuffer<f32>>,
+        m: u32, n: u32, k: u32,
+        fuse_relu: bool,
+        trans_a: bool,
+        trans_b: bool,
+    ) {
+        let use_simd = m >= 64 && n >= 64
+            && (m as u64) * (n as u64) >= 1024 * 1024
+            && bias.is_none() && !fuse_relu;
+
+        if use_simd {
+            self.dispatch_matmul_simd(a, b, c, None, m, n, k, false, trans_a, trans_b);
+        } else {
+            self.dispatch_matmul_scalar(a, b, c, bias, m, n, k, fuse_relu, trans_a, trans_b);
+        }
+    }
+
     /// Dispatch matmul: C = op(A)[M,K] @ op(B)[K,N], optionally fused with bias and relu.
     /// trans_a/trans_b control whether A and B are transposed.
-    pub fn dispatch_matmul(
+    /// Scalar 16x16 tiled kernel — works at all sizes, supports fused bias/relu.
+    pub fn dispatch_matmul_scalar(
         &self,
         a: &GpuBuffer<f32>,
         b: &GpuBuffer<f32>,
@@ -487,6 +524,88 @@ impl GpuContext {
         let num_groups = MTLSize {
             width: (n as usize + tile_size - 1) / tile_size,
             height: (m as usize + tile_size - 1) / tile_size,
+            depth: 1,
+        };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch matmul with automatic kernel selection (convenience alias).
+    pub fn dispatch_matmul(
+        &self,
+        a: &GpuBuffer<f32>,
+        b: &GpuBuffer<f32>,
+        c: &GpuBuffer<f32>,
+        bias: Option<&GpuBuffer<f32>>,
+        m: u32, n: u32, k: u32,
+        fuse_relu: bool,
+        trans_a: bool,
+        trans_b: bool,
+    ) {
+        self.dispatch_matmul_auto(a, b, c, bias, m, n, k, fuse_relu, trans_a, trans_b);
+    }
+
+    /// Dispatch simdgroup matmul: uses hardware 8x8 simdgroup_matrix_multiply.
+    /// Each threadgroup has 4 simdgroups (128 threads), computing a 64x64 output tile.
+    pub fn dispatch_matmul_simd(
+        &self,
+        a: &GpuBuffer<f32>,
+        b: &GpuBuffer<f32>,
+        c: &GpuBuffer<f32>,
+        bias: Option<&GpuBuffer<f32>>,
+        m: u32, n: u32, k: u32,
+        fuse_relu: bool,
+        trans_a: bool,
+        trans_b: bool,
+    ) {
+        #[repr(C)]
+        struct MatmulParams {
+            m: u32,
+            n: u32,
+            k: u32,
+            fuse_bias: u32,
+            fuse_relu: u32,
+            trans_a: u32,
+            trans_b: u32,
+        }
+
+        let params = MatmulParams {
+            m, n, k,
+            fuse_bias: if bias.is_some() { 1 } else { 0 },
+            fuse_relu: if fuse_relu { 1 } else { 0 },
+            trans_a: if trans_a { 1 } else { 0 },
+            trans_b: if trans_b { 1 } else { 0 },
+        };
+
+        let pipeline = &self.pipelines["matmul_simd_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(a.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(b.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(c.raw()), 0, 2);
+            if let Some(bias_buf) = bias {
+                enc.setBuffer_offset_atIndex(Some(bias_buf.raw()), 0, 3);
+            }
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<MatmulParams>(),
+                4,
+            );
+        }
+
+        // 4 simdgroups of 32 threads = 128 threads per threadgroup
+        // Each threadgroup covers 32x32 output tile
+        let threads_per_group = 128usize;
+        let tile = 32usize;
+        let threadgroup_size = MTLSize { width: threads_per_group, height: 1, depth: 1 };
+        let num_groups = MTLSize {
+            width: (n as usize + tile - 1) / tile,
+            height: (m as usize + tile - 1) / tile,
             depth: 1,
         };
         enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
@@ -1324,6 +1443,295 @@ impl GpuContext {
         let grid_size = MTLSize { width: n, height: 1, depth: 1 };
         enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
         enc.endEncoding();
+    }
+
+    // --- Attention reshape + RoPE dispatch methods ---
+
+    /// Split fused QKV [batch*seq, 3*embed_dim] -> Q, K, V in [batch*heads, seq, head_dim].
+    pub fn dispatch_qkv_reshape(
+        &self,
+        qkv: &GpuBuffer<f32>,
+        q: &GpuBuffer<f32>,
+        k: &GpuBuffer<f32>,
+        v: &GpuBuffer<f32>,
+        batch: u32, seq: u32, heads: u32, head_dim: u32, embed_dim: u32,
+    ) {
+        #[repr(C)]
+        struct QkvReshapeParams { batch: u32, seq: u32, heads: u32, head_dim: u32, embed_dim: u32 }
+        let params = QkvReshapeParams { batch, seq, heads, head_dim, embed_dim };
+        let total = (batch * heads * seq * head_dim) as usize;
+
+        let pipeline = &self.pipelines["qkv_reshape_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(qkv.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(q.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(k.raw()), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(v.raw()), 0, 3);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<QkvReshapeParams>(), 4,
+            );
+        }
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(total), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: total, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+        enc.endEncoding();
+    }
+
+    /// In-place 2D RoPE on Q or K in [batch*heads, seq, head_dim] layout.
+    pub fn dispatch_rope2d(
+        &self,
+        data: &GpuBuffer<f32>,
+        cos_y: &GpuBuffer<f32>,
+        sin_y: &GpuBuffer<f32>,
+        cos_x: &GpuBuffer<f32>,
+        sin_x: &GpuBuffer<f32>,
+        batch_heads: u32, seq: u32, head_dim: u32,
+    ) {
+        #[repr(C)]
+        struct Rope2dParams { batch_heads: u32, seq: u32, head_dim: u32, quarter: u32 }
+        let quarter = head_dim / 4;
+        let params = Rope2dParams { batch_heads, seq, head_dim, quarter };
+        let total = (batch_heads * seq * quarter) as usize;
+
+        let pipeline = &self.pipelines["rope2d_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(data.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(cos_y.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(sin_y.raw()), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(cos_x.raw()), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(sin_x.raw()), 0, 4);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<Rope2dParams>(), 5,
+            );
+        }
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(total), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: total, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+        enc.endEncoding();
+    }
+
+    /// Reshape [batch*seq, embed_dim] -> [batch*heads, seq, head_dim] (for cross-attn).
+    pub fn dispatch_separate_reshape(
+        &self,
+        input: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        batch: u32, seq: u32, heads: u32, head_dim: u32, embed_dim: u32,
+    ) {
+        #[repr(C)]
+        struct AttnReshapeParams { batch: u32, seq: u32, heads: u32, head_dim: u32, embed_dim: u32 }
+        let params = AttnReshapeParams { batch, seq, heads, head_dim, embed_dim };
+        let total = (batch * heads * seq * head_dim) as usize;
+
+        let pipeline = &self.pipelines["separate_reshape_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<AttnReshapeParams>(), 2,
+            );
+        }
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(total), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: total, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+        enc.endEncoding();
+    }
+
+    /// Reshape [batch*heads, seq, head_dim] -> [batch*seq, embed_dim] (attn output).
+    pub fn dispatch_attn_output_reshape(
+        &self,
+        input: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        batch: u32, seq: u32, heads: u32, head_dim: u32, embed_dim: u32,
+    ) {
+        #[repr(C)]
+        struct AttnReshapeParams { batch: u32, seq: u32, heads: u32, head_dim: u32, embed_dim: u32 }
+        let params = AttnReshapeParams { batch, seq, heads, head_dim, embed_dim };
+        let total = (batch * seq * embed_dim) as usize;
+
+        let pipeline = &self.pipelines["attn_output_reshape_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<AttnReshapeParams>(), 2,
+            );
+        }
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(total), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: total, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+        enc.endEncoding();
+    }
+
+    /// Composed SDPA: scale Q, batched Q@K^T, softmax, batched scores@V.
+    /// All buffers in [total_bh, seq, head_dim] / [total_bh, seq_q, seq_kv] layout.
+    pub fn dispatch_sdpa(
+        &self,
+        q: &GpuBuffer<f32>,
+        k: &GpuBuffer<f32>,
+        v: &GpuBuffer<f32>,
+        scores: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        total_bh: usize, seq_q: usize, seq_kv: usize, head_dim: usize,
+        scale: f32,
+    ) {
+        // 1. Scale Q into scratch buffer (avoids modifying caller's q)
+        let q_len = total_bh * seq_q * head_dim;
+        let q_scaled = self.alloc::<f32>(q_len);
+        self.dispatch_scale(q, &q_scaled, scale);
+
+        // 2. Batched Q @ K^T -> scores [total_bh, seq_q, seq_kv]
+        let head_q_size = seq_q * head_dim;
+        let head_kv_size = seq_kv * head_dim;
+        let head_s_size = seq_q * seq_kv;
+
+        {
+            let cmd_ref = self.ensure_cmd();
+            let cmd = cmd_ref.as_ref().unwrap();
+            let enc = cmd.computeCommandEncoder().expect("encoder");
+
+            #[repr(C)]
+            struct MatmulParams { m: u32, n: u32, k: u32, fuse_bias: u32, fuse_relu: u32, trans_a: u32, trans_b: u32 }
+            let params = MatmulParams {
+                m: seq_q as u32, n: seq_kv as u32, k: head_dim as u32,
+                fuse_bias: 0, fuse_relu: 0, trans_a: 0, trans_b: 1,
+            };
+
+            // Choose kernel based on size
+            let use_simd = seq_q >= 64 && seq_kv >= 64
+                && (seq_q as u64) * (seq_kv as u64) >= 1024 * 1024;
+            let kernel_name = if use_simd { "matmul_simd_f32" } else { "matmul_f32" };
+            let pipeline = &self.pipelines[kernel_name];
+            enc.setComputePipelineState(pipeline);
+
+            for bh in 0..total_bh {
+                let q_offset = bh * head_q_size * 4; // byte offset
+                let k_offset = bh * head_kv_size * 4;
+                let s_offset = bh * head_s_size * 4;
+
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(q_scaled.raw()), q_offset, 0);
+                    enc.setBuffer_offset_atIndex(Some(k.raw()), k_offset, 1);
+                    enc.setBuffer_offset_atIndex(Some(scores.raw()), s_offset, 2);
+                    // dummy bias buffer (not used)
+                    enc.setBuffer_offset_atIndex(Some(scores.raw()), 0, 3);
+                    enc.setBytes_length_atIndex(
+                        std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                        std::mem::size_of::<MatmulParams>(), 4,
+                    );
+                }
+
+                if use_simd {
+                    let threads_per_group = 128usize;
+                    let tile = 32usize;
+                    let threadgroup_size = MTLSize { width: threads_per_group, height: 1, depth: 1 };
+                    let num_groups = MTLSize {
+                        width: (seq_kv + tile - 1) / tile,
+                        height: (seq_q + tile - 1) / tile,
+                        depth: 1,
+                    };
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+                } else {
+                    let tile_size = 16usize;
+                    let threadgroup_size = MTLSize { width: tile_size, height: tile_size, depth: 1 };
+                    let num_groups = MTLSize {
+                        width: (seq_kv + tile_size - 1) / tile_size,
+                        height: (seq_q + tile_size - 1) / tile_size,
+                        depth: 1,
+                    };
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+                }
+            }
+            enc.endEncoding();
+        }
+
+        // 3. Softmax over scores: each of total_bh * seq_q rows has seq_kv elements
+        self.dispatch_softmax(
+            scores, scores,
+            (total_bh * seq_q) as u32, seq_kv as u32,
+        );
+
+        // 4. Batched scores @ V -> output [total_bh, seq_q, head_dim]
+        {
+            let cmd_ref = self.ensure_cmd();
+            let cmd = cmd_ref.as_ref().unwrap();
+            let enc = cmd.computeCommandEncoder().expect("encoder");
+
+            #[repr(C)]
+            struct MatmulParams { m: u32, n: u32, k: u32, fuse_bias: u32, fuse_relu: u32, trans_a: u32, trans_b: u32 }
+            let params = MatmulParams {
+                m: seq_q as u32, n: head_dim as u32, k: seq_kv as u32,
+                fuse_bias: 0, fuse_relu: 0, trans_a: 0, trans_b: 0,
+            };
+
+            let use_simd = seq_q >= 64 && head_dim >= 64
+                && (seq_q as u64) * (head_dim as u64) >= 1024 * 1024;
+            let kernel_name = if use_simd { "matmul_simd_f32" } else { "matmul_f32" };
+            let pipeline = &self.pipelines[kernel_name];
+            enc.setComputePipelineState(pipeline);
+
+            for bh in 0..total_bh {
+                let s_offset = bh * head_s_size * 4;
+                let v_offset = bh * head_kv_size * 4;
+                let o_offset = bh * head_q_size * 4;
+
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(scores.raw()), s_offset, 0);
+                    enc.setBuffer_offset_atIndex(Some(v.raw()), v_offset, 1);
+                    enc.setBuffer_offset_atIndex(Some(output.raw()), o_offset, 2);
+                    enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 3);
+                    enc.setBytes_length_atIndex(
+                        std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                        std::mem::size_of::<MatmulParams>(), 4,
+                    );
+                }
+
+                if use_simd {
+                    let threads_per_group = 128usize;
+                    let tile = 32usize;
+                    let threadgroup_size = MTLSize { width: threads_per_group, height: 1, depth: 1 };
+                    let num_groups = MTLSize {
+                        width: (head_dim + tile - 1) / tile,
+                        height: (seq_q + tile - 1) / tile,
+                        depth: 1,
+                    };
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+                } else {
+                    let tile_size = 16usize;
+                    let threadgroup_size = MTLSize { width: tile_size, height: tile_size, depth: 1 };
+                    let num_groups = MTLSize {
+                        width: (head_dim + tile_size - 1) / tile_size,
+                        height: (seq_q + tile_size - 1) / tile_size,
+                        depth: 1,
+                    };
+                    enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+                }
+            }
+            enc.endEncoding();
+        }
     }
 }
 

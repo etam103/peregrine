@@ -921,6 +921,22 @@ impl Tensor {
         })))
     }
 
+    /// Create a Tensor that wraps an existing GPU buffer (inference only, no grad).
+    /// CPU data is empty; the GPU buffer is authoritative.
+    #[cfg(feature = "metal")]
+    pub fn from_gpu(gpu_data: crate::metal::GpuBuffer<f32>, shape: Vec<usize>) -> Self {
+        Tensor(Rc::new(RefCell::new(TensorInner {
+            data: Vec::new(),
+            shape,
+            grad: None,
+            op: Op::None,
+            requires_grad: false,
+            gpu_data: Some(gpu_data),
+            gpu_grad: None,
+            gpu_dirty: true,
+        })))
+    }
+
     /// Upload CPU data to GPU, making the tensor GPU-resident.
     #[cfg(feature = "metal")]
     pub fn to_gpu(&self) {
@@ -989,6 +1005,34 @@ impl Tensor {
     #[cfg(feature = "metal")]
     pub fn is_gpu(&self) -> bool {
         self.0.borrow().gpu_data.is_some()
+    }
+
+    /// Read GPU buffer contents directly without going through CPU sync.
+    /// This is more efficient than `data()` when the tensor is GPU-resident
+    /// and you only need to read the raw float data (e.g., for re-uploading
+    /// to a different GPU buffer layout).
+    ///
+    /// Panics if the tensor has no GPU data.
+    #[cfg(feature = "metal")]
+    pub fn gpu_read(&self) -> Vec<f32> {
+        crate::metal::gpu_sync();
+        let inner = self.0.borrow();
+        inner.gpu_data.as_ref().expect("Tensor not on GPU").read()
+    }
+
+    /// Run a closure with a reference to the underlying GPU buffer.
+    /// Useful for dispatching GPU kernels that read from this tensor's buffer
+    /// without copying data. Syncs pending GPU commands first.
+    ///
+    /// Panics if the tensor has no GPU data.
+    #[cfg(feature = "metal")]
+    pub fn with_gpu_buf<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&crate::metal::GpuBuffer<f32>) -> R,
+    {
+        let inner = self.0.borrow();
+        let buf = inner.gpu_data.as_ref().expect("Tensor not on GPU");
+        f(buf)
     }
 
     /// Ensure CPU data is available (sync from GPU if needed).
@@ -2408,6 +2452,7 @@ impl Tensor {
                 inner.gpu_data.is_some() && g.gpu_data.is_some() && b.gpu_data.is_some()
             };
             if can_gpu {
+                let needs_grad = gamma.0.borrow().requires_grad;
                 if let Some(result) = crate::metal::with_gpu(|gpu| {
                     let inner = self.0.borrow();
                     let g = gamma.0.borrow();
@@ -2423,6 +2468,10 @@ impl Tensor {
                     let shape = inner.shape.clone();
                     (out, shape)
                 }) {
+                    // Inference path: no backward cache needed, no GPU sync
+                    if !needs_grad {
+                        return Tensor::from_gpu(result.0, result.1);
+                    }
                     // Need normalized and inv_std for backward — compute on CPU from GPU output
                     // For simplicity, read back and compute
                     crate::metal::gpu_sync();

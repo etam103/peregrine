@@ -31,16 +31,22 @@ Server mode (`--server`) loads weights once and processes pairs over stdin/stdou
 
 With `--workers N` in `reconstruct_video.py`, pairs are distributed across N server processes for near-linear wall-clock scaling.
 
-### Metal GPU Inference (v0.15.0)
+### Metal GPU Inference (v0.19.0 — GPU-Resident Attention)
 
-GPU mode (`--gpu`, requires `--features metal`) dispatches matmul, layernorm, GELU, add, add_bias to Metal GPU.
+GPU mode (`--gpu`, requires `--features metal`) now keeps the entire attention pipeline on GPU: QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape — with no CPU round-trips. Inference-mode `layer_norm` skips backward cache sync.
+
+| Resolution | CPU | GPU | Speedup |
+|-----------|----:|----:|---------|
+| 512x512   | 2.81s | **2.05s** | **1.37x** |
+
+GPU output is byte-identical to CPU. The encoder+decoder dispatch in ~110ms total; the head's `.data()` call triggers the actual GPU execution (~809ms), which represents the full pipelined GPU compute.
+
+Previous GPU results (v0.15.0, before GPU-resident attention):
 
 | Resolution | CPU (server) | GPU (server) | Note |
 |-----------|------------:|------------:|------|
 | 224x224   | ~0.51s      | ~0.52s      | Parity |
 | 512x384   | ~1.83s      | ~1.82s      | Parity |
-
-GPU is at parity (not faster) due to decoder GPU↔CPU roundtrips in stack/split features and Apple's AMX-based sgemm matching the tiled Metal matmul. GPU output is byte-identical to CPU.
 
 ### Optimizations applied
 1. **Weight loading** (378x): BufReader + bulk tensor reads instead of per-element syscalls
@@ -53,6 +59,8 @@ GPU is at parity (not faster) due to decoder GPU↔CPU roundtrips in stack/split
 8. **Direct transpose loops**: Replaces Tensor::transpose() which allocated + copied full 4D tensors
 9. **Server mode**: Load weights once, process all pairs over stdin/stdout — eliminates ~0.5s overhead per pair
 10. **Metal GPU dispatch**: GELU, matmul, layernorm, add, add_bias on GPU (with `precise::tanh()` fix for GELU correctness)
+11. **GPU-resident attention** (v0.19.0): 4 new Metal kernels (QKV reshape, RoPE2D, attention output reshape, separate reshape) + composed SDPA (scale → batched matmul → softmax → batched matmul) — eliminates all GPU↔CPU round-trips in attention blocks
+12. **Inference-mode layer_norm** (v0.19.0): skips GPU sync + backward cache computation when gamma doesn't require grad — removes the dominant GPU stall point
 
 ## Op-Level Benchmarks — 6 Frameworks
 
