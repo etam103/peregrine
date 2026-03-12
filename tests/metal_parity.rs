@@ -780,3 +780,31 @@ fn parity_gpu_cpu_sdpa_gqa() {
     let err = max_abs_error(&gpu_out, &cpu_out);
     assert!(err < 0.01, "GQA SDPA GPU/CPU parity: max_abs_err={err}");
 }
+
+// --- 2:4 Structured Sparse Matmul ---
+
+#[test]
+fn parity_gpu_cpu_sparse_24() {
+    use peregrine::sparse::{prune_to_24, matmul_sparse_24, matmul_sparse_24_gpu};
+
+    let gpu = GpuContext::new().unwrap();
+
+    for &(m, k, n) in &[(8, 16, 12), (32, 64, 48), (16, 128, 32), (1, 4, 1)] {
+        let a = random_data(m * k);
+        let w = random_data(k * n);
+
+        let mut st = prune_to_24(&w, k, n);
+        let cpu_result = matmul_sparse_24(&a, m, k, &st);
+
+        st.to_gpu(&gpu);
+        let gpu_buf = matmul_sparse_24_gpu(&gpu, &a, m, k, &st);
+        gpu.sync();
+        let gpu_result = gpu_buf.read();
+
+        let err = max_abs_error(&cpu_result, &gpu_result);
+        assert!(
+            err < 1e-3,
+            "sparse-24 GPU/CPU parity: M={m} K={k} N={n} max_abs_err={err}"
+        );
+    }
+}

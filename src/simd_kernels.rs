@@ -1027,6 +1027,127 @@ pub fn gemm_i8_sdot(
 }
 
 // ========================================================================
+// 2:4 Structured Sparse GEMM
+// ========================================================================
+
+/// NEON-accelerated 2:4 sparse matmul: C[M,N] = A[M,K] @ W_sparse_24[K,N].
+///
+/// W is stored in 2:4 packed format:
+///   - `w_vals`: [K/4 * N * 2] f32 — two non-zero values per group-of-4 per column
+///   - `w_idx`:  [K/4 * N] u8 — nibble-packed indices (low=idx0, high=idx1)
+///
+/// Processes 4-element groups along K, gathers 2 A values per group via indices,
+/// multiplies with packed W values, accumulates with NEON fmla.
+#[cfg(target_arch = "aarch64")]
+pub fn gemm_sparse_24(
+    a: &[f32],       // [M, K] row-major
+    w_vals: &[f32],  // [K/4 * N * 2] packed values
+    w_idx: &[u8],    // [K/4 * N] nibble-packed indices
+    out: &mut [f32],  // [M, N]
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    debug_assert_eq!(k % 4, 0);
+    debug_assert_eq!(a.len(), m * k);
+    debug_assert_eq!(out.len(), m * n);
+    let groups = k / 4;
+    debug_assert_eq!(w_vals.len(), groups * n * 2);
+    debug_assert_eq!(w_idx.len(), groups * n);
+
+    // Process 4 columns at a time with NEON
+    let n_chunks = n / 4;
+
+    for mi in 0..m {
+        let a_row = &a[mi * k..];
+
+        for nc in 0..n_chunks {
+            let ni_base = nc * 4;
+            unsafe {
+                let mut acc0 = vdupq_n_f32(0.0);
+                let mut acc1 = vdupq_n_f32(0.0);
+
+                for g in 0..groups {
+                    let a_base = g * 4;
+                    let idx_off = g * n + ni_base;
+                    let val_off = g * n * 2 + ni_base * 2;
+
+                    // Load 4 index bytes for 4 columns
+                    let ib0 = *w_idx.get_unchecked(idx_off);
+                    let ib1 = *w_idx.get_unchecked(idx_off + 1);
+                    let ib2 = *w_idx.get_unchecked(idx_off + 2);
+                    let ib3 = *w_idx.get_unchecked(idx_off + 3);
+
+                    // For each column, gather the two A values and multiply
+                    let i00 = (ib0 & 0x0F) as usize;
+                    let i01 = ((ib0 >> 4) & 0x0F) as usize;
+                    let i10 = (ib1 & 0x0F) as usize;
+                    let i11 = ((ib1 >> 4) & 0x0F) as usize;
+                    let i20 = (ib2 & 0x0F) as usize;
+                    let i21 = ((ib2 >> 4) & 0x0F) as usize;
+                    let i30 = (ib3 & 0x0F) as usize;
+                    let i31 = ((ib3 >> 4) & 0x0F) as usize;
+
+                    // Gather A values for idx0 across 4 columns
+                    let a_gather0 = vld1q_f32([
+                        *a_row.get_unchecked(a_base + i00),
+                        *a_row.get_unchecked(a_base + i10),
+                        *a_row.get_unchecked(a_base + i20),
+                        *a_row.get_unchecked(a_base + i30),
+                    ].as_ptr());
+
+                    // Gather A values for idx1 across 4 columns
+                    let a_gather1 = vld1q_f32([
+                        *a_row.get_unchecked(a_base + i01),
+                        *a_row.get_unchecked(a_base + i11),
+                        *a_row.get_unchecked(a_base + i21),
+                        *a_row.get_unchecked(a_base + i31),
+                    ].as_ptr());
+
+                    // Load packed W values: layout is [v0_col0, v1_col0, v0_col1, v1_col1, ...]
+                    // We need w_val0 = [v0_c0, v0_c1, v0_c2, v0_c3]
+                    //          w_val1 = [v1_c0, v1_c1, v1_c2, v1_c3]
+                    let wv0 = vld1q_f32([
+                        *w_vals.get_unchecked(val_off + 0),
+                        *w_vals.get_unchecked(val_off + 2),
+                        *w_vals.get_unchecked(val_off + 4),
+                        *w_vals.get_unchecked(val_off + 6),
+                    ].as_ptr());
+                    let wv1 = vld1q_f32([
+                        *w_vals.get_unchecked(val_off + 1),
+                        *w_vals.get_unchecked(val_off + 3),
+                        *w_vals.get_unchecked(val_off + 5),
+                        *w_vals.get_unchecked(val_off + 7),
+                    ].as_ptr());
+
+                    acc0 = vfmaq_f32(acc0, a_gather0, wv0);
+                    acc1 = vfmaq_f32(acc1, a_gather1, wv1);
+                }
+
+                let sum = vaddq_f32(acc0, acc1);
+                vst1q_f32(out.as_mut_ptr().add(mi * n + ni_base), sum);
+            }
+        }
+
+        // Scalar tail for remaining columns
+        for ni in (n_chunks * 4)..n {
+            let mut sum = 0.0f32;
+            for g in 0..groups {
+                let a_base = g * 4;
+                let idx_byte = w_idx[g * n + ni];
+                let idx0 = (idx_byte & 0x0F) as usize;
+                let idx1 = ((idx_byte >> 4) & 0x0F) as usize;
+
+                let v_base = g * n * 2 + ni * 2;
+                sum += a_row[a_base + idx0] * w_vals[v_base]
+                     + a_row[a_base + idx1] * w_vals[v_base + 1];
+            }
+            out[mi * n + ni] = sum;
+        }
+    }
+}
+
+// ========================================================================
 // Tests
 // ========================================================================
 

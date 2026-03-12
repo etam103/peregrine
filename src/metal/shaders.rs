@@ -2485,4 +2485,166 @@ kernel void causal_mask_softmax_f32(
         row_out[i] = (total > 0.0f) ? row_out[i] / total : 0.0f;
     }
 }
+
+// ---------------------------------------------------------------------------
+// 2:4 Structured Sparse Matmul: C[M,N] = A_f32[M,K] @ W_sparse_24[K,N]
+// W_vals: [K/4 * N * 2] f32 packed values (2 per group-of-4 per column)
+// W_idx:  [K/4 * N] u8 nibble-packed indices (low=idx0, high=idx1)
+// ---------------------------------------------------------------------------
+
+struct SparseMatmulParams24 {
+    uint M;
+    uint N;
+    uint K;
+};
+
+constant uint SP_TILE = 16;
+
+kernel void matmul_sparse_24(
+    device const float* A            [[buffer(0)]],
+    device const float* W_vals       [[buffer(1)]],
+    device const uchar* W_idx        [[buffer(2)]],
+    device float* C                  [[buffer(3)]],
+    constant SparseMatmulParams24& p [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+
+    if (row >= p.M || col >= p.N) return;
+
+    uint groups = p.K / 4;
+    float sum = 0.0f;
+
+    for (uint g = 0; g < groups; g++) {
+        uint a_base = row * p.K + g * 4;
+        uint idx_byte = W_idx[g * p.N + col];
+        uint idx0 = idx_byte & 0x0F;
+        uint idx1 = (idx_byte >> 4) & 0x0F;
+
+        uint v_base = g * p.N * 2 + col * 2;
+        float v0 = W_vals[v_base];
+        float v1 = W_vals[v_base + 1];
+
+        sum += A[a_base + idx0] * v0 + A[a_base + idx1] * v1;
+    }
+
+    C[row * p.N + col] = sum;
+}
+
+// Simdgroup variant: 32x32 tiles with hardware 8x8 matrix multiply.
+// Expands compressed W into dense shared memory tile, then uses simdgroup_multiply_accumulate.
+constant uint SP_STILE = 32;
+
+kernel void matmul_sparse_simd_24(
+    device const float* A            [[buffer(0)]],
+    device const float* W_vals       [[buffer(1)]],
+    device const uchar* W_idx        [[buffer(2)]],
+    device float* C                  [[buffer(3)]],
+    constant SparseMatmulParams24& p [[buffer(4)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sid [[simdgroup_index_in_threadgroup]])
+{
+    uint base_row = group_id.y * SP_STILE;
+    uint base_col = group_id.x * SP_STILE;
+
+    uint sg_row = sid / 2;
+    uint sg_col = sid % 2;
+
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2; i++)
+        for (uint j = 0; j < 2; j++)
+            acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    threadgroup float tileA[SP_STILE][SP_STILE];
+    threadgroup float tileW[SP_STILE][SP_STILE];
+
+    // We iterate over K in chunks of SP_STILE (must be multiple of 4)
+    uint num_k_tiles = (p.K + SP_STILE - 1) / SP_STILE;
+    uint groups_total = p.K / 4;
+
+    for (uint t = 0; t < num_k_tiles; t++) {
+        // Cooperative load of A tile
+        for (uint i = tid; i < SP_STILE * SP_STILE; i += 128) {
+            uint lr = i / SP_STILE;
+            uint lc = i % SP_STILE;
+            uint gr = base_row + lr;
+            uint gk = t * SP_STILE + lc;
+            tileA[lr][lc] = (gr < p.M && gk < p.K) ? A[gr * p.K + gk] : 0.0f;
+        }
+
+        // Cooperative expand of sparse W into dense tile
+        // For K range [t*SP_STILE, t*SP_STILE+SP_STILE), expand to tileW[SP_STILE][SP_STILE]
+        // First zero the tile
+        for (uint i = tid; i < SP_STILE * SP_STILE; i += 128) {
+            uint lr = i / SP_STILE;
+            uint lc = i % SP_STILE;
+            tileW[lr][lc] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each thread expands some groups within this K tile
+        uint k_start = t * SP_STILE;
+        uint k_end = min(k_start + SP_STILE, p.K);
+        uint g_start = k_start / 4;
+        uint g_end = (k_end + 3) / 4;
+        if (g_end > groups_total) g_end = groups_total;
+        uint num_groups_tile = g_end - g_start;
+
+        // Distribute (group, col) pairs across threads
+        uint total_work = num_groups_tile * SP_STILE;
+        for (uint i = tid; i < total_work; i += 128) {
+            uint lg = i / SP_STILE;
+            uint lc = i % SP_STILE;
+            uint g = g_start + lg;
+            uint gc = base_col + lc;
+            if (g < groups_total && gc < p.N) {
+                uint idx_byte = W_idx[g * p.N + gc];
+                uint idx0 = idx_byte & 0x0F;
+                uint idx1 = (idx_byte >> 4) & 0x0F;
+
+                uint v_base = g * p.N * 2 + gc * 2;
+                float v0 = W_vals[v_base];
+                float v1 = W_vals[v_base + 1];
+
+                uint local_k0 = g * 4 + idx0 - k_start;
+                uint local_k1 = g * 4 + idx1 - k_start;
+                if (local_k0 < SP_STILE) tileW[local_k0][lc] = v0;
+                if (local_k1 < SP_STILE) tileW[local_k1][lc] = v1;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2x2 simdgroup matrix multiply from 16x16 sub-tiles
+        for (uint tk = 0; tk < SP_STILE; tk += 8) {
+            simdgroup_matrix<float, 8, 8> a_tile[2];
+            simdgroup_matrix<float, 8, 8> b_tile[2];
+
+            simdgroup_load(a_tile[0], &tileA[sg_row * 16][tk], SP_STILE);
+            simdgroup_load(a_tile[1], &tileA[sg_row * 16 + 8][tk], SP_STILE);
+            simdgroup_load(b_tile[0], &tileW[tk][sg_col * 16], SP_STILE);
+            simdgroup_load(b_tile[1], &tileW[tk][sg_col * 16 + 8], SP_STILE);
+
+            for (uint i = 0; i < 2; i++)
+                for (uint j = 0; j < 2; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], a_tile[i], b_tile[j], acc[i][j]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results
+    for (uint i = 0; i < 2; i++) {
+        for (uint j = 0; j < 2; j++) {
+            uint r = base_row + sg_row * 16 + i * 8;
+            uint c = base_col + sg_col * 16 + j * 8;
+            if (r < p.M && c < p.N) {
+                simdgroup_store(acc[i][j], C + r * p.N + c, p.N);
+            }
+        }
+    }
+}
 "#;

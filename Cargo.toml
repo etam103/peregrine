@@ -85,3 +85,7 @@ path = "examples/systolic_bench.rs"
 name = "comm_bench"
 path = "examples/comm_bench.rs"
 required-features = ["comm"]
+
+[[example]]
+name = "sparse_bench"
+path = "examples/sparse_bench.rs"
