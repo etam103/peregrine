@@ -716,6 +716,47 @@ fn bench_linalg() -> Vec<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Pipeline ops (fused matmul+bias+gelu, add+layernorm)
+// ---------------------------------------------------------------------------
+
+fn bench_pipeline_ops() -> Vec<serde_json::Value> {
+    let mut results = Vec::new();
+
+    // matmul_bias_gelu at transformer FFN sizes
+    for (m, k, n, label) in [
+        (196, 768, 3072, "196x768x3072"),   // ViT-Base FFN
+        (196, 1024, 4096, "196x1024x4096"),  // ViT-Large FFN
+    ] {
+        let x = Tensor::randn(&[m, k], false);
+        let w = Tensor::randn(&[k, n], false);
+        let b = Tensor::randn(&[1, n], false);
+        let times = bench(|| {
+            let h = x.matmul(&w).add_bias(&b).gelu();
+            black_box(h);
+        }, ITERS_SLOW);
+        results.push(make_result(&format!("matmul_bias_gelu_{label}"), times));
+    }
+
+    // add + layernorm at transformer sizes
+    for (batch, dim, label) in [
+        (196, 768, "196x768"),
+        (196, 1024, "196x1024"),
+    ] {
+        let x = Tensor::randn(&[batch, dim], false);
+        let r = Tensor::randn(&[batch, dim], false);
+        let g = Tensor::randn(&[dim], false);
+        let b = Tensor::randn(&[dim], false);
+        let times = bench(|| {
+            let out = x.add(&r).layer_norm(&g, &b, dim);
+            black_box(out);
+        }, ITERS_FAST);
+        results.push(make_result(&format!("add_layernorm_{label}"), times));
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
 // GPU Benchmarks (Metal)
 // ---------------------------------------------------------------------------
 
@@ -1008,6 +1049,8 @@ fn main() {
         ("bench_random", bench_random),
         ("bench_fft", bench_fft),
         ("bench_linalg", bench_linalg),
+        // Pipeline ops (fused matmul+bias+gelu, add+layernorm)
+        ("bench_pipeline_ops", bench_pipeline_ops),
     ];
 
     let mut all_results = Vec::new();

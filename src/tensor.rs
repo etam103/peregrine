@@ -380,6 +380,8 @@ pub enum Op {
         dim: usize,
     },
     MatMulBiasRelu(Tensor, Tensor, Tensor), // input, weight, bias — fused matmul+bias+relu
+    MatMulBiasGelu(Tensor, Tensor, Tensor), // input, weight, bias — fused matmul+bias+gelu
+    AddLayerNorm { x: Tensor, residual: Tensor, gamma: Tensor, beta: Tensor, normalized: Vec<f32>, inv_std: Vec<f32> },
     // Phase 1B: Binary math ops
     Maximum(Tensor, Tensor),
     Minimum(Tensor, Tensor),
@@ -1477,6 +1479,83 @@ impl Tensor {
 
         // CPU fallback: unfused
         self.matmul(weight).add_bias(bias).relu()
+    }
+
+    /// Fused matmul + bias + gelu: self=[M,K] x weight=[K,N] + bias=[1,N] -> gelu -> [M,N].
+    /// Single GPU dispatch eliminates 2 intermediate buffers and 2 kernel launches.
+    pub fn matmul_bias_gelu(&self, weight: &Tensor, bias: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let all_gpu = {
+                let a = self.0.borrow();
+                let w = weight.0.borrow();
+                let b = bias.0.borrow();
+                a.gpu_data.is_some() && w.gpu_data.is_some() && b.gpu_data.is_some()
+            };
+            if all_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let w = weight.0.borrow();
+                    let b = bias.0.borrow();
+                    let (m, k) = (a.shape[0], a.shape[1]);
+                    let n = w.shape[1];
+                    assert_eq!(k, w.shape[0], "matmul_bias_gelu: K mismatch");
+                    assert_eq!(b.shape[1], n, "matmul_bias_gelu: bias dim mismatch");
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let w_buf = w.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(m * n);
+                    gpu.dispatch_matmul_fused(a_buf, w_buf, &out, Some(b_buf),
+                        m as u32, n as u32, k as u32, false, true, false, false);
+                    (out, vec![m, n])
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1,
+                        Op::MatMulBiasGelu(self.clone(), weight.clone(), bias.clone()));
+                }
+            }
+        }
+
+        // CPU fallback: unfused
+        self.matmul(weight).add_bias(bias).gelu()
+    }
+
+    /// Fused residual add + layer norm: out = layernorm(x + residual, gamma, beta).
+    /// Single GPU dispatch eliminates the intermediate add buffer.
+    pub fn add_layer_norm(&self, residual: &Tensor, gamma: &Tensor, beta: &Tensor, normalized_shape: usize) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let can_gpu = {
+                let x = self.0.borrow();
+                let r = residual.0.borrow();
+                let g = gamma.0.borrow();
+                let b = beta.0.borrow();
+                x.gpu_data.is_some() && r.gpu_data.is_some() && g.gpu_data.is_some() && b.gpu_data.is_some()
+            };
+            if can_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let x = self.0.borrow();
+                    let r = residual.0.borrow();
+                    let g = gamma.0.borrow();
+                    let b = beta.0.borrow();
+                    let x_buf = x.gpu_data.as_ref().unwrap();
+                    let r_buf = r.gpu_data.as_ref().unwrap();
+                    let g_buf = g.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let total = x_buf.len();
+                    let batch = (total / normalized_shape) as u32;
+                    let dim = normalized_shape as u32;
+                    let out = gpu.alloc(total);
+                    gpu.dispatch_add_layernorm(x_buf, r_buf, g_buf, b_buf, &out, batch, dim, 1e-5);
+                    let shape = x.shape.clone();
+                    (out, shape)
+                }) {
+                    return Tensor::from_gpu(result.0, result.1);
+                }
+            }
+        }
+
+        // CPU fallback: unfused
+        self.add(residual).layer_norm(gamma, beta, normalized_shape)
     }
 
     /// 2D convolution with same-padding: self=[N,Ci,H,W], kernel=[Co,Ci,kH,kW], bias=[Co].
@@ -6223,8 +6302,10 @@ impl Tensor {
                 Op::Conv2d(a, b, c) | Op::Conv2dStrided { input: a, kernel: b, bias: c, .. }
                 | Op::ConvTranspose2d { input: a, kernel: b, bias: c, .. }
                 | Op::ConvTranspose1d { input: a, kernel: b, bias: c, .. }
-                | Op::MatMulBiasRelu(a, b, c) => vec![a, b, c],
+                | Op::MatMulBiasRelu(a, b, c)
+                | Op::MatMulBiasGelu(a, b, c) => vec![a, b, c],
                 Op::Where { cond, x, y } => vec![cond, x, y],
+                Op::AddLayerNorm { x, residual, gamma, beta, .. } => vec![x, residual, gamma, beta],
                 Op::Conv2dReluPool { input, kernel, bias, .. } => vec![input, kernel, bias],
                 Op::MaxPool2d { input, .. } | Op::MaxPool2dExt { input, .. } | Op::Flatten { input, .. }
                 | Op::Squeeze { input, .. } | Op::Unsqueeze { input, .. }
@@ -6364,10 +6445,16 @@ impl Tensor {
             | Op::Conv2dStrided { input: a, kernel: b, bias: c, .. }
             | Op::ConvTranspose2d { input: a, kernel: b, bias: c, .. }
             | Op::ConvTranspose1d { input: a, kernel: b, bias: c, .. }
-            | Op::MatMulBiasRelu(a, b, c) => {
+            | Op::MatMulBiasRelu(a, b, c)
+            | Op::MatMulBiasGelu(a, b, c) => {
                 a.sync_gpu_to_cpu();
                 b.sync_gpu_to_cpu();
                 c.sync_gpu_to_cpu();
+            }
+            Op::AddLayerNorm { ref x, ref residual, ref gamma, .. } => {
+                x.sync_gpu_to_cpu();
+                residual.sync_gpu_to_cpu();
+                gamma.sync_gpu_to_cpu();
             }
             Op::LayerNorm { gamma, .. } => {
                 gamma.sync_gpu_to_cpu();
@@ -6628,6 +6715,107 @@ impl Tensor {
                 accumulate_grad(a_input, &grad_a);
                 accumulate_grad(weight, &grad_w);
                 accumulate_grad(bias, &grad_bias);
+            }
+            Op::MatMulBiasGelu(ref a_input, ref weight, ref bias) => {
+                // Backward for y = gelu(A @ W + bias)
+                // Need the pre-gelu values for the GELU derivative
+                #[cfg(feature = "metal")]
+                {
+                    a_input.sync_gpu_to_cpu();
+                    weight.sync_gpu_to_cpu();
+                    bias.sync_gpu_to_cpu();
+                }
+                let a_inner = a_input.0.borrow();
+                let w_inner = weight.0.borrow();
+                let b_inner = bias.0.borrow();
+                let (m, k) = (a_inner.shape[0], a_inner.shape[1]);
+                let n = w_inner.shape[1];
+
+                // Recompute pre-gelu = A @ W + bias
+                let mut pre_gelu = vec![0.0f32; m * n];
+                #[cfg(target_os = "macos")]
+                sgemm(false, false, m, n, k, 1.0, &a_inner.data, k, &w_inner.data, n, 0.0, &mut pre_gelu, n);
+                #[cfg(not(target_os = "macos"))]
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut sum = 0.0f32;
+                        for p in 0..k { sum += a_inner.data[i * k + p] * w_inner.data[p * n + j]; }
+                        pre_gelu[i * n + j] = sum;
+                    }
+                }
+                for i in 0..m {
+                    for j in 0..n {
+                        pre_gelu[i * n + j] += b_inner.data[j];
+                    }
+                }
+
+                // GELU backward: d_gelu/dx = 0.5*(1+tanh(c)) + 0.5*x*(1-tanh(c)^2)*c'
+                // where c = sqrt(2/pi)*(x + 0.044715*x^3), c' = sqrt(2/pi)*(1 + 0.134145*x^2)
+                let len = m * n;
+                let mut gelu_grad = pool_get(len);
+                for i in 0..len {
+                    let x = pre_gelu[i];
+                    let x3 = x * x * x;
+                    let inner = 0.7978845608f32 * (x + 0.044715 * x3);
+                    let t = inner.tanh();
+                    let d_inner = 0.7978845608f32 * (1.0 + 0.134145 * x * x);
+                    let d_gelu = 0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * d_inner;
+                    gelu_grad[i] = grad[i] * d_gelu;
+                }
+
+                // bias_grad
+                let mut grad_bias = vec![0.0f32; n];
+                for r in 0..m {
+                    for c in 0..n {
+                        grad_bias[c] += gelu_grad[r * n + c];
+                    }
+                }
+
+                // grad_a = gelu_grad @ W^T, grad_w = A^T @ gelu_grad
+                #[cfg(target_os = "macos")]
+                let (grad_a, grad_w) = {
+                    let mut ga = vec![0.0f32; m * k];
+                    sgemm(false, true, m, k, n, 1.0, &gelu_grad, n, &w_inner.data, n, 0.0, &mut ga, k);
+                    let mut gw = vec![0.0f32; k * n];
+                    sgemm(true, false, k, n, m, 1.0, &a_inner.data, k, &gelu_grad, n, 0.0, &mut gw, n);
+                    (ga, gw)
+                };
+                #[cfg(not(target_os = "macos"))]
+                let (grad_a, grad_w) = {
+                    let mut ga = vec![0.0f32; m * k];
+                    for i in 0..m {
+                        for j in 0..k {
+                            let mut sum = 0.0;
+                            for p in 0..n {
+                                sum += gelu_grad[i * n + p] * w_inner.data[j * n + p];
+                            }
+                            ga[i * k + j] = sum;
+                        }
+                    }
+                    let mut gw = vec![0.0f32; k * n];
+                    for i in 0..k {
+                        for j in 0..n {
+                            let mut sum = 0.0;
+                            for p in 0..m {
+                                sum += a_inner.data[p * k + i] * gelu_grad[p * n + j];
+                            }
+                            gw[i * n + j] = sum;
+                        }
+                    }
+                    (ga, gw)
+                };
+
+                drop(a_inner);
+                drop(w_inner);
+                drop(b_inner);
+                accumulate_grad(a_input, &grad_a);
+                accumulate_grad(weight, &grad_w);
+                accumulate_grad(bias, &grad_bias);
+            }
+            Op::AddLayerNorm { .. } => {
+                // AddLayerNorm is inference-only (from_gpu, no backward cache).
+                // If backward is needed, use unfused add + layer_norm with requires_grad.
+                panic!("AddLayerNorm backward not implemented — use unfused ops for training");
             }
             Op::Conv2d(ref input, ref kernel, ref bias) => {
                 let in_inner = input.0.borrow();
@@ -9380,6 +9568,14 @@ impl Tensor {
                     self.0.borrow_mut().gpu_grad = Some(gpu_grad);
                     return false;
                 }
+            }
+            Op::MatMulBiasGelu(ref _a_input, ref _weight, ref _bias) => {
+                // Fall back to CPU — GELU backward on GPU requires recomputing pre-gelu values
+                self.0.borrow_mut().gpu_grad = Some(gpu_grad);
+                return false;
+            }
+            Op::AddLayerNorm { .. } => {
+                panic!("AddLayerNorm backward not implemented — use unfused ops for training");
             }
             Op::AddBias(ref input, ref bias) => {
                 // input grad = grad (pass-through)

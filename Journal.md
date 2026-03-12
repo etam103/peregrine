@@ -1139,3 +1139,53 @@ Starting point: Peregrine 1.87s vs PyTorch 0.67s at 224 (2.8x slower), 10.45s vs
 | Inference 512 | 10.45s | 1.98s | 2.26s | 5.3x |
 
 All optimizations use the same Apple Accelerate BLAS (cblas_sgemm) as PyTorch. The remaining gains came from eliminating overhead in non-matmul operations: vectorized softmax/GELU, fused data layout transforms, parallel attention, batched encoder/decoder, and allocation reduction.
+
+## PER-40: Tiled Software Pipelining Engine (2026-03-11)
+
+### Goal
+
+Eliminate intermediate device memory round-trips in transformer FFN by fusing multi-op sequences into single Metal kernel dispatches. For a typical transformer MLP (`matmul → bias → gelu → matmul → bias`), the unfused path requires 5 separate kernel dispatches and 4 unnecessary device memory writes.
+
+### Phase A: Fused Simdgroup Kernels
+
+**Changes:**
+- Extended `MatmulParams` with `fuse_gelu` field
+- Added GELU path to scalar `matmul_f32` and simdgroup `matmul_simd_f32` epilogues using `precise::tanh()` (avoids Metal fast-math NaN)
+- Added `bias_gelu_f32` standalone fused elementwise kernel
+- Added `add_layernorm_f32` fused residual add + layernorm (single pass: add, mean, var, normalize)
+
+### Phase B: Double-Buffered Matmul
+
+**Changes:**
+- Added `matmul_simd_db_f32` kernel with K-tile=16, two threadgroup memory slots `As[2][32][16]` + `Bs[2][16][32]` (32KB total)
+- Loads tile N+1 while computing tile N
+
+**Result:** Neutral performance on Apple Silicon unified memory (~0.96-0.98x). Default routing uses single-buffered kernel; double-buffered kept available for explicit use.
+
+### Phase C: Pipeline Builder API
+
+- `FusedOp` enum and `PipelineBuilder` in `src/metal/pipeline.rs`
+- Builder pattern for declaring fused op sequences
+
+### Phase D: MUSt3R Integration
+
+- Decoder FFN now uses `matmul_bias_gelu` for first linear layer
+- Eliminates 2 intermediate device memory passes per decoder block (12 blocks x 2 views = 24 fewer round-trips)
+
+### Phase E: Benchmarks
+
+Fused vs unfused (pipeline_bench, GPU, 50 iters):
+
+| Benchmark | Unfused | Fused | Speedup |
+|-----------|---------|-------|---------|
+| MLP FFN 196x768x3072 | 262us | 251us | 1.04x |
+| MLP FFN 196x1024x4096 | 383us | 344us | 1.12x |
+| Add+LayerNorm 196x768 | 15us | 10us | 1.51x |
+| Add+LayerNorm 196x1024 | 18us | 13us | 1.38x |
+
+Cross-framework (CPU, ViT-Base FFN 196x768x3072):
+
+| Op | Peregrine | PyTorch | TF | tinygrad | JAX |
+|----|----------:|--------:|---:|---------:|----:|
+| matmul+bias+gelu | **1128us** | 1307us | 3187us | 1294us | 3427us |
+| add+layernorm | **110us** | 117us | 1411us | 1335us | 292us |

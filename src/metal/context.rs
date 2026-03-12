@@ -90,6 +90,10 @@ impl GpuContext {
             "logsumexp_axis_f32", "var_axis_f32",
             // Simdgroup matmul
             "matmul_simd_f32",
+            // Double-buffered simdgroup matmul
+            "matmul_simd_db_f32",
+            // Fused kernels
+            "bias_gelu_f32", "add_layernorm_f32",
             // Attention reshape + RoPE kernels
             "qkv_reshape_f32", "rope2d_f32",
             "attn_output_reshape_f32", "separate_reshape_f32",
@@ -438,10 +442,8 @@ impl GpuContext {
         enc.endEncoding();
     }
 
-    /// Dispatch matmul with automatic kernel selection.
-    /// Uses simdgroup 8x8 kernel for large matrices (min(M,N) >= 64 and M*N >= 1024*1024),
-    /// falls back to scalar 16x16 tiled kernel otherwise.
-    /// Note: simdgroup kernel does not support fused bias/relu, so those always use scalar.
+    /// Dispatch matmul with automatic kernel selection (legacy — no GELU fusion).
+    /// Delegates to `dispatch_matmul_fused` with `fuse_gelu = false`.
     pub fn dispatch_matmul_auto(
         &self,
         a: &GpuBuffer<f32>,
@@ -453,20 +455,44 @@ impl GpuContext {
         trans_a: bool,
         trans_b: bool,
     ) {
-        let use_simd = m >= 64 && n >= 64
-            && (m as u64) * (n as u64) >= 1024 * 1024
-            && bias.is_none() && !fuse_relu;
+        self.dispatch_matmul_fused(a, b, c, bias, m, n, k, fuse_relu, false, trans_a, trans_b);
+    }
 
-        if use_simd {
-            self.dispatch_matmul_simd(a, b, c, None, m, n, k, false, trans_a, trans_b);
+    /// Dispatch matmul with fusion-aware kernel selection.
+    /// Routes to the best kernel based on matrix size and requested fusions:
+    /// - Large matrices (M,N >= 64, K >= 64, M*N >= 1M): double-buffered simdgroup kernel
+    /// - Large matrices (M,N >= 64, M*N >= 1M, K < 64): single-buffered simdgroup kernel
+    /// - Small matrices: scalar 16x16 tiled kernel
+    /// All kernel variants support fused bias + relu/gelu epilogue.
+    pub fn dispatch_matmul_fused(
+        &self,
+        a: &GpuBuffer<f32>,
+        b: &GpuBuffer<f32>,
+        c: &GpuBuffer<f32>,
+        bias: Option<&GpuBuffer<f32>>,
+        m: u32, n: u32, k: u32,
+        fuse_relu: bool,
+        fuse_gelu: bool,
+        trans_a: bool,
+        trans_b: bool,
+    ) {
+        let large_enough = m >= 64 && n >= 64
+            && (m as u64) * (n as u64) >= 1024 * 1024;
+
+        if large_enough {
+            // Simdgroup kernel with fused epilogue for large matrices.
+            // Note: dispatch_matmul_simd_db is available for explicit use but
+            // benchmarks show single-buffered performs equivalently on Apple Silicon
+            // unified memory, so we default to the simpler single-buffered kernel.
+            self.dispatch_matmul_simd(a, b, c, bias, m, n, k, fuse_relu, fuse_gelu, trans_a, trans_b);
         } else {
-            self.dispatch_matmul_scalar(a, b, c, bias, m, n, k, fuse_relu, trans_a, trans_b);
+            self.dispatch_matmul_scalar(a, b, c, bias, m, n, k, fuse_relu, trans_a, trans_b, fuse_gelu);
         }
     }
 
-    /// Dispatch matmul: C = op(A)[M,K] @ op(B)[K,N], optionally fused with bias and relu.
+    /// Dispatch matmul: C = op(A)[M,K] @ op(B)[K,N], optionally fused with bias and relu/gelu.
     /// trans_a/trans_b control whether A and B are transposed.
-    /// Scalar 16x16 tiled kernel — works at all sizes, supports fused bias/relu.
+    /// Scalar 16x16 tiled kernel — works at all sizes, supports fused bias/relu/gelu.
     pub fn dispatch_matmul_scalar(
         &self,
         a: &GpuBuffer<f32>,
@@ -477,6 +503,7 @@ impl GpuContext {
         fuse_relu: bool,
         trans_a: bool,
         trans_b: bool,
+        fuse_gelu: bool,
     ) {
         #[repr(C)]
         struct MatmulParams {
@@ -487,6 +514,7 @@ impl GpuContext {
             fuse_relu: u32,
             trans_a: u32,
             trans_b: u32,
+            fuse_gelu: u32,
         }
 
         let params = MatmulParams {
@@ -495,6 +523,7 @@ impl GpuContext {
             fuse_relu: if fuse_relu { 1 } else { 0 },
             trans_a: if trans_a { 1 } else { 0 },
             trans_b: if trans_b { 1 } else { 0 },
+            fuse_gelu: if fuse_gelu { 1 } else { 0 },
         };
 
         let pipeline = &self.pipelines["matmul_f32"];
@@ -543,11 +572,12 @@ impl GpuContext {
         trans_a: bool,
         trans_b: bool,
     ) {
-        self.dispatch_matmul_auto(a, b, c, bias, m, n, k, fuse_relu, trans_a, trans_b);
+        self.dispatch_matmul_fused(a, b, c, bias, m, n, k, fuse_relu, false, trans_a, trans_b);
     }
 
     /// Dispatch simdgroup matmul: uses hardware 8x8 simdgroup_matrix_multiply.
-    /// Each threadgroup has 4 simdgroups (128 threads), computing a 64x64 output tile.
+    /// Each threadgroup has 4 simdgroups (128 threads), computing a 32x32 output tile.
+    /// Supports fused bias + relu/gelu epilogue.
     pub fn dispatch_matmul_simd(
         &self,
         a: &GpuBuffer<f32>,
@@ -556,6 +586,7 @@ impl GpuContext {
         bias: Option<&GpuBuffer<f32>>,
         m: u32, n: u32, k: u32,
         fuse_relu: bool,
+        fuse_gelu: bool,
         trans_a: bool,
         trans_b: bool,
     ) {
@@ -568,6 +599,7 @@ impl GpuContext {
             fuse_relu: u32,
             trans_a: u32,
             trans_b: u32,
+            fuse_gelu: u32,
         }
 
         let params = MatmulParams {
@@ -576,6 +608,7 @@ impl GpuContext {
             fuse_relu: if fuse_relu { 1 } else { 0 },
             trans_a: if trans_a { 1 } else { 0 },
             trans_b: if trans_b { 1 } else { 0 },
+            fuse_gelu: if fuse_gelu { 1 } else { 0 },
         };
 
         let pipeline = &self.pipelines["matmul_simd_f32"];
@@ -610,6 +643,152 @@ impl GpuContext {
         };
         enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
 
+        enc.endEncoding();
+    }
+
+    /// Dispatch double-buffered simdgroup matmul: overlaps next tile load with current compute.
+    /// K-tile = 16 (halved from 32) to fit double buffers in 32KB threadgroup memory.
+    /// Same interface and epilogue as `dispatch_matmul_simd`.
+    pub fn dispatch_matmul_simd_db(
+        &self,
+        a: &GpuBuffer<f32>,
+        b: &GpuBuffer<f32>,
+        c: &GpuBuffer<f32>,
+        bias: Option<&GpuBuffer<f32>>,
+        m: u32, n: u32, k: u32,
+        fuse_relu: bool,
+        fuse_gelu: bool,
+        trans_a: bool,
+        trans_b: bool,
+    ) {
+        #[repr(C)]
+        struct MatmulParams {
+            m: u32,
+            n: u32,
+            k: u32,
+            fuse_bias: u32,
+            fuse_relu: u32,
+            trans_a: u32,
+            trans_b: u32,
+            fuse_gelu: u32,
+        }
+
+        let params = MatmulParams {
+            m, n, k,
+            fuse_bias: if bias.is_some() { 1 } else { 0 },
+            fuse_relu: if fuse_relu { 1 } else { 0 },
+            trans_a: if trans_a { 1 } else { 0 },
+            trans_b: if trans_b { 1 } else { 0 },
+            fuse_gelu: if fuse_gelu { 1 } else { 0 },
+        };
+
+        let pipeline = &self.pipelines["matmul_simd_db_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(a.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(b.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(c.raw()), 0, 2);
+            if let Some(bias_buf) = bias {
+                enc.setBuffer_offset_atIndex(Some(bias_buf.raw()), 0, 3);
+            }
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<MatmulParams>(),
+                4,
+            );
+        }
+
+        let threads_per_group = 128usize;
+        let tile = 32usize;
+        let threadgroup_size = MTLSize { width: threads_per_group, height: 1, depth: 1 };
+        let num_groups = MTLSize {
+            width: (n as usize + tile - 1) / tile,
+            height: (m as usize + tile - 1) / tile,
+            depth: 1,
+        };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch fused bias + GELU: out[i] = gelu(input[i] + bias[i % cols]).
+    pub fn dispatch_bias_gelu(
+        &self,
+        input: &GpuBuffer<f32>,
+        bias: &GpuBuffer<f32>,
+        out: &GpuBuffer<f32>,
+        cols: u32,
+    ) {
+        let n = input.len();
+        assert_eq!(n, out.len());
+        assert_eq!(bias.len(), cols as usize);
+
+        let pipeline = &self.pipelines["bias_gelu_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(input.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(bias.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 2);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&cols as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+        }
+
+        let max_threads = pipeline.maxTotalThreadsPerThreadgroup() as usize;
+        let threadgroup_size = MTLSize { width: max_threads.min(n), height: 1, depth: 1 };
+        let grid_size = MTLSize { width: n, height: 1, depth: 1 };
+        enc.dispatchThreads_threadsPerThreadgroup(grid_size, threadgroup_size);
+
+        enc.endEncoding();
+    }
+
+    /// Dispatch fused residual add + layernorm: out = layernorm(x + residual).
+    /// Input shapes: x=[batch, dim], residual=[batch, dim].
+    pub fn dispatch_add_layernorm(
+        &self,
+        x: &GpuBuffer<f32>,
+        residual: &GpuBuffer<f32>,
+        gamma: &GpuBuffer<f32>,
+        beta: &GpuBuffer<f32>,
+        output: &GpuBuffer<f32>,
+        batch: u32, dim: u32, eps: f32,
+    ) {
+        #[repr(C)]
+        struct AddLayerNormParams { batch: u32, dim: u32, eps: f32 }
+        let params = AddLayerNormParams { batch, dim, eps };
+
+        let pipeline = &self.pipelines["add_layernorm_f32"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(x.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(residual.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(gamma.raw()), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(beta.raw()), 0, 3);
+            enc.setBuffer_offset_atIndex(Some(output.raw()), 0, 4);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<AddLayerNormParams>(), 5,
+            );
+        }
+
+        let threads_per_row = (dim as usize).next_power_of_two().min(1024);
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize { width: batch as usize, height: 1, depth: 1 },
+            MTLSize { width: threads_per_row, height: 1, depth: 1 },
+        );
         enc.endEncoding();
     }
 

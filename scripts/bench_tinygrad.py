@@ -465,6 +465,49 @@ def bench_random():
 
 
 # ---------------------------------------------------------------------------
+# Pipeline ops (fused matmul+bias+gelu, add+layernorm)
+# ---------------------------------------------------------------------------
+
+
+def bench_pipeline_ops():
+    results = []
+
+    # matmul + bias + gelu at transformer FFN sizes
+    for m, k, n, label in [
+        (196, 768, 3072, "196x768x3072"),
+        (196, 1024, 4096, "196x1024x4096"),
+    ]:
+        x = Tensor.randn(m, k).realize()
+        w = Tensor.randn(k, n).realize()
+        b = Tensor.randn(1, n).realize()
+
+        def run(x=x, w=w, b=b):
+            h = ((x @ w) + b).gelu()
+            h.realize()
+
+        results.extend(try_bench(f"matmul_bias_gelu_{label}", run, ITERS_SLOW))
+
+    # add + layernorm at transformer sizes
+    for batch, dim, label in [
+        (196, 768, "196x768"),
+        (196, 1024, "196x1024"),
+    ]:
+        x = Tensor.randn(batch, dim).realize()
+        r = Tensor.randn(batch, dim).realize()
+
+        def run(x=x, r=r, dim=dim):
+            s = x + r
+            mean = s.mean(axis=-1, keepdim=True)
+            var = ((s - mean) * (s - mean)).mean(axis=-1, keepdim=True)
+            out = (s - mean) / (var + 1e-5).sqrt()
+            out.realize()
+
+        results.extend(try_bench(f"add_layernorm_{label}", run, ITERS_FAST))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -496,6 +539,8 @@ def main():
         bench_losses,
         # Phase 5: Random
         bench_random,
+        # Pipeline ops
+        bench_pipeline_ops,
     ]:
         print(f"  tinygrad: {fn.__name__} ...")
         all_results.extend(fn())

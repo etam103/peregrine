@@ -602,6 +602,50 @@ def bench_linalg():
 
 
 # ---------------------------------------------------------------------------
+# Pipeline ops (fused matmul+bias+gelu, add+layernorm)
+# ---------------------------------------------------------------------------
+
+
+def bench_pipeline_ops():
+    results = []
+
+    # matmul + bias + gelu at transformer FFN sizes
+    for m, k, n, label in [
+        (196, 768, 3072, "196x768x3072"),
+        (196, 1024, 4096, "196x1024x4096"),
+    ]:
+        x = torch.randn(m, k)
+        w = torch.randn(k, n)
+        b = torch.randn(1, n)
+
+        def run(x=x, w=w, b=b):
+            h = F.gelu(x @ w + b)
+            return h
+
+        times = bench(run, ITERS_SLOW)
+        results.append({"op": f"matmul_bias_gelu_{label}", **stats(times)})
+
+    # add + layernorm at transformer sizes
+    for batch, dim, label in [
+        (196, 768, "196x768"),
+        (196, 1024, "196x1024"),
+    ]:
+        x = torch.randn(batch, dim)
+        r = torch.randn(batch, dim)
+        g = torch.ones(dim)
+        b = torch.zeros(dim)
+
+        def run(x=x, r=r, g=g, b=b, dim=dim):
+            out = F.layer_norm(x + r, (dim,), g, b)
+            return out
+
+        times = bench(run, ITERS_FAST)
+        results.append({"op": f"add_layernorm_{label}", **stats(times)})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -641,6 +685,8 @@ def main():
         bench_fft,
         # Phase 7: Linear algebra
         bench_linalg,
+        # Pipeline ops
+        bench_pipeline_ops,
     ]:
         print(f"  PyTorch: {fn.__name__} ...")
         all_results.extend(fn())

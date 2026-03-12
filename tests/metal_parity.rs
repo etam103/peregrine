@@ -437,3 +437,128 @@ fn parity_matmul_large_backward() {
     assert!(rel_b < 0.01,
         "simdgroup matmul backward grad_b [{n}x{n}]: max_rel_err={rel_b}");
 }
+
+// --- Fused kernel parity tests ---
+
+#[test]
+fn parity_matmul_simd_bias_gelu() {
+    let gpu = GpuContext::new().unwrap();
+    // Test sizes that exercise both scalar (small) and simdgroup (large) kernels
+    for (m, n, k) in [(64, 64, 32), (128, 256, 128), (1024, 1024, 512)] {
+        let a_data = random_data(m * k);
+        let b_data = random_data(k * n);
+        let bias_data = random_data(n);
+
+        // CPU reference: matmul + bias + gelu (unfused)
+        let a_cpu = Tensor::new(a_data.clone(), vec![m, k], false);
+        let b_cpu = Tensor::new(b_data.clone(), vec![k, n], false);
+        let bias_cpu = Tensor::new(bias_data.clone(), vec![1, n], false);
+        let cpu_result = a_cpu.matmul(&b_cpu).add_bias(&bias_cpu).gelu().data();
+
+        // GPU fused: matmul_bias_gelu
+        let a_g = Tensor::new(a_data.clone(), vec![m, k], false);
+        let b_g = Tensor::new(b_data.clone(), vec![k, n], false);
+        let bias_g = Tensor::new(bias_data.clone(), vec![1, n], false);
+        a_g.to_gpu(); b_g.to_gpu(); bias_g.to_gpu();
+        let gpu_result = a_g.matmul_bias_gelu(&b_g, &bias_g);
+        peregrine::metal::gpu_sync();
+        let gpu_data = gpu_result.data();
+
+        let err = max_abs_error(&cpu_result, &gpu_data);
+        assert!(err < 0.01,
+            "matmul_bias_gelu [{m}x{k}]@[{k}x{n}]: max_abs_err={err}");
+    }
+}
+
+#[test]
+fn parity_bias_gelu() {
+    let gpu = GpuContext::new().unwrap();
+    for size in [256, 4096, 65536] {
+        let cols = 256;
+        let rows = size / cols;
+        let input_data = random_data(size);
+        let bias_data = random_data(cols);
+
+        // CPU reference: bias_add + gelu
+        let cpu_result: Vec<f32> = (0..size).map(|i| {
+            let x = input_data[i] + bias_data[i % cols];
+            let x3 = x * x * x;
+            let inner = 0.7978845608f32 * (x + 0.044715 * x3);
+            0.5 * x * (1.0 + inner.tanh())
+        }).collect();
+
+        // GPU fused kernel
+        let in_buf = gpu.upload(&input_data);
+        let bias_buf = gpu.upload(&bias_data);
+        let out_buf = gpu.alloc(size);
+        gpu.dispatch_bias_gelu(&in_buf, &bias_buf, &out_buf, cols as u32);
+        gpu.sync();
+        let gpu_result = out_buf.read();
+
+        let err = max_abs_error(&cpu_result, &gpu_result);
+        assert!(err < 1e-4,
+            "bias_gelu rows={rows} cols={cols}: max_abs_err={err}");
+    }
+}
+
+#[test]
+fn parity_add_layernorm() {
+    let gpu = GpuContext::new().unwrap();
+    for (batch, dim) in [(4, 128), (16, 768), (32, 1024)] {
+        let x_data = random_data(batch * dim);
+        let res_data = random_data(batch * dim);
+        let gamma_data: Vec<f32> = (0..dim).map(|i| 0.5 + (i as f32 / dim as f32)).collect();
+        let beta_data = random_data(dim);
+
+        // CPU reference: add + layernorm
+        let x_cpu = Tensor::new(x_data.clone(), vec![batch, dim], false);
+        let r_cpu = Tensor::new(res_data.clone(), vec![batch, dim], false);
+        let g_cpu = Tensor::new(gamma_data.clone(), vec![dim], false);
+        let b_cpu = Tensor::new(beta_data.clone(), vec![dim], false);
+        let cpu_result = x_cpu.add(&r_cpu).layer_norm(&g_cpu, &b_cpu, dim).data();
+
+        // GPU fused: add_layer_norm
+        let x_g = Tensor::new(x_data.clone(), vec![batch, dim], false);
+        let r_g = Tensor::new(res_data.clone(), vec![batch, dim], false);
+        let g_g = Tensor::new(gamma_data.clone(), vec![dim], false);
+        let b_g = Tensor::new(beta_data.clone(), vec![dim], false);
+        x_g.to_gpu(); r_g.to_gpu(); g_g.to_gpu(); b_g.to_gpu();
+        let gpu_result = x_g.add_layer_norm(&r_g, &g_g, &b_g, dim);
+        peregrine::metal::gpu_sync();
+        let gpu_data = gpu_result.data();
+
+        let err = max_abs_error(&cpu_result, &gpu_data);
+        assert!(err < 1e-3,
+            "add_layernorm batch={batch} dim={dim}: max_abs_err={err}");
+    }
+}
+
+#[test]
+fn parity_matmul_simd_db() {
+    let gpu = GpuContext::new().unwrap();
+    // Test that double-buffered matmul produces same results as single-buffered
+    // Using sizes that trigger the double-buffered path (M,N >= 64, K >= 64, M*N >= 1M)
+    for n in [1024, 2048] {
+        let a_data = random_data(n * n);
+        let b_data = random_data(n * n);
+
+        // CPU reference via matmul
+        let a_cpu = Tensor::new(a_data.clone(), vec![n, n], false);
+        let b_cpu = Tensor::new(b_data.clone(), vec![n, n], false);
+        let cpu_result = a_cpu.matmul(&b_cpu).data();
+
+        // GPU (will use double-buffered path for large enough K)
+        let a_buf = gpu.upload(&a_data);
+        let b_buf = gpu.upload(&b_data);
+        let out_buf = gpu.alloc(n * n);
+        gpu.dispatch_matmul_simd_db(&a_buf, &b_buf, &out_buf, None,
+            n as u32, n as u32, n as u32, false, false, false, false);
+        gpu.sync();
+        let gpu_result = out_buf.read();
+
+        let err = max_abs_error(&cpu_result, &gpu_result);
+        // Simdgroup matmul has slightly larger error due to different accumulation order
+        assert!(err < 0.05,
+            "matmul_simd_db [{n}x{n}]: max_abs_err={err}");
+    }
+}

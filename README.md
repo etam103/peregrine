@@ -41,7 +41,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
 | **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
 | **`peregrine::envs`** | 10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe |
-| **`peregrine::metal`** | Metal GPU backend — 102 compute shaders, 35 dispatch methods, command batching, autograd integration, buffer pool (`--features metal`) |
+| **`peregrine::metal`** | Metal GPU backend — 105 compute shaders, 39 dispatch methods, fused op pipelines, command batching, autograd integration, buffer pool (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 | **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512). Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
@@ -83,7 +83,7 @@ opt.zero_grad();
 | **Shape** | `reshape` `transpose` `squeeze` `unsqueeze` `concat` `select` `flatten` `stack` `split` `tril` `triu` `repeat` `tile` `pad` `roll` `take` `diagonal` `diag` `trace` `outer` `inner` `broadcast_to` `expand_dims` |
 | **Conditional** | `clip` `where` `nan_to_num` |
 | **Comparison** | `equal` `not_equal` `greater` `greater_equal` `less` `less_equal` `logical_and` `logical_or` `logical_not` `isnan` `isinf` `isfinite` |
-| **Layers** | `matmul` `conv1d` `conv2d` `conv2d_strided` `conv_transpose1d` `conv_transpose2d` `conv2d+relu+pool` `max_pool2d` `max_pool2d_ext` `avg_pool2d` `add_bias` `batch_norm` `layer_norm` `rms_norm` `group_norm` `instance_norm` `upsample_nearest` `upsample_bilinear` `index_select` |
+| **Layers** | `matmul` `conv1d` `conv2d` `conv2d_strided` `conv_transpose1d` `conv_transpose2d` `conv2d+relu+pool` `max_pool2d` `max_pool2d_ext` `avg_pool2d` `add_bias` `batch_norm` `layer_norm` `rms_norm` `group_norm` `instance_norm` `upsample_nearest` `upsample_bilinear` `index_select` `matmul_bias_gelu` `add_layer_norm` |
 | **Loss** | `bce_with_logits` `cross_entropy` `mse` `l1` `nll` `smooth_l1` `huber` `kl_div` `cosine_similarity` `triplet` `hinge` `log_cosh` `margin_ranking` `gaussian_nll` |
 
 All ops support broadcasting where applicable.
@@ -198,22 +198,24 @@ Input Image [1, 3, 256, 256]
 
 CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compute shaders (`--features metal`). Wall-clock benchmarks run via `./scripts/bench_compare.sh`.
 
-### Peregrine vs ML Frameworks (133 ops, CPU, wall-clock, all times in microseconds)
+### Peregrine vs ML Frameworks (137 ops, CPU, wall-clock, all times in microseconds)
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | **6.2** | 6.0 | 19.6 | 94.3 | 431.2 | 82.6 |
-| matmul 512x512 | 214.2 | **142.8** | 161.7 | 704.0 | 429.9 | 533.2 |
-| add 100k | **12.5** | 41.7 | 29.7 | 52.4 | 186.7 | 33.9 |
-| mul 100k | **12.9** | 39.2 | 28.9 | 41.7 | 191.7 | 31.1 |
-| relu 100k | **8.9** | 37.9 | 25.3 | 38.3 | 343.3 | 99.5 |
-| softmax 8x128 | **3.8** | 33.8 | 14.6 | 11.2 | 618.7 | 31.0 |
-| silu 100k | **64.1** | 74.0 | 84.8 | 246.0 | 343.0 | 54.9 |
-| rfft 1k | **2.2** | 4.4 | 19.2 | 42.8 | — | 59.5 |
-| cross_entropy | **2.6** | 38.5 | 36.4 | 624.4 | 3337.3 | 55.7 |
-| train step 64 | **839.5** | 1247.3 | 788.1 | 8713.9 | 23717.2 | 5084.3 |
+| matmul 128x128 | **5.8** | 6.0 | 21.0 | 54.5 | 425.3 | 95.9 |
+| matmul 512x512 | 158.0 | **136.2** | 246.4 | 894.8 | 457.5 | 625.0 |
+| add 100k | **9.8** | 57.5 | 37.6 | 62.2 | 200.4 | 64.2 |
+| mul 100k | **13.0** | 45.1 | 25.6 | 46.7 | 199.8 | 58.2 |
+| relu 100k | **9.2** | 37.4 | 26.7 | 41.3 | 358.6 | 102.7 |
+| softmax 8x128 | **1.2** | 39.9 | 14.5 | 12.1 | 669.5 | 37.5 |
+| silu 100k | 68.2 | 105.3 | 86.7 | 256.4 | 351.3 | **54.6** |
+| rfft 1k | **2.2** | 4.5 | 22.6 | 45.7 | — | 46.9 |
+| cross_entropy | **2.7** | 38.2 | 27.4 | 664.0 | 3915.0 | 36.2 |
+| train step 64 | **831.0** | 1562.4 | 1290.8 | 9098.5 | 25884.2 | 5610.9 |
+| matmul+bias+gelu 196x768x3072 | **1128** | 1307 | — | 3187 | 1294 | 3427 |
+| add+layernorm 196x768 | **110** | 117 | — | 1411 | 1335 | 292 |
 
-Geometric mean ratio across 133 ops (lower = Peregrine faster): **PyTorch 0.95x**, **MLX 0.74x**, TensorFlow 0.55x, tinygrad 0.09x, JAX 0.68x. Peregrine wins 56 of 133 ops.
+Geometric mean ratio across 137 ops (lower = Peregrine faster): **PyTorch 0.87x**, **MLX 0.70x**, TensorFlow 0.50x, tinygrad 0.09x, JAX 0.65x. Peregrine wins 91 of 167 ops (incl. GPU-only).
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
@@ -251,7 +253,7 @@ Server mode (`--server` flag on the Rust binary) loads weights once and processe
 | Pool bypass for small tensors | Skip HashMap overhead for tensors < 1024 elements |
 | Rayon threshold tuning | Dual thresholds (500K cheap / 100K expensive) — avoids spawn overhead |
 | Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
-| Metal GPU backend | 102 compute shaders with command batching, full autograd integration, and GPU-resident attention (QKV reshape, RoPE2D, SDPA) |
+| Metal GPU backend | 105 compute shaders with fused op pipelines (matmul+bias+gelu, add+layernorm, double-buffered matmul), command batching, full autograd integration, and GPU-resident attention (QKV reshape, RoPE2D, SDPA) |
 
 ---
 
@@ -274,7 +276,7 @@ src/
   serial.rs       model weight save/load (binary format)
   rl.rs           RL algorithms — PPO, DQN, REINFORCE, replay/rollout buffers, Environment trait (~1,750 lines)
   envs.rs         10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe (~2,150 lines)
-  metal/          Metal GPU backend (102 shaders, 35 dispatch methods, command batching, autograd)
+  metal/          Metal GPU backend (105 shaders, 39 dispatch methods, fused pipelines, command batching, autograd)
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
   wallclock.rs    wall-clock comparison benchmark (JSON output)
@@ -323,7 +325,7 @@ scripts/
 tests/
   pytorch_parity.rs   23 numerical parity tests vs PyTorch
   activations.rs      34 activation function tests
-  metal_parity.rs     27 CPU vs Metal parity tests
+  metal_parity.rs     31 CPU vs Metal parity tests
   metal_basics.rs     12 Metal compute shader tests
   metal_autograd.rs   17 GPU autograd integration tests
   generate_reference.py  script to regenerate PyTorch reference data

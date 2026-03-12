@@ -7,6 +7,71 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.20.0] - 2026-03-11
+
+### Added — Fused GPU kernel pipelines (matmul+bias+gelu, add+layernorm, double-buffered matmul)
+
+Eliminates intermediate device memory round-trips by fusing multi-op sequences into single Metal compute kernel dispatches. For transformer FFN layers, this removes 2-3 unnecessary buffer writes per layer.
+
+**3 new Metal compute kernels** (`src/metal/shaders.rs`)
+- `matmul_simd_db_f32` — double-buffered simdgroup matmul with K-tile=16, two threadgroup memory slots (load N+1 while computing N)
+- `bias_gelu_f32` — standalone fused bias + GELU elementwise kernel using `precise::tanh()` to avoid Metal fast-math NaN
+- `add_layernorm_f32` — fused residual add + layernorm in a single pass (add, compute mean/var, normalize)
+
+**Extended existing kernels** (`src/metal/shaders.rs`)
+- `matmul_f32` epilogue: added `fuse_gelu` path (scalar kernel)
+- `matmul_simd_f32` epilogue: added `fuse_gelu` path (simdgroup kernel)
+- `MatmulParams` struct: added `fuse_gelu` field
+
+**4 new dispatch methods** (`src/metal/context.rs`)
+- `dispatch_matmul_fused` — fusion-aware routing: scalar for small matrices, simdgroup for large
+- `dispatch_matmul_simd_db` — double-buffered simdgroup dispatch
+- `dispatch_bias_gelu` — standalone fused bias+GELU
+- `dispatch_add_layernorm` — fused residual add + layernorm
+
+**Pipeline Builder API** (`src/metal/pipeline.rs` — new file)
+- `FusedOp` enum: `MatmulBiasGelu`, `MatmulBiasRelu`, `MatmulBias`, `BiasGelu`, `AddLayerNorm`
+- `PipelineBuilder` — builder pattern for declaring fused op sequences
+
+**New tensor ops** (`src/tensor.rs`)
+- `matmul_bias_gelu()` — fused matmul + bias + GELU (GPU: single kernel dispatch; CPU: unfused chain)
+- `add_layer_norm()` — fused residual add + layernorm (GPU: single kernel dispatch; CPU: unfused chain)
+- Full autograd support for both ops (CPU backward with GELU derivative)
+
+**MUSt3R integration** (`examples/must3r/decoder.rs`)
+- FFN forward uses `matmul_bias_gelu` for the first linear layer, eliminating 2 intermediate device memory passes per decoder block
+
+**4 new parity tests** (`tests/metal_parity.rs`)
+- `parity_matmul_simd_bias_gelu` — fused vs unfused at (64,64,32), (128,256,128), (1024,1024,512)
+- `parity_bias_gelu` — standalone kernel at 256, 4096, 65536 elements
+- `parity_add_layernorm` — at (4,128), (16,768), (32,1024)
+- `parity_matmul_simd_db` — double-buffered vs CPU at 1024, 2048
+
+**Cross-framework benchmarks** (`benches/wallclock.rs`, `scripts/bench_*.py`)
+- Added `matmul_bias_gelu` and `add_layernorm` at transformer FFN sizes to Peregrine, PyTorch, JAX, TensorFlow, and tinygrad benchmarks
+
+### Benchmark Results
+
+Pipeline fusion (CPU, ViT-Base FFN 196x768x3072):
+| Op | Peregrine | PyTorch | TensorFlow | tinygrad | JAX |
+|----|----------:|--------:|-----------:|---------:|----:|
+| matmul+bias+gelu | **1128us** | 1307us | 3187us | 1294us | 3427us |
+| add+layernorm | **110us** | 117us | 1411us | 1335us | 292us |
+
+GPU fused MLP (pipeline_bench, 50 iters):
+- Fused vs unfused matmul+bias+gelu: 1.04-1.12x speedup
+- Fused vs unfused add+layernorm: 1.38-1.51x speedup
+
+Overall: Peregrine wins 91/167 ops across 6 frameworks. Geometric mean ratio vs PyTorch: **0.87x** (Peregrine faster).
+
+### Stats
+
+- 105 Metal compute shaders (up from 102), 39 dispatch methods (up from 35)
+- 31 metal parity tests (up from 27)
+- 485 lib tests + 31 parity tests all pass
+
+---
+
 ## [0.19.0] - 2026-03-11
 
 ### Added — GPU-resident attention for MUSt3R (27% faster than CPU at 512x512)

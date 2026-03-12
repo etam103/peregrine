@@ -450,11 +450,8 @@ impl CachedDecoderBlock {
         // Pre-norm
         let normed = x.layer_norm(&self.norm3_weight, &self.norm3_bias, embed_dim);
 
-        // FFN: Linear -> GELU -> Linear
-        let hidden = normed
-            .matmul(&self.mlp_fc1_weight)
-            .add_bias(&self.mlp_fc1_bias)
-            .gelu();
+        // FFN: Linear -> GELU -> Linear (fused on GPU)
+        let hidden = normed.matmul_bias_gelu(&self.mlp_fc1_weight, &self.mlp_fc1_bias);
         let output = hidden
             .matmul(&self.mlp_fc2_weight)
             .add_bias(&self.mlp_fc2_bias);

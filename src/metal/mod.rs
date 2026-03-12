@@ -9,9 +9,11 @@
 mod context;
 mod buffer;
 mod pool;
+pub mod pipeline;
 mod shaders;
 
 pub use context::GpuContext;
 pub use context::{init_gpu, with_gpu, with_gpu_mut, gpu_sync};
 pub use buffer::GpuBuffer;
 pub use pool::BufferPool;
+pub use pipeline::{FusedOp, PipelineBuilder};

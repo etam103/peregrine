@@ -367,6 +367,7 @@ struct MatmulParams {
     uint fuse_relu;   // 0 = no relu, 1 = relu
     uint trans_a;     // 0 = no transpose, 1 = transpose A
     uint trans_b;     // 0 = no transpose, 1 = transpose B
+    uint fuse_gelu;   // 0 = no gelu, 1 = apply GELU after bias
 };
 
 kernel void matmul_f32(
@@ -418,6 +419,11 @@ kernel void matmul_f32(
     if (row < p.M && col < p.N) {
         if (p.fuse_bias) sum += bias[col];
         if (p.fuse_relu) sum = max(sum, 0.0f);
+        if (p.fuse_gelu) {
+            float x3 = sum * sum * sum;
+            float inner = 0.7978845608f * (sum + 0.044715f * x3);
+            sum = 0.5f * sum * (1.0f + precise::tanh(inner));
+        }
         C[row * p.N + col] = sum;
     }
 }
@@ -1965,8 +1971,8 @@ kernel void matmul_simd_f32(
         }
     }
 
-    // Fused bias + relu
-    if (p.fuse_bias || p.fuse_relu) {
+    // Fused bias + relu/gelu
+    if (p.fuse_bias || p.fuse_relu || p.fuse_gelu) {
         threadgroup_barrier(mem_flags::mem_device);
         for (uint i = tid; i < STILE * STILE; i += 128) {
             uint lr = i / STILE;
@@ -1978,6 +1984,258 @@ kernel void matmul_simd_f32(
                 float val = C[idx];
                 if (p.fuse_bias) val += bias[c];
                 if (p.fuse_relu) val = max(val, 0.0f);
+                if (p.fuse_gelu) {
+                    float x3 = val * val * val;
+                    float inner = 0.7978845608f * (val + 0.044715f * x3);
+                    val = 0.5f * val * (1.0f + precise::tanh(inner));
+                }
+                C[idx] = val;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused bias + GELU: out[i] = gelu(input[i] + bias[i % cols])
+// Eliminates a device memory round-trip between bias_add and gelu.
+// ---------------------------------------------------------------------------
+
+kernel void bias_gelu_f32(
+    device const float* input [[buffer(0)]],
+    device const float* bias  [[buffer(1)]],
+    device float* out         [[buffer(2)]],
+    constant uint& cols       [[buffer(3)]],
+    uint idx [[thread_position_in_grid]])
+{
+    float x = input[idx] + bias[idx % cols];
+    float x3 = x * x * x;
+    float inner = 0.7978845608f * (x + 0.044715f * x3);
+    out[idx] = 0.5f * x * (1.0f + precise::tanh(inner));
+}
+
+// ---------------------------------------------------------------------------
+// Fused residual add + layernorm: out = layernorm(x + residual)
+// Single pass: add, compute mean/var, normalize — eliminates intermediate buffer.
+// One threadgroup per row (same structure as layernorm_f32).
+// ---------------------------------------------------------------------------
+
+struct AddLayerNormParams {
+    uint batch;
+    uint dim;
+    float eps;
+};
+
+kernel void add_layernorm_f32(
+    device const float* x        [[buffer(0)]],
+    device const float* residual [[buffer(1)]],
+    device const float* gamma    [[buffer(2)]],
+    device const float* beta     [[buffer(3)]],
+    device float* output         [[buffer(4)]],
+    constant AddLayerNormParams& p [[buffer(5)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group_size [[threads_per_threadgroup]])
+{
+    uint row = gid;
+    if (row >= p.batch) return;
+
+    device const float* row_x   = x + row * p.dim;
+    device const float* row_res = residual + row * p.dim;
+    device float* row_out       = output + row * p.dim;
+
+    threadgroup float shared[1024];
+
+    // 1. Compute mean of (x + residual)
+    float local_sum = 0.0f;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        local_sum += row_x[i] + row_res[i];
+    }
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) shared[lid] += shared[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = shared[0] / float(p.dim);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2. Compute variance
+    float local_var = 0.0f;
+    for (uint i = lid; i < p.dim; i += group_size) {
+        float val = row_x[i] + row_res[i];
+        float diff = val - mean;
+        local_var += diff * diff;
+    }
+    shared[lid] = local_var;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) shared[lid] += shared[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_std = rsqrt(shared[0] / float(p.dim) + p.eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Normalize with affine transform
+    for (uint i = lid; i < p.dim; i += group_size) {
+        float val = row_x[i] + row_res[i];
+        row_out[i] = gamma[i] * (val - mean) * inv_std + beta[i];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Double-buffered simdgroup matmul: overlap next tile load with current compute.
+// K-tile reduced to 16 to fit double buffers in 32KB threadgroup memory:
+//   2 × As[32][16] + 2 × Bs[16][32] = 2×(32×16 + 16×32)×4 = 2×4096 = 8KB per slot × 2 = 16KB
+// Actually fits well within 32KB, leaving room for the simdgroup accumulators.
+// ---------------------------------------------------------------------------
+
+constant uint DB_STILE = 32;   // Output tile size (same as single-buffered)
+constant uint DB_KTILE = 16;   // K-dimension tile (halved for double-buffering)
+
+kernel void matmul_simd_db_f32(
+    device const float* A       [[buffer(0)]],
+    device const float* B       [[buffer(1)]],
+    device float* C             [[buffer(2)]],
+    device const float* bias    [[buffer(3)]],
+    constant MatmulParams& p    [[buffer(4)]],
+    uint2 group_id              [[threadgroup_position_in_grid]],
+    uint  tid                   [[thread_index_in_threadgroup]],
+    uint  simd_id               [[simdgroup_index_in_threadgroup]])
+{
+    uint sg_row = simd_id / 2;
+    uint sg_col = simd_id % 2;
+
+    uint base_row = group_id.y * DB_STILE;
+    uint base_col = group_id.x * DB_STILE;
+
+    // Double-buffered shared memory: two slots for A and B tiles
+    threadgroup float As[2][DB_STILE][DB_KTILE];   // 2 × 32 × 16
+    threadgroup float Bs[2][DB_KTILE][DB_STILE];   // 2 × 16 × 32
+
+    simdgroup_float8x8 acc[2][2];
+    for (uint i = 0; i < 2; i++)
+        for (uint j = 0; j < 2; j++)
+            acc[i][j] = simdgroup_float8x8(0.0f);
+
+    uint num_k_tiles = (p.K + DB_KTILE - 1) / DB_KTILE;
+    uint cur = 0;  // current buffer slot
+
+    // Pre-load first tile into slot 0
+    {
+        uint k_base = 0;
+        for (uint idx = tid; idx < DB_STILE * DB_KTILE; idx += 128) {
+            uint lr = idx / DB_KTILE;
+            uint lc = idx % DB_KTILE;
+            uint gr = base_row + lr;
+            uint gk = k_base + lc;
+            if (gr < p.M && gk < p.K) {
+                uint a_idx = p.trans_a ? (gk * p.M + gr) : (gr * p.K + gk);
+                As[0][lr][lc] = A[a_idx];
+            } else {
+                As[0][lr][lc] = 0.0f;
+            }
+        }
+        for (uint idx = tid; idx < DB_KTILE * DB_STILE; idx += 128) {
+            uint lr = idx / DB_STILE;
+            uint lc = idx % DB_STILE;
+            uint gk = k_base + lr;
+            uint gc = base_col + lc;
+            if (gk < p.K && gc < p.N) {
+                uint b_idx = p.trans_b ? (gc * p.K + gk) : (gk * p.N + gc);
+                Bs[0][lr][lc] = B[b_idx];
+            } else {
+                Bs[0][lr][lc] = 0.0f;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint tk = 0; tk < num_k_tiles; tk++) {
+        uint nxt = 1 - cur;
+
+        // Start loading next tile into alternate slot (if there is a next tile)
+        if (tk + 1 < num_k_tiles) {
+            uint k_base = (tk + 1) * DB_KTILE;
+            for (uint idx = tid; idx < DB_STILE * DB_KTILE; idx += 128) {
+                uint lr = idx / DB_KTILE;
+                uint lc = idx % DB_KTILE;
+                uint gr = base_row + lr;
+                uint gk = k_base + lc;
+                if (gr < p.M && gk < p.K) {
+                    uint a_idx = p.trans_a ? (gk * p.M + gr) : (gr * p.K + gk);
+                    As[nxt][lr][lc] = A[a_idx];
+                } else {
+                    As[nxt][lr][lc] = 0.0f;
+                }
+            }
+            for (uint idx = tid; idx < DB_KTILE * DB_STILE; idx += 128) {
+                uint lr = idx / DB_STILE;
+                uint lc = idx % DB_STILE;
+                uint gk = k_base + lr;
+                uint gc = base_col + lc;
+                if (gk < p.K && gc < p.N) {
+                    uint b_idx = p.trans_b ? (gc * p.K + gk) : (gk * p.N + gc);
+                    Bs[nxt][lr][lc] = B[b_idx];
+                } else {
+                    Bs[nxt][lr][lc] = 0.0f;
+                }
+            }
+        }
+
+        // Compute on current slot — walk K in steps of 8 within DB_KTILE
+        for (uint kk = 0; kk < DB_KTILE; kk += 8) {
+            simdgroup_float8x8 a_tile[2];
+            for (uint i = 0; i < 2; i++) {
+                simdgroup_load(a_tile[i],
+                    (threadgroup float*)&As[cur][sg_row * 16 + i * 8][kk],
+                    DB_KTILE);
+            }
+
+            simdgroup_float8x8 b_tile[2];
+            for (uint j = 0; j < 2; j++) {
+                simdgroup_load(b_tile[j],
+                    (threadgroup float*)&Bs[cur][kk][sg_col * 16 + j * 8],
+                    DB_STILE);
+            }
+
+            for (uint i = 0; i < 2; i++)
+                for (uint j = 0; j < 2; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], a_tile[i], b_tile[j], acc[i][j]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cur = nxt;
+    }
+
+    // Store results
+    for (uint i = 0; i < 2; i++) {
+        for (uint j = 0; j < 2; j++) {
+            uint r = base_row + sg_row * 16 + i * 8;
+            uint c = base_col + sg_col * 16 + j * 8;
+            if (r < p.M && c < p.N) {
+                simdgroup_store(acc[i][j], C + r * p.N + c, p.N);
+            }
+        }
+    }
+
+    // Fused bias + relu/gelu (same epilogue as single-buffered)
+    if (p.fuse_bias || p.fuse_relu || p.fuse_gelu) {
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint i = tid; i < DB_STILE * DB_STILE; i += 128) {
+            uint lr = i / DB_STILE;
+            uint lc = i % DB_STILE;
+            uint r = base_row + lr;
+            uint c = base_col + lc;
+            if (r < p.M && c < p.N) {
+                uint idx = r * p.N + c;
+                float val = C[idx];
+                if (p.fuse_bias) val += bias[c];
+                if (p.fuse_relu) val = max(val, 0.0f);
+                if (p.fuse_gelu) {
+                    float x3 = val * val * val;
+                    float inner = 0.7978845608f * (val + 0.044715f * x3);
+                    val = 0.5f * val * (1.0f + precise::tanh(inner));
+                }
                 C[idx] = val;
             }
         }

@@ -993,6 +993,57 @@ def bench_linalg():
 
 
 # ---------------------------------------------------------------------------
+# Pipeline ops (fused matmul+bias+gelu, add+layernorm)
+# ---------------------------------------------------------------------------
+
+
+def bench_pipeline_ops():
+    results = []
+
+    # matmul + bias + gelu at transformer FFN sizes
+    for m, k, n, label in [
+        (196, 768, 3072, "196x768x3072"),
+        (196, 1024, 4096, "196x1024x4096"),
+    ]:
+        key = jax.random.key(42)
+        keys = jax.random.split(key, 3)
+        x = jax.random.normal(keys[0], (m, k))
+        w = jax.random.normal(keys[1], (k, n))
+        b = jax.random.normal(keys[2], (1, n))
+
+        def run(x=x, w=w, b=b):
+            h = jax.nn.gelu(x @ w + b)
+            h.block_until_ready()
+
+        times = bench(run, ITERS_SLOW)
+        results.append({"op": f"matmul_bias_gelu_{label}", **stats(times)})
+
+    # add + layernorm at transformer sizes
+    for batch, dim, label in [
+        (196, 768, "196x768"),
+        (196, 1024, "196x1024"),
+    ]:
+        key = jax.random.key(0)
+        keys = jax.random.split(key, 4)
+        x = jax.random.normal(keys[0], (batch, dim))
+        r = jax.random.normal(keys[1], (batch, dim))
+        g = jnp.ones((dim,))
+        b = jnp.zeros((dim,))
+
+        def run(x=x, r=r, g=g, b=b):
+            s = x + r
+            mean = jnp.mean(s, axis=-1, keepdims=True)
+            var = jnp.var(s, axis=-1, keepdims=True)
+            out = (s - mean) / jnp.sqrt(var + 1e-5) * g + b
+            out.block_until_ready()
+
+        times = bench(run, ITERS_FAST)
+        results.append({"op": f"add_layernorm_{label}", **stats(times)})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1030,6 +1081,8 @@ def main():
         bench_fft,
         # Phase 7: Linear algebra
         bench_linalg,
+        # Pipeline ops
+        bench_pipeline_ops,
     ]:
         print(f"  JAX: {fn.__name__} ...")
         all_results.extend(fn())
