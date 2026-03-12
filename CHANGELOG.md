@@ -7,6 +7,60 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.21.0] - 2026-03-12
+
+### Added — Int8 quantized inference path (NEON i8 GEMM + Metal dequant matmul)
+
+Per-column symmetric int8 weight quantization with per-row dynamic activation quantization at inference time. CPU path uses NEON `vmull_s8` + `vpadalq_s16` widening multiply-accumulate (16 i8 MACs/iteration, 4-row register blocking). Metal GPU path loads i8 weights, dequantizes to f32 in registers, and computes via existing simdgroup f32 HW.
+
+**New module** (`src/quant.rs`)
+- `QuantizedTensor` — i8 data + per-column f32 scales, optional GPU buffers
+- `quantize_weights()` — per-column symmetric: `scale[n] = max(|w[:,n]|) / 127`
+- `quantize_activations()` — per-row dynamic with NEON fast path (`absmax_f32`, `quantize_row_i8`)
+- `dequantize()` — reconstruct f32 from i8 + scales
+- `matmul_quantized()` — CPU: quantize activations, transpose B, dispatch `gemm_i8_sdot`
+- `matmul_quantized_gpu()` — GPU: upload f32 activations, dispatch dequant kernel
+
+**3 new NEON kernels** (`src/simd_kernels.rs`)
+- `absmax_f32` — NEON fabs+fmax reduce with `vmaxvq_f32` horizontal max
+- `quantize_row_i8` — scale+round+clamp via `vrndnq_f32`
+- `gemm_i8_sdot` — i8 GEMM with `vmull_s8`+`vpadalq_s16`, 4-row blocking, B pre-transposed
+
+**2 new Metal compute kernels** (`src/metal/shaders.rs`)
+- `matmul_dequant_i8` — scalar 16×16 tiled kernel, loads `char*` i8 weights, dequantizes with per-column scale
+- `matmul_dequant_simd_i8` — simdgroup 32×32 tiled kernel, same dequant pattern, `simdgroup_matrix<float,8,8>` compute
+
+**1 new dispatch method** (`src/metal/context.rs`)
+- `dispatch_matmul_dequant_i8()` — auto-selects scalar vs simdgroup based on output size (M*N >= 1M → simdgroup)
+
+**Extended modules**
+- `src/tensor.rs` — `matmul_quantized()` method (GPU path if weights on GPU, else CPU)
+- `src/serial.rs` — `write_quantized_tensor()` / `read_quantized_tensor()` with dtype tag byte (0=f32, 1=i8)
+- `src/lib.rs` — `pub mod quant`
+
+**New scripts & tests**
+- `scripts/convert_weights_int8.py` — convert f32 Peregrine checkpoint to int8 (quantizes 2D `.weight` tensors, keeps biases as f32)
+- `tests/quant_parity.rs` — 4 integration tests: roundtrip error, i8 vs f32 matmul parity, Metal vs CPU parity, serialization roundtrip
+
+### Benchmark Results
+
+Int8 vs f32 matmul (CPU, Peregrine-only — int8 currently ~23x slower due to vmull+vpadalq vs Apple Accelerate cblas_sgemm):
+| Op | f32 | i8 |
+|----|----:|---:|
+| 196×768×3072 | 636us | 14,603us |
+| 196×1024×4096 | 1,508us | 28,587us |
+
+Note: int8 path trades speed for 4× memory reduction. The NEON kernel uses stable `vmull_s8`+`vpadalq_s16` (not unstable `vdotq_s32`). Metal GPU dequant path loads 4× less data from device memory.
+
+Cross-framework (updated): Peregrine wins 97/171 ops. Geometric mean ratio vs PyTorch: **0.84x** (Peregrine faster).
+
+### Stats
+
+- 107 Metal compute shaders (up from 105), 40 dispatch methods (up from 39)
+- 491 total tests (up from 487): 356 unit + 34 activation + 23 parity + 4 quantization + 31 metal parity + 12 metal basics + 17 metal autograd + 14 misc
+
+---
+
 ## [0.20.0] - 2026-03-11
 
 ### Added — Fused GPU kernel pipelines (matmul+bias+gelu, add+layernorm, double-buffered matmul)

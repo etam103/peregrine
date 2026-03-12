@@ -37,7 +37,8 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::fft`** | FFT via Apple Accelerate vDSP — fft, ifft, rfft, irfft, fft2, ifft2, rfft2, irfft2, fftshift |
 | **`peregrine::linalg`** | Linear algebra via LAPACK — solve, inv, cholesky, svd, qr, eigh, lu, det, pinv, norm, matrix_rank, cond, lstsq, matrix_power |
 | **`peregrine::transforms`** | Functional autograd utilities — grad, value_and_grad, checkpoint |
-| **`peregrine::serial`** | Save/load model weights in compact binary format |
+| **`peregrine::quant`** | Int8 quantized inference — per-column symmetric weight quantization, per-row dynamic activation quantization, NEON i8 GEMM, Metal dequant matmul |
+| **`peregrine::serial`** | Save/load model weights in compact binary format (f32 and int8 quantized) |
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
 | **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
 | **`peregrine::envs`** | 10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe |
@@ -83,7 +84,7 @@ opt.zero_grad();
 | **Shape** | `reshape` `transpose` `squeeze` `unsqueeze` `concat` `select` `flatten` `stack` `split` `tril` `triu` `repeat` `tile` `pad` `roll` `take` `diagonal` `diag` `trace` `outer` `inner` `broadcast_to` `expand_dims` |
 | **Conditional** | `clip` `where` `nan_to_num` |
 | **Comparison** | `equal` `not_equal` `greater` `greater_equal` `less` `less_equal` `logical_and` `logical_or` `logical_not` `isnan` `isinf` `isfinite` |
-| **Layers** | `matmul` `conv1d` `conv2d` `conv2d_strided` `conv_transpose1d` `conv_transpose2d` `conv2d+relu+pool` `max_pool2d` `max_pool2d_ext` `avg_pool2d` `add_bias` `batch_norm` `layer_norm` `rms_norm` `group_norm` `instance_norm` `upsample_nearest` `upsample_bilinear` `index_select` `matmul_bias_gelu` `add_layer_norm` |
+| **Layers** | `matmul` `matmul_quantized` `conv1d` `conv2d` `conv2d_strided` `conv_transpose1d` `conv_transpose2d` `conv2d+relu+pool` `max_pool2d` `max_pool2d_ext` `avg_pool2d` `add_bias` `batch_norm` `layer_norm` `rms_norm` `group_norm` `instance_norm` `upsample_nearest` `upsample_bilinear` `index_select` `matmul_bias_gelu` `add_layer_norm` |
 | **Loss** | `bce_with_logits` `cross_entropy` `mse` `l1` `nll` `smooth_l1` `huber` `kl_div` `cosine_similarity` `triplet` `hinge` `log_cosh` `margin_ranking` `gaussian_nll` |
 
 All ops support broadcasting where applicable.
@@ -114,7 +115,7 @@ Model: MLP (784 → 128 → 64 → 10) with ReLU, trained with CrossEntropyLoss 
 
 ```
 $ cargo test
-running 409 tests ... ok (352 unit + 34 activation + 23 parity)
+running 491 tests ... ok (356 unit + 34 activation + 23 parity + 4 quantization)
 ```
 
 To regenerate reference data: `.venv/bin/python tests/generate_reference.py`
@@ -215,7 +216,7 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 | matmul+bias+gelu 196x768x3072 | **1128** | 1307 | — | 3187 | 1294 | 3427 |
 | add+layernorm 196x768 | **110** | 117 | — | 1411 | 1335 | 292 |
 
-Geometric mean ratio across 137 ops (lower = Peregrine faster): **PyTorch 0.87x**, **MLX 0.70x**, TensorFlow 0.50x, tinygrad 0.09x, JAX 0.65x. Peregrine wins 91 of 167 ops (incl. GPU-only).
+Geometric mean ratio across 137 ops (lower = Peregrine faster): **PyTorch 0.84x**, **MLX 0.67x**, TensorFlow 0.48x, tinygrad 0.09x, JAX 0.62x. Peregrine wins 97 of 171 ops (incl. GPU-only).
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
@@ -253,7 +254,8 @@ Server mode (`--server` flag on the Rust binary) loads weights once and processe
 | Pool bypass for small tensors | Skip HashMap overhead for tensors < 1024 elements |
 | Rayon threshold tuning | Dual thresholds (500K cheap / 100K expensive) — avoids spawn overhead |
 | Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
-| Metal GPU backend | 105 compute shaders with fused op pipelines (matmul+bias+gelu, add+layernorm, double-buffered matmul), command batching, full autograd integration, and GPU-resident attention (QKV reshape, RoPE2D, SDPA) |
+| Int8 quantized inference | Per-column symmetric weight quantization, per-row dynamic activation quantization, NEON i8 GEMM (vmull+vpadalq, 16 MACs/iter, 4-row blocking), Metal dequant matmul (scalar 16×16 + simdgroup 32×32) |
+| Metal GPU backend | 107 compute shaders with fused op pipelines (matmul+bias+gelu, add+layernorm, double-buffered matmul, int8 dequant matmul), command batching, full autograd integration, and GPU-resident attention (QKV reshape, RoPE2D, SDPA) |
 
 ---
 
@@ -273,10 +275,11 @@ src/
   linalg.rs       linear algebra via LAPACK (solve, inv, cholesky, svd, qr, eigh, lu, det, pinv, matrix_rank, cond, lstsq, matrix_power)
   transforms.rs   functional autograd utilities (grad, value_and_grad, checkpoint)
   debug.rs        model summary + training health diagnostics
-  serial.rs       model weight save/load (binary format)
+  quant.rs        int8 quantized inference — per-column weight quantization, per-row activation quantization, NEON i8 GEMM, Metal dequant matmul
+  serial.rs       model weight save/load (binary format, f32 + int8)
   rl.rs           RL algorithms — PPO, DQN, REINFORCE, replay/rollout buffers, Environment trait (~1,750 lines)
   envs.rs         10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe (~2,150 lines)
-  metal/          Metal GPU backend (105 shaders, 39 dispatch methods, fused pipelines, command batching, autograd)
+  metal/          Metal GPU backend (107 shaders, 40 dispatch methods, fused pipelines, command batching, autograd)
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
   wallclock.rs    wall-clock comparison benchmark (JSON output)
@@ -322,12 +325,14 @@ examples/
 scripts/
   convert_grok1.py  Grok-1 JAX checkpoint → Peregrine binary format (dequantize 8-bit, transpose, rename)
   convert_deepseek.py  DeepSeek HuggingFace SafeTensors → Peregrine binary format (transpose, rename)
+  convert_weights_int8.py  convert f32 Peregrine checkpoint to int8 quantized format
 tests/
   pytorch_parity.rs   23 numerical parity tests vs PyTorch
   activations.rs      34 activation function tests
   metal_parity.rs     31 CPU vs Metal parity tests
   metal_basics.rs     12 Metal compute shader tests
   metal_autograd.rs   17 GPU autograd integration tests
+  quant_parity.rs     4 int8 quantization tests (roundtrip, matmul parity, Metal parity, serialization)
   generate_reference.py  script to regenerate PyTorch reference data
   fixtures/             binary reference tensors
 ```

@@ -6,6 +6,7 @@ pub mod nn;
 pub mod debug;
 pub mod optim;
 pub mod serial;
+pub mod quant;
 pub mod random;
 pub mod init;
 pub mod fft;

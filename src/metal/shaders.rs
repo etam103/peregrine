@@ -2241,4 +2241,155 @@ kernel void matmul_simd_db_f32(
         }
     }
 }
+// ---------------------------------------------------------------------------
+// Int8 dequantizing matmul: C[M,N] = A_f32[M,K] @ W_i8[K,N]
+// W is stored as int8 with per-column f32 scales.
+// Loads i8 weights, dequantizes to f32 in registers, accumulates.
+// ---------------------------------------------------------------------------
+
+struct DequantMatmulParams {
+    uint M;
+    uint N;
+    uint K;
+};
+
+constant uint DQ_TILE = 16;
+
+kernel void matmul_dequant_i8(
+    device const float* A            [[buffer(0)]],
+    device const char* W_i8          [[buffer(1)]],
+    device const float* W_scales     [[buffer(2)]],
+    device float* C                  [[buffer(3)]],
+    constant DequantMatmulParams& p  [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+
+    threadgroup float As[DQ_TILE][DQ_TILE];
+    threadgroup float Ws[DQ_TILE][DQ_TILE];
+
+    float sum = 0.0f;
+    uint num_tiles = (p.K + DQ_TILE - 1) / DQ_TILE;
+
+    float w_scale = (col < p.N) ? W_scales[col] : 1.0f;
+
+    for (uint t = 0; t < num_tiles; t++) {
+        // Load tile of A
+        uint a_k = t * DQ_TILE + lid.x;
+        if (row < p.M && a_k < p.K) {
+            As[lid.y][lid.x] = A[row * p.K + a_k];
+        } else {
+            As[lid.y][lid.x] = 0.0f;
+        }
+
+        // Load tile of W (dequantize i8 -> f32 in registers)
+        uint w_k = t * DQ_TILE + lid.y;
+        if (w_k < p.K && col < p.N) {
+            float qi = float(W_i8[w_k * p.N + col]);
+            Ws[lid.y][lid.x] = qi * w_scale;
+        } else {
+            Ws[lid.y][lid.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < DQ_TILE; k++) {
+            sum += As[lid.y][k] * Ws[k][lid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < p.M && col < p.N) {
+        C[row * p.N + col] = sum;
+    }
+}
+
+// Simdgroup variant: 32x32 tiles with hardware 8x8 matrix multiply.
+// Dequantizes i8 weights to f32 during tile load.
+constant uint DQ_STILE = 32;
+
+kernel void matmul_dequant_simd_i8(
+    device const float* A            [[buffer(0)]],
+    device const char* W_i8          [[buffer(1)]],
+    device const float* W_scales     [[buffer(2)]],
+    device float* C                  [[buffer(3)]],
+    constant DequantMatmulParams& p  [[buffer(4)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sid [[simdgroup_index_in_threadgroup]])
+{
+    uint base_row = group_id.y * DQ_STILE;
+    uint base_col = group_id.x * DQ_STILE;
+
+    uint sg_row = sid / 2;
+    uint sg_col = sid % 2;
+
+    simdgroup_matrix<float, 8, 8> acc[2][2];
+    for (uint i = 0; i < 2; i++)
+        for (uint j = 0; j < 2; j++)
+            acc[i][j] = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    threadgroup float tileA[DQ_STILE][DQ_STILE];
+    threadgroup float tileW[DQ_STILE][DQ_STILE];
+
+    uint num_k_tiles = (p.K + DQ_STILE - 1) / DQ_STILE;
+
+    for (uint t = 0; t < num_k_tiles; t++) {
+        // Cooperative load of A tile
+        for (uint i = tid; i < DQ_STILE * DQ_STILE; i += 128) {
+            uint lr = i / DQ_STILE;
+            uint lc = i % DQ_STILE;
+            uint gr = base_row + lr;
+            uint gk = t * DQ_STILE + lc;
+            tileA[lr][lc] = (gr < p.M && gk < p.K) ? A[gr * p.K + gk] : 0.0f;
+        }
+
+        // Cooperative load of W tile (dequantize i8 -> f32)
+        for (uint i = tid; i < DQ_STILE * DQ_STILE; i += 128) {
+            uint lr = i / DQ_STILE;
+            uint lc = i % DQ_STILE;
+            uint gk = t * DQ_STILE + lr;
+            uint gc = base_col + lc;
+            if (gk < p.K && gc < p.N) {
+                float qi = float(W_i8[gk * p.N + gc]);
+                tileW[lr][lc] = qi * W_scales[gc];
+            } else {
+                tileW[lr][lc] = 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2x2 simdgroup matrix multiply from 16x16 sub-tiles
+        for (uint tk = 0; tk < DQ_STILE; tk += 8) {
+            simdgroup_matrix<float, 8, 8> a_tile[2];
+            simdgroup_matrix<float, 8, 8> b_tile[2];
+
+            simdgroup_load(a_tile[0], &tileA[sg_row * 16][tk], DQ_STILE);
+            simdgroup_load(a_tile[1], &tileA[sg_row * 16 + 8][tk], DQ_STILE);
+            simdgroup_load(b_tile[0], &tileW[tk][sg_col * 16], DQ_STILE);
+            simdgroup_load(b_tile[1], &tileW[tk][sg_col * 16 + 8], DQ_STILE);
+
+            for (uint i = 0; i < 2; i++)
+                for (uint j = 0; j < 2; j++)
+                    simdgroup_multiply_accumulate(acc[i][j], a_tile[i], b_tile[j], acc[i][j]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store results
+    for (uint i = 0; i < 2; i++) {
+        for (uint j = 0; j < 2; j++) {
+            uint r = base_row + sg_row * 16 + i * 8;
+            uint c = base_col + sg_col * 16 + j * 8;
+            if (r < p.M && c < p.N) {
+                simdgroup_store(acc[i][j], C + r * p.N + c, p.N);
+            }
+        }
+    }
+}
 "#;

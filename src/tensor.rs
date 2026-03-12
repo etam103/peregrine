@@ -1263,6 +1263,38 @@ impl Tensor {
         Tensor::from_op(data, vec![m, n], Op::MatMul(self.clone(), other.clone()))
     }
 
+    /// Int8 quantized matmul: self[M,K] @ w_quant[K,N] -> [M,N].
+    /// Inference only (Op::None, no grad tracking).
+    /// CPU: quantize activation per-row, NEON sdot kernel.
+    /// GPU: upload activation, dispatch dequant kernel.
+    pub fn matmul_quantized(&self, w: &crate::quant::QuantizedTensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let on_gpu = w.gpu_data_i8.is_some() && w.gpu_scales.is_some();
+            if on_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    self.sync_gpu_to_cpu();
+                    let inner = self.0.borrow();
+                    let a_data = &inner.data;
+                    let m = inner.shape[0];
+                    let k = inner.shape[1];
+                    crate::quant::matmul_quantized_gpu(gpu, a_data, m, k, w)
+                }) {
+                    let inner = self.0.borrow();
+                    let shape = vec![inner.shape[0], w.cols];
+                    return Tensor::from_gpu_op(result, shape, Op::None);
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
+        let inner = self.0.borrow();
+        assert_eq!(inner.shape.len(), 2);
+        let (m, k) = (inner.shape[0], inner.shape[1]);
+        let data = crate::quant::matmul_quantized(&inner.data, m, k, w);
+        Tensor::new(data, vec![m, w.cols], false)
+    }
+
     pub fn relu(&self) -> Tensor {
         #[cfg(feature = "metal")]
         {

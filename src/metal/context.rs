@@ -97,6 +97,8 @@ impl GpuContext {
             // Attention reshape + RoPE kernels
             "qkv_reshape_f32", "rope2d_f32",
             "attn_output_reshape_f32", "separate_reshape_f32",
+            // Int8 dequant matmul
+            "matmul_dequant_i8", "matmul_dequant_simd_i8",
         ];
 
         let mut pipelines = HashMap::new();
@@ -1909,6 +1911,90 @@ impl GpuContext {
                     enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
                 }
             }
+            enc.endEncoding();
+        }
+    }
+
+    /// Dispatch int8 dequantizing matmul: C[M,N] = A_f32[M,K] @ W_i8[K,N].
+    /// Auto-selects scalar (16x16) or simdgroup (32x32) kernel based on matrix size.
+    pub fn dispatch_matmul_dequant_i8(
+        &self,
+        a: &GpuBuffer<f32>,
+        w_i8: &GpuBuffer<i8>,
+        w_scales: &GpuBuffer<f32>,
+        out: &GpuBuffer<f32>,
+        m: u32, n: u32, k: u32,
+    ) {
+        #[repr(C)]
+        struct DequantMatmulParams {
+            m: u32,
+            n: u32,
+            k: u32,
+        }
+
+        let params = DequantMatmulParams { m, n, k };
+
+        let large_enough = m >= 64 && n >= 64
+            && (m as u64) * (n as u64) >= 1024 * 1024;
+
+        if large_enough {
+            // Simdgroup kernel
+            let pipeline = &self.pipelines["matmul_dequant_simd_i8"];
+            let cmd_ref = self.ensure_cmd();
+            let cmd = cmd_ref.as_ref().unwrap();
+            let enc = cmd.computeCommandEncoder().expect("encoder");
+
+            enc.setComputePipelineState(pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(a.raw()), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(w_i8.raw()), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(w_scales.raw()), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 3);
+                enc.setBytes_length_atIndex(
+                    std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                    std::mem::size_of::<DequantMatmulParams>(),
+                    4,
+                );
+            }
+
+            let threads_per_group = 128usize;
+            let tile = 32usize;
+            let threadgroup_size = MTLSize { width: threads_per_group, height: 1, depth: 1 };
+            let num_groups = MTLSize {
+                width: (n as usize + tile - 1) / tile,
+                height: (m as usize + tile - 1) / tile,
+                depth: 1,
+            };
+            enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
+            enc.endEncoding();
+        } else {
+            // Scalar 16x16 tiled kernel
+            let pipeline = &self.pipelines["matmul_dequant_i8"];
+            let cmd_ref = self.ensure_cmd();
+            let cmd = cmd_ref.as_ref().unwrap();
+            let enc = cmd.computeCommandEncoder().expect("encoder");
+
+            enc.setComputePipelineState(pipeline);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(a.raw()), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(w_i8.raw()), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(w_scales.raw()), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(out.raw()), 0, 3);
+                enc.setBytes_length_atIndex(
+                    std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                    std::mem::size_of::<DequantMatmulParams>(),
+                    4,
+                );
+            }
+
+            let tile_size = 16usize;
+            let threadgroup_size = MTLSize { width: tile_size, height: tile_size, depth: 1 };
+            let num_groups = MTLSize {
+                width: (n as usize + tile_size - 1) / tile_size,
+                height: (m as usize + tile_size - 1) / tile_size,
+                depth: 1,
+            };
+            enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
             enc.endEncoding();
         }
     }

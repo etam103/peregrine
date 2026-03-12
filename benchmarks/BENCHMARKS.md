@@ -1,6 +1,6 @@
 # Peregrine Benchmarks
 
-**Date**: 2026-02-28
+**Date**: 2026-03-12
 **System**: Apple M1 Max, 10 cores, 64 GB RAM, arm64
 **Frameworks**: Peregrine (Rust), PyTorch 2.10.0, TensorFlow 2.20.0, JAX 0.9.0.1, MLX 0.30.6, TinyGrad
 **All benchmarks**: CPU only, median of 20-50 iterations
@@ -69,16 +69,16 @@ Winner column: PG=Peregrine, PT=PyTorch, TF=TensorFlow, JAX=JAX, MLX=MLX.
 
 ### Summary
 
-| Framework | Wins (of 115 multi-framework ops) |
-|-----------|----------------------------------|
-| Peregrine | 37 |
-| PyTorch | 41 |
-| TensorFlow | 15 |
-| JAX | 8 |
-| MLX | 14 |
-| TinyGrad | 0 |
+| Framework | Wins (of 171 total ops) |
+|-----------|------------------------|
+| Peregrine | 97 |
+| PyTorch | 23 |
+| JAX | 23 |
+| TensorFlow | 14 |
+| MLX | 13 |
+| TinyGrad | 1 |
 
-Peregrine and PyTorch are the clear front-runners, essentially tied. Peregrine beats TF, JAX, MLX, and TinyGrad overall.
+Peregrine wins the majority of ops (97/171). Geometric mean ratio vs PyTorch: 0.84x (Peregrine faster), vs MLX: 0.67x, vs TF: 0.48x, vs JAX: 0.62x, vs tinygrad: 0.09x.
 
 ### Matmul
 
@@ -307,6 +307,17 @@ Peregrine and PyTorch are the clear front-runners, essentially tied. Peregrine b
 | qr_256x256 | 1049.3 | 1015.1 | 1814.4 | **997.6** | 1186.3 | - | JAX |
 | eigh_256x256 | 6052.4 | **3502.2** | 4736.8 | 3613.7 | 3658.6 | - | PT |
 | det_256x256 | 213.8 | **206.5** | 450.5 | 207.2 | - | - | PT |
+
+### Int8 Quantized Matmul
+
+Peregrine-only benchmark comparing f32 (Apple Accelerate cblas_sgemm) vs int8 quantized matmul (NEON vmull+vpadalq, per-column weight + per-row activation quantization).
+
+| Op | f32 (us) | i8 (us) | Ratio |
+|----|----------:|--------:|------:|
+| matmul_196x768x3072 | 636 | 14,603 | 23.0x slower |
+| matmul_196x1024x4096 | 1,508 | 28,587 | 19.0x slower |
+
+The int8 path is currently slower than f32 because: (a) NEON `vmull_s8`+`vpadalq_s16` (stable) vs hardware `sdot` (unstable), (b) competing against Apple Accelerate's heavily optimized cblas_sgemm. The primary benefit is **4× memory reduction** for weight storage, enabling larger models to fit in memory. The Metal GPU dequant path loads 4× less data from device memory.
 
 ## Analysis
 

@@ -756,6 +756,36 @@ fn bench_pipeline_ops() -> Vec<serde_json::Value> {
     results
 }
 
+fn bench_int8_matmul() -> Vec<serde_json::Value> {
+    use peregrine::quant::quantize_weights;
+    let mut results = Vec::new();
+
+    for (m, k, n, label) in [
+        (196, 768, 3072, "196x768x3072"),   // ViT-Base FFN
+        (196, 1024, 4096, "196x1024x4096"),  // ViT-Large FFN
+    ] {
+        // f32 matmul baseline
+        let a = Tensor::randn(&[m, k], false);
+        let w_f32 = Tensor::randn(&[k, n], false);
+        let times_f32 = bench(|| {
+            let h = a.matmul(&w_f32);
+            black_box(h);
+        }, ITERS_SLOW);
+        results.push(make_result(&format!("matmul_f32_{label}"), times_f32));
+
+        // int8 matmul
+        let w_data = w_f32.data();
+        let qt = quantize_weights(&w_data, k, n);
+        let times_i8 = bench(|| {
+            let h = a.matmul_quantized(&qt);
+            black_box(h);
+        }, ITERS_SLOW);
+        results.push(make_result(&format!("matmul_i8_{label}"), times_i8));
+    }
+
+    results
+}
+
 // ---------------------------------------------------------------------------
 // GPU Benchmarks (Metal)
 // ---------------------------------------------------------------------------
@@ -1051,6 +1081,8 @@ fn main() {
         ("bench_linalg", bench_linalg),
         // Pipeline ops (fused matmul+bias+gelu, add+layernorm)
         ("bench_pipeline_ops", bench_pipeline_ops),
+        // Int8 quantized matmul
+        ("bench_int8_matmul", bench_int8_matmul),
     ];
 
     let mut all_results = Vec::new();
