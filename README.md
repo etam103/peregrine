@@ -46,13 +46,14 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
 | **`peregrine::envs`** | 10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe |
 | **`peregrine::gguf`** | GGUF binary format parser — load quantized model weights (Q8_0, Q4_0, Q4_1, F16, F32), metadata extraction, dequantization |
-| **`peregrine::metal`** | Metal GPU backend — 108 compute shaders, 41 dispatch methods, fused op pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling (`--features metal`) |
+| **`peregrine::metal`** | Metal GPU backend — 108 compute shaders, 41 dispatch methods, fused op pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling, thermal-aware scheduling (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
-| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
+| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, 4.5% faster than PyTorch at 224 (0.64s vs 0.67s), 14% faster at 512 (1.95s vs 2.26s). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
 | **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
 | **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
-| **`examples/llama`** | Llama 3.2 inference from GGUF — loads quantized GGUF models directly (Q8_0, Q4_0, Q4_1), 16-layer 1B config (2048 dim, GQA 32/8 heads, SwiGLU), RoPE (theta=500000), BPE tokenizer from GGUF metadata, greedy/temperature/top-p sampling, streaming decode with tok/s stats |
+| **`peregrine::thermal`** | Thermal monitoring via Darwin notifications — `ThermalState` (Nominal/Moderate/Heavy/Trapping/Sleeping), rate-limited polling (100ms cache), thread-local singleton. Used by `het_execute_thermal` for thermal-aware GPU/CPU scheduling |
+| **`examples/llama`** | Llama 3.2 inference from GGUF — loads quantized GGUF models directly (Q8_0, Q4_0, Q4_1), 16-layer 1B config (2048 dim, GQA 32/8 heads, SwiGLU), RoPE (theta=500000), BPE tokenizer from GGUF metadata, greedy/temperature/top-p sampling, streaming decode with tok/s stats. `--sustained SECS` for sustained throughput profiling (p50/p95/p99 latency, thermal distribution), `--wandb` for W&B logging |
 | **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
 | **`examples/moba`** | MOBA 3v3 with LSTM-based PPO and self-play — single-lane map (32x16), heroes, towers, creeps, bases. Train, selfplay, watch (HTML replay), video (MP4 export via FFmpeg) |
 
@@ -208,31 +209,31 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | 7.1 | **6.2** | 28.4 | 50.2 | 424.1 | 81.4 |
-| matmul 512x512 | 193.0 | **134.0** | 221.2 | 695.1 | 460.4 | 504.6 |
-| add 100k | **12.8** | 40.1 | 32.4 | 49.6 | 203.6 | 39.4 |
-| mul 100k | **12.4** | 40.7 | 33.0 | 43.5 | 185.7 | 30.0 |
-| relu 100k | **8.8** | 40.2 | 27.0 | 38.5 | 345.4 | 99.2 |
-| softmax 8x128 | **1.2** | 30.1 | 19.0 | 11.4 | 617.8 | 32.8 |
-| gelu 100k | 77.9 | **75.2** | 148.3 | 247.3 | 885.2 | 271.6 |
-| rfft 1k | **2.2** | 4.4 | 20.6 | 43.5 | — | 42.8 |
-| cross_entropy | **2.6** | 39.8 | 24.0 | 626.0 | 3431.6 | 60.9 |
-| train step 64 | **817.6** | 1276.8 | 869.1 | 8796.6 | 24610.8 | 5544.6 |
-| matmul+bias+gelu 196x768x3072 | 1209.0 | **934.7** | — | 2440.2 | 1259.2 | 2142.1 |
-| add+layernorm 196x768 | **108.5** | 110.3 | — | 1258.4 | 1143.5 | 231.7 |
+| matmul 128x128 | 35.8 | **6.5** | 21.2 | 52.5 | 442.5 | 58.4 |
+| matmul 512x512 | 277.5 | **146.5** | 197.0 | 702.2 | 428.8 | 556.6 |
+| add 100k | **10.2** | 48.8 | 33.8 | 60.3 | 194.6 | 34.3 |
+| mul 100k | **12.7** | 42.6 | 33.5 | 48.0 | 197.2 | 38.1 |
+| relu 100k | **8.8** | 45.8 | 36.2 | 39.5 | 354.2 | 100.5 |
+| softmax 8x128 | **1.2** | 37.0 | 23.5 | 12.4 | 642.1 | 33.0 |
+| gelu 100k | **83.2** | 83.7 | 143.1 | 249.7 | 895.4 | 222.3 |
+| rfft 1k | **2.0** | 4.5 | 30.6 | 46.1 | — | 23.0 |
+| cross_entropy | **2.7** | 47.2 | 24.3 | 635.8 | 3823.9 | 58.2 |
+| train step 64 | **821.1** | 1543.1 | 1029.1 | 9305.1 | 25607.6 | 5264.5 |
+| matmul+bias+gelu 196x768x3072 | 1207.2 | **1099.6** | — | 2463.9 | 1314.8 | 2155.1 |
+| add+layernorm 196x768 | **107.5** | 109.7 | — | 1280.5 | 1159.9 | 237.2 |
 
-Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.93x**, **MLX 0.67x**, TensorFlow 0.52x, tinygrad 0.10x, JAX 0.60x. Peregrine wins 64 of 141 ops.
+Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.90x**, **MLX 0.66x**, TensorFlow 0.53x, tinygrad 0.10x, JAX 0.67x. Peregrine wins 68 of 141 ops.
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
 | Resolution | CPU | GPU | GPU+Pipeline | PyTorch CPU |
 |-----------|----:|----:|-------------:|------------:|
-| 224x224 | 0.66s | 0.53s | **0.54s** | 0.67s |
-| 512x384 | 1.97s | 1.55s | **1.44s** | 2.26s |
+| 224x224 | 0.64s | 0.53s | **0.54s** | 0.67s |
+| 512x384 | 1.95s | 1.55s | **1.44s** | 2.26s |
 | Weight load | **0.6s** | 0.6s | 0.6s | 1.6s |
 
-- **224**: Peregrine is **1.5% faster** on CPU (0.66s vs 0.67s), **22% faster** with GPU (0.53s)
-- **512**: Peregrine is **13% faster** on CPU (1.97s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
+- **224**: Peregrine is **4.5% faster** on CPU (0.64s vs 0.67s), **22% faster** with GPU (0.53s)
+- **512**: Peregrine is **14% faster** on CPU (1.95s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
 GPU mode (`--gpu`) keeps the entire attention pipeline on Metal — QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape all run as GPU kernels with no CPU round-trips. Pipeline mode (`--pipeline`) overlaps feat1 (GPU) and feat2 (CPU/AMX) decoder processing via `MTLSharedEvent` signaling — single-threaded, no `Send`/`Sync` needed.
@@ -290,9 +291,10 @@ src/
   serial.rs       model weight save/load (binary format, f32 + int8 + 2:4 sparse)
   attention.rs    core GQA attention — StandardKVCache, gqa_attention_cpu, AttentionMask, PostScoreTransform
   speculative.rs  speculative decoding — CausalLM trait, draft-propose/target-verify with stochastic acceptance
+  thermal.rs      thermal monitoring via Darwin notifications — ThermalState, rate-limited polling, thread-local singleton
   rl.rs           RL algorithms — PPO, DQN, REINFORCE, replay/rollout buffers, Environment trait (~1,750 lines)
   envs.rs         10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe (~2,150 lines)
-  metal/          Metal GPU backend (108 shaders, 41 dispatch methods, fused pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd, het scheduling)
+  metal/          Metal GPU backend (108 shaders, 41 dispatch methods, fused pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd, het scheduling, thermal-aware scheduling)
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
   wallclock.rs    wall-clock comparison benchmark (JSON output)
@@ -327,7 +329,8 @@ examples/
     moe.rs          MoE — sigmoid gate, group-limited top-k, shared experts
     tokenizer.rs    HuggingFace tokenizer.json BPE parser (pure Rust)
   llama/          Llama 3.2 inference from GGUF
-    main.rs         CLI, greedy/temperature/top-p sampling, streaming decode
+    main.rs         CLI, greedy/temperature/top-p sampling, streaming decode, sustained profiling
+    wandb.rs        W&B logging for sustained profiling metrics
     model.rs        LlamaConfig (from GGUF metadata), weight loading with transpose
     decoder.rs      LlamaBlock — pre-norm GQA attention + SwiGLU FFN
     attention.rs    GQA with RoPE (theta=500000), causal masking, KV cache

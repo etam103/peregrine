@@ -21,3 +21,4 @@ pub use buffer::GpuBuffer;
 pub use pool::BufferPool;
 pub use pipeline::{FusedOp, PipelineBuilder};
 pub use sched::het_execute;
+pub use sched::het_execute_thermal;

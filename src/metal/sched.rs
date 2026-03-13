@@ -37,6 +37,43 @@ where
     (gpu_result, cpu_result)
 }
 
+/// Thermal-aware heterogeneous execution.
+///
+/// Checks thermal pressure and decides whether to use the GPU:
+/// - **Nominal / Moderate** → normal `het_execute` (GPU + CPU overlap)
+/// - **Heavy** → skip GPU, call `cpu_fallback()` for both results
+/// - **Trapping / Sleeping** → CPU fallback + 1ms micro-pause cooldown
+pub fn het_execute_thermal<F1, F2, F3, R1, R2>(
+    gpu_work: F1,
+    cpu_work: F2,
+    cpu_fallback: F3,
+) -> (R1, R2)
+where
+    F1: FnOnce() -> R1,
+    F2: FnOnce() -> R2,
+    F3: FnOnce() -> (R1, R2),
+{
+    use crate::thermal::{thermal_state, ThermalState};
+
+    match thermal_state() {
+        ThermalState::Nominal | ThermalState::Moderate => {
+            het_execute(gpu_work, cpu_work)
+        }
+        ThermalState::Heavy => {
+            drop(gpu_work);
+            drop(cpu_work);
+            cpu_fallback()
+        }
+        ThermalState::Trapping | ThermalState::Sleeping => {
+            drop(gpu_work);
+            drop(cpu_work);
+            let result = cpu_fallback();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            result
+        }
+    }
+}
+
 /// Calibrate whether heterogeneous execution is beneficial.
 ///
 /// Runs `gpu_fn` and `cpu_fn` independently, measures their wall-clock times,
