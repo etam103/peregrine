@@ -13,27 +13,28 @@ Model: 423M parameters (ViT-L encoder + ViT-B decoder), shared head.
 |----------------------|---------------|-------------|----------------|-------------|
 | Input resolution     | 224x224       | 224x224     | 512x384        | 512x384     |
 | Patches              | 196           | 196         | 768            | 768         |
-| **Inference time**   | **0.66s**     | **0.67s**   | **2.64s**      | **2.26s**   |
+| **Inference time**   | **0.66s**     | **0.67s**   | **1.97s**      | **2.26s**   |
 | **Weight loading**   | **0.6s**      | **1.6s**    | **0.6s**       | **1.6s**    |
 
 - **224**: Peregrine is **1.5% faster** (0.66s vs 0.67s)
+- **512**: Peregrine is **13% faster** (1.97s vs 2.26s)
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
 ### Detailed Breakdown
 
 | Component     | 224 CPU | 224 GPU | 224 Pipeline | 512 CPU | 512 GPU | 512 Pipeline |
 |--------------|--------:|--------:|-------------:|--------:|--------:|-------------:|
-| Encoder      | 459.5ms | 15.1ms  | 15.4ms       | 1794.4ms| 52.9ms  | 45.8ms       |
-| Decoder      | 187.0ms | 14.8ms  | 183.0ms      | 768.6ms | 35.0ms  | 462.9ms      |
-| Head+postproc| 3.2ms   | 180.6ms | 5.1ms        | 13.5ms  | 588.1ms | 12.6ms       |
-| **Total**    | **0.66s**| **0.53s**| **0.54s**   | **2.64s**| **1.55s**| **1.44s**   |
+| Encoder      | 459.5ms | 15.1ms  | 15.4ms       | 1331.0ms| 52.9ms  | 45.8ms       |
+| Decoder      | 187.0ms | 14.8ms  | 183.0ms      | 581.5ms | 35.0ms  | 462.9ms      |
+| Head+postproc| 3.2ms   | 180.6ms | 5.1ms        | 9.3ms   | 588.1ms | 12.6ms       |
+| **Total**    | **0.66s**| **0.53s**| **0.54s**   | **1.97s**| **1.55s**| **1.44s**   |
 
 ### Metal GPU Inference (v0.19.0+)
 
 | Resolution | CPU | GPU | GPU+Pipeline | Speedup (best vs CPU) |
 |-----------|----:|----:|-------------:|---------|
 | 224x224   | 0.66s | 0.53s | **0.54s** | **1.22x** |
-| 512x384   | 2.64s | 1.55s | **1.44s** | **1.83x** |
+| 512x384   | 1.97s | 1.55s | **1.44s** | **1.37x** |
 
 ### Server Mode & Parallel Workers (v0.15.0)
 

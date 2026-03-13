@@ -228,11 +228,11 @@ Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.93x*
 | Resolution | CPU | GPU | GPU+Pipeline | PyTorch CPU |
 |-----------|----:|----:|-------------:|------------:|
 | 224x224 | 0.66s | 0.53s | **0.54s** | 0.67s |
-| 512x384 | 2.64s | 1.55s | **1.44s** | 2.26s |
+| 512x384 | 1.97s | 1.55s | **1.44s** | 2.26s |
 | Weight load | **0.6s** | 0.6s | 0.6s | 1.6s |
 
 - **224**: Peregrine is **1.5% faster** on CPU (0.66s vs 0.67s), **22% faster** with GPU (0.53s)
-- **512**: **36% faster** with GPU+Pipeline (1.44s vs 2.26s PyTorch)
+- **512**: Peregrine is **13% faster** on CPU (1.97s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
 GPU mode (`--gpu`) keeps the entire attention pipeline on Metal — QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape all run as GPU kernels with no CPU round-trips. Pipeline mode (`--pipeline`) overlaps feat1 (GPU) and feat2 (CPU/AMX) decoder processing via `MTLSharedEvent` signaling — single-threaded, no `Send`/`Sync` needed.
