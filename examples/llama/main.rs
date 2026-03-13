@@ -7,6 +7,7 @@ mod wandb;
 use model::Llama;
 use tokenizer::Tokenizer;
 use peregrine::thermal::{thermal_init, thermal_state, ThermalState};
+use peregrine::sched::{Priority, Scheduler, SchedulerAction, SchedulerConfig};
 use std::env;
 use std::time::{Duration, Instant};
 
@@ -227,6 +228,16 @@ fn main() {
         .find(|w| w[0] == "--sustained")
         .and_then(|w| w[1].parse::<u64>().ok());
 
+    let chunked_prefill_size = args
+        .windows(2)
+        .find(|w| w[0] == "--chunked-prefill")
+        .and_then(|w| w[1].parse::<usize>().ok());
+
+    let multi_request_n = args
+        .windows(2)
+        .find(|w| w[0] == "--multi-request")
+        .and_then(|w| w[1].parse::<usize>().ok());
+
     let use_wandb = args.iter().any(|a| a == "--wandb");
 
     #[allow(unused_variables)]
@@ -245,6 +256,8 @@ fn main() {
                 || arg == "--temperature"
                 || arg == "--top-p"
                 || arg == "--sustained"
+                || arg == "--chunked-prefill"
+                || arg == "--multi-request"
             {
                 skip_next = true;
                 continue;
@@ -258,7 +271,7 @@ fn main() {
     };
 
     if positional.len() < 2 {
-        eprintln!("Usage: llama [--gpu] [--temperature T] [--top-p P] [--max-tokens N] [--sustained SECS] [--wandb] <model.gguf> <prompt>");
+        eprintln!("Usage: llama [--gpu] [--temperature T] [--top-p P] [--max-tokens N] [--sustained SECS] [--chunked-prefill SIZE] [--multi-request N] [--wandb] <model.gguf> <prompt>");
         std::process::exit(1);
     }
 
@@ -285,6 +298,149 @@ fn main() {
     tokens.extend(tok.encode(prompt_str));
     eprintln!("Prompt: \"{}\"", prompt_str);
     eprintln!("Tokens ({}): {:?}", tokens.len(), &tokens[..tokens.len().min(32)]);
+
+    // --- Multi-request scheduler mode ---
+    if let Some(n) = multi_request_n {
+        eprintln!("Multi-request mode: {} concurrent requests", n);
+        let chunk_size = chunked_prefill_size.unwrap_or(256);
+        let config = SchedulerConfig {
+            initial_chunk_size: chunk_size,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::new(config);
+        let vocab_size = model.config.vocab_size;
+
+        // Add N requests: first is High, rest are Background
+        for i in 0..n {
+            let prio = if i == 0 { Priority::High } else { Priority::Background };
+            let kv = model.init_kv_caches();
+            sched.add_request(tokens.clone(), kv, tok.eos_id, max_tokens, prio);
+        }
+
+        let t_start = Instant::now();
+        loop {
+            let action = sched.next_action();
+            match action {
+                SchedulerAction::AllDone | SchedulerAction::Idle => break,
+                SchedulerAction::Decode { id, token } => {
+                    let tok_slice = token.clone();
+                    let t0 = Instant::now();
+                    let caches = sched.caches_mut(id);
+                    let logits = model.forward(&tok_slice, caches);
+                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let logits_data = logits.data().to_vec();
+                    sched.complete_step(id, logits_data, vocab_size, elapsed_ms, |l, vs| {
+                        greedy_decode(l, vs)
+                    });
+                }
+                SchedulerAction::PrefillChunk { id, tokens: chunk } => {
+                    let chunk_clone = chunk.clone();
+                    let t0 = Instant::now();
+                    let caches = sched.caches_mut(id);
+                    let logits = model.forward(&chunk_clone, caches);
+                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let logits_data = logits.data().to_vec();
+                    sched.complete_step(id, logits_data, vocab_size, elapsed_ms, |l, vs| {
+                        greedy_decode(l, vs)
+                    });
+                }
+            }
+        }
+
+        let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        let stats = sched.stats();
+        eprintln!("\n--- Scheduler Stats ---");
+        eprintln!("  Decode steps:       {}", stats.total_decode_steps);
+        eprintln!("  Prefill chunks:     {}", stats.total_prefill_chunks);
+        eprintln!("  Decode EMA:         {:.2}ms", stats.decode_latency_ema_ms);
+        eprintln!("  Prefill chunk EMA:  {:.2}ms", stats.prefill_chunk_latency_ema_ms);
+        eprintln!("  Final chunk size:   {}", stats.current_chunk_size);
+        eprintln!("  Completed:          {}/{}", stats.total_completed, n);
+        eprintln!("  Total time:         {:.1}ms", total_ms);
+
+        // Print generated text for each request
+        for i in 0..n as u64 {
+            if let Some(req) = sched.request(i) {
+                let text = tok.decode(&req.generated_tokens);
+                eprintln!("  Request {} ({:?}): {} tokens", i, req.priority, req.generated_tokens.len());
+                if i == 0 {
+                    println!("{}", text);
+                }
+            }
+        }
+        return;
+    }
+
+    // --- Chunked-prefill mode ---
+    if let Some(chunk_size) = chunked_prefill_size {
+        eprintln!("Chunked-prefill mode: chunk_size={}", chunk_size);
+        let config = SchedulerConfig {
+            initial_chunk_size: chunk_size,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::new(config);
+        let vocab_size = model.config.vocab_size;
+        let kv = model.init_kv_caches();
+        let id = sched.add_request(tokens.clone(), kv, tok.eos_id, max_tokens, Priority::Normal);
+
+        let t_start = Instant::now();
+        let mut first_token_time = None;
+        loop {
+            let action = sched.next_action();
+            match action {
+                SchedulerAction::AllDone | SchedulerAction::Idle => break,
+                SchedulerAction::Decode { id, token } => {
+                    let tok_slice = token.clone();
+                    let t0 = Instant::now();
+                    let caches = sched.caches_mut(id);
+                    let logits = model.forward(&tok_slice, caches);
+                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let logits_data = logits.data().to_vec();
+                    if let Some(t) = sched.complete_step(id, logits_data, vocab_size, elapsed_ms, |l, vs| {
+                        greedy_decode(l, vs)
+                    }) {
+                        eprint!("{}", tok.decode(&[t]));
+                    }
+                }
+                SchedulerAction::PrefillChunk { id, tokens: chunk } => {
+                    let chunk_clone = chunk.clone();
+                    let t0 = Instant::now();
+                    let caches = sched.caches_mut(id);
+                    let logits = model.forward(&chunk_clone, caches);
+                    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    let logits_data = logits.data().to_vec();
+                    if let Some(t) = sched.complete_step(id, logits_data, vocab_size, elapsed_ms, |l, vs| {
+                        greedy_decode(l, vs)
+                    }) {
+                        if first_token_time.is_none() {
+                            first_token_time = Some(t_start.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        eprint!("{}", tok.decode(&[t]));
+                    }
+                }
+            }
+        }
+        eprintln!(); // newline after streaming
+
+        let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+        let stats = sched.stats();
+        eprintln!("\n--- Scheduler Stats ---");
+        if let Some(ttft) = first_token_time {
+            eprintln!("  TTFT:               {:.1}ms", ttft);
+        }
+        eprintln!("  Decode steps:       {}", stats.total_decode_steps);
+        eprintln!("  Prefill chunks:     {}", stats.total_prefill_chunks);
+        eprintln!("  Decode EMA:         {:.2}ms", stats.decode_latency_ema_ms);
+        eprintln!("  Prefill chunk EMA:  {:.2}ms", stats.prefill_chunk_latency_ema_ms);
+        eprintln!("  Final chunk size:   {}", stats.current_chunk_size);
+        eprintln!("  Completed:          {}", stats.total_completed);
+        eprintln!("  Total time:         {:.1}ms", total_ms);
+
+        if let Some(req) = sched.request(id) {
+            println!("{}", tok.decode(&req.generated_tokens));
+        }
+        return;
+    }
 
     // --- Sustained mode ---
     if let Some(duration_secs) = sustained_secs {

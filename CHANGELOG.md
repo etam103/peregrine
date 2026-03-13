@@ -7,6 +7,35 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.28.0] - 2026-03-13
+
+### Added — Managed prefill/decode aggregation with priority scheduling
+
+Request scheduler for interleaved chunked prefill and decode across multiple concurrent requests. The scheduler does not own the model — it returns `SchedulerAction` values telling the caller what to forward, making it reusable across llama, grok1, deepseek, and gpt_oss examples.
+
+**New module** (`src/sched.rs`)
+- `Priority` enum (Background/Normal/High) with derived ordering
+- `RequestState` enum (Queued/Prefilling{chunk_offset}/Decoding/Done)
+- `Request` struct: id, priority, state, prompt tokens, generated tokens, KV caches, EOS id, max tokens, pending logits
+- `ChunkedPrefiller`: standalone chunked prefill — `next_chunk()` returns the next token slice, `step()` advances state
+- `SchedulerConfig`: target_decode_ms (40.0), initial/min/max chunk size (256/32/1024), ema_alpha (0.3)
+- `SchedulerStats`: EMA latency tracking for decode and prefill, current chunk size, totals
+- `SchedulerAction` enum: Decode, PrefillChunk, AllDone, Idle
+- `Scheduler`: `add_request()`, `next_action()`, `complete_step()`, `caches_mut()`, `request()`, `stats()`
+- Priority policy: high-priority decodes first, then normal decodes, then highest-priority prefill chunk, then background decodes
+- Dynamic chunk-size tuning: EMA latency tracking, shrink at 90% target, grow at 50% target (dead band prevents oscillation)
+- 7 unit tests: lifecycle, priority ordering, EOS termination, max-tokens termination, chunk-size tuning, AllDone vs Idle, prefill-before-background
+
+**Extended modules**
+- `src/lib.rs` — `pub mod sched`
+- `examples/llama/main.rs` — two new CLI flags:
+  - `--chunked-prefill SIZE`: single request with chunked prefill in SIZE-token chunks, streams output, prints TTFT + scheduler stats (decode EMA, prefill chunk EMA, final chunk size)
+  - `--multi-request N`: N concurrent requests (first=High priority, rest=Background), scheduler loop calling model.forward(), prints per-request stats and generated text
+
+Chunked prefill works transparently with existing KV caches — RoPE offset is read from `kv_cache.len`, so each chunk appends correctly without any changes to the attention module.
+
+---
+
 ## [0.22.0] - 2026-03-12
 
 ### Added — Heterogeneous GPU + CPU scheduling (two-view decoder overlap)

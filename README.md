@@ -52,8 +52,9 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, 4.5% faster than PyTorch at 224 (0.64s vs 0.67s), 14% faster at 512 (1.95s vs 2.26s). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
 | **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
 | **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
+| **`peregrine::sched`** | Request scheduler for managed prefill/decode aggregation — `Priority` (Background/Normal/High), `ChunkedPrefiller`, dynamic chunk-size tuning with EMA latency tracking, `SchedulerAction`-based model-agnostic API. Supports multiple concurrent requests with priority-based interleaving |
 | **`peregrine::thermal`** | Thermal monitoring via Darwin notifications — `ThermalState` (Nominal/Moderate/Heavy/Trapping/Sleeping), rate-limited polling (100ms cache), thread-local singleton. Used by `het_execute_thermal` for thermal-aware GPU/CPU scheduling |
-| **`examples/llama`** | Llama 3.2 inference from GGUF — loads quantized GGUF models directly (Q8_0, Q4_0, Q4_1), 16-layer 1B config (2048 dim, GQA 32/8 heads, SwiGLU), RoPE (theta=500000), BPE tokenizer from GGUF metadata, greedy/temperature/top-p sampling, streaming decode with tok/s stats. `--sustained SECS` for sustained throughput profiling (p50/p95/p99 latency, thermal distribution), `--wandb` for W&B logging |
+| **`examples/llama`** | Llama 3.2 inference from GGUF — loads quantized GGUF models directly (Q8_0, Q4_0, Q4_1), 16-layer 1B config (2048 dim, GQA 32/8 heads, SwiGLU), RoPE (theta=500000), BPE tokenizer from GGUF metadata, greedy/temperature/top-p sampling, streaming decode with tok/s stats. `--sustained SECS` for sustained throughput profiling (p50/p95/p99 latency, thermal distribution), `--chunked-prefill SIZE` for chunked prefill via scheduler, `--multi-request N` for N concurrent priority-scheduled requests, `--wandb` for W&B logging |
 | **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
 | **`examples/moba`** | MOBA 3v3 with LSTM-based PPO and self-play — single-lane map (32x16), heroes, towers, creeps, bases. Train, selfplay, watch (HTML replay), video (MP4 export via FFmpeg) |
 
@@ -291,6 +292,7 @@ src/
   serial.rs       model weight save/load (binary format, f32 + int8 + 2:4 sparse)
   attention.rs    core GQA attention — StandardKVCache, gqa_attention_cpu, AttentionMask, PostScoreTransform
   speculative.rs  speculative decoding — CausalLM trait, draft-propose/target-verify with stochastic acceptance
+  sched.rs        request scheduler — priority-based prefill/decode aggregation, chunked prefill, dynamic chunk-size tuning, EMA latency tracking
   thermal.rs      thermal monitoring via Darwin notifications — ThermalState, rate-limited polling, thread-local singleton
   rl.rs           RL algorithms — PPO, DQN, REINFORCE, replay/rollout buffers, Environment trait (~1,750 lines)
   envs.rs         10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe (~2,150 lines)
@@ -329,7 +331,7 @@ examples/
     moe.rs          MoE — sigmoid gate, group-limited top-k, shared experts
     tokenizer.rs    HuggingFace tokenizer.json BPE parser (pure Rust)
   llama/          Llama 3.2 inference from GGUF
-    main.rs         CLI, greedy/temperature/top-p sampling, streaming decode, sustained profiling
+    main.rs         CLI, greedy/temperature/top-p sampling, streaming decode, sustained profiling, chunked prefill, multi-request scheduling
     wandb.rs        W&B logging for sustained profiling metrics
     model.rs        LlamaConfig (from GGUF metadata), weight loading with transpose
     decoder.rs      LlamaBlock — pre-norm GQA attention + SwiGLU FFN
