@@ -303,6 +303,135 @@ pub fn read_sparse_tensor_24(
     }))
 }
 
+/// Write a Huffman-compressed tensor to a binary stream.
+/// Format: [name][dtype=3u8][ndim=2: u32][rows: u32][cols: u32]
+///         [codebook: 256 bytes][num_streams: u32]
+///         [stream_lengths: u32 * num_streams][stream_sizes: u32 * num_streams]
+///         [bitstreams...][f32 scales (cols)]
+pub fn write_huffman_tensor(
+    file: &mut impl Write,
+    name: &str,
+    ht: &crate::huffman::HuffmanTensor,
+) -> std::io::Result<()> {
+    // Name
+    let name_bytes = name.as_bytes();
+    file.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+    file.write_all(name_bytes)?;
+
+    // Dtype tag: 3 = Huffman compressed
+    file.write_all(&[3u8])?;
+
+    // Shape [rows, cols]
+    file.write_all(&(2u32).to_le_bytes())?;
+    file.write_all(&(ht.rows as u32).to_le_bytes())?;
+    file.write_all(&(ht.cols as u32).to_le_bytes())?;
+
+    // Codebook (256 bytes of bit_lengths)
+    file.write_all(&ht.table.to_bytes())?;
+
+    // Number of streams
+    file.write_all(&(ht.num_streams as u32).to_le_bytes())?;
+
+    // Stream lengths (number of symbols per stream)
+    for &len in &ht.stream_lengths {
+        file.write_all(&(len as u32).to_le_bytes())?;
+    }
+
+    // Stream byte sizes then stream data
+    for stream in &ht.streams {
+        file.write_all(&(stream.len() as u32).to_le_bytes())?;
+    }
+    for stream in &ht.streams {
+        file.write_all(stream)?;
+    }
+
+    // f32 scales (one per column)
+    let scale_bytes = unsafe {
+        std::slice::from_raw_parts(ht.scales.as_ptr() as *const u8, ht.scales.len() * 4)
+    };
+    file.write_all(scale_bytes)?;
+
+    Ok(())
+}
+
+/// Read a Huffman-compressed tensor from a binary stream.
+pub fn read_huffman_tensor(
+    file: &mut impl Read,
+) -> std::io::Result<(String, crate::huffman::HuffmanTensor)> {
+    let mut buf4 = [0u8; 4];
+
+    // Name
+    file.read_exact(&mut buf4)?;
+    let name_len = u32::from_le_bytes(buf4) as usize;
+    let mut name_bytes = vec![0u8; name_len];
+    file.read_exact(&mut name_bytes)?;
+    let name = String::from_utf8(name_bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Dtype tag
+    let mut dtype_byte = [0u8; 1];
+    file.read_exact(&mut dtype_byte)?;
+    assert_eq!(dtype_byte[0], 3, "expected dtype=3 (Huffman) for huffman tensor");
+
+    // Shape
+    file.read_exact(&mut buf4)?;
+    let ndim = u32::from_le_bytes(buf4) as usize;
+    assert_eq!(ndim, 2, "huffman tensors must be 2D");
+    file.read_exact(&mut buf4)?;
+    let rows = u32::from_le_bytes(buf4) as usize;
+    file.read_exact(&mut buf4)?;
+    let cols = u32::from_le_bytes(buf4) as usize;
+
+    // Codebook
+    let mut codebook_bytes = vec![0u8; 256];
+    file.read_exact(&mut codebook_bytes)?;
+    let table = crate::huffman::HuffmanTable::from_bytes(&codebook_bytes);
+
+    // Number of streams
+    file.read_exact(&mut buf4)?;
+    let num_streams = u32::from_le_bytes(buf4) as usize;
+
+    // Stream lengths
+    let mut stream_lengths = Vec::with_capacity(num_streams);
+    for _ in 0..num_streams {
+        file.read_exact(&mut buf4)?;
+        stream_lengths.push(u32::from_le_bytes(buf4) as usize);
+    }
+
+    // Stream byte sizes
+    let mut stream_sizes = Vec::with_capacity(num_streams);
+    for _ in 0..num_streams {
+        file.read_exact(&mut buf4)?;
+        stream_sizes.push(u32::from_le_bytes(buf4) as usize);
+    }
+
+    // Stream data
+    let mut streams = Vec::with_capacity(num_streams);
+    for &size in &stream_sizes {
+        let mut stream_data = vec![0u8; size];
+        file.read_exact(&mut stream_data)?;
+        streams.push(stream_data);
+    }
+
+    // f32 scales
+    let mut scale_bytes = vec![0u8; cols * 4];
+    file.read_exact(&mut scale_bytes)?;
+    let scales: Vec<f32> = scale_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    Ok((name, crate::huffman::HuffmanTensor {
+        table,
+        streams,
+        stream_lengths,
+        scales,
+        rows,
+        cols,
+        num_streams,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

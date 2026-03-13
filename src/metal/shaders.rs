@@ -2647,4 +2647,56 @@ kernel void matmul_sparse_simd_24(
         }
     }
 }
+// ---------------------------------------------------------------------------
+// Huffman decode: LUT-based bitstream → i8
+// ---------------------------------------------------------------------------
+
+struct HuffmanDecodeParams {
+    uint num_symbols;
+    uint bitstream_len;
+};
+
+/// LUT-based Huffman decode kernel.
+/// Each LUT entry is a packed u32: lower 8 bits = symbol (u8, offset by 128),
+/// bits 8..15 = bit_length. LUT is indexed by the next MAX_LUT_BITS bits of input.
+///
+/// Because bitstream decoding is inherently sequential (variable-length codes),
+/// this kernel processes symbols serially per thread. For parallel decode,
+/// split the bitstream into independent streams on the CPU side and dispatch
+/// one threadgroup per stream.
+kernel void huffman_decode_i8(
+    device const uchar* bitstream     [[buffer(0)]],
+    device const uint*  lut           [[buffer(1)]],
+    device char*        out_i8        [[buffer(2)]],
+    constant HuffmanDecodeParams& p   [[buffer(3)]],
+    uint tid [[thread_position_in_grid]])
+{
+    // Serial decode: thread 0 decodes all symbols.
+    // For multi-stream decode, the host splits streams and dispatches separately.
+    if (tid != 0) return;
+
+    uint bit_pos = 0;
+    uint total_bits = p.bitstream_len * 8;
+
+    for (uint s = 0; s < p.num_symbols; s++) {
+        // Read 12 bits for LUT lookup
+        uint code = 0;
+        uint bits_avail = min(12u, total_bits - bit_pos);
+        for (uint b = 0; b < bits_avail; b++) {
+            uint byte_idx = (bit_pos + b) / 8;
+            uint bit_idx = 7 - ((bit_pos + b) % 8);
+            code = (code << 1) | ((bitstream[byte_idx] >> bit_idx) & 1);
+        }
+        if (bits_avail < 12) {
+            code <<= (12 - bits_avail);
+        }
+
+        uint entry = lut[code];
+        uchar sym_u8 = entry & 0xFF;
+        uint bl = (entry >> 8) & 0xFF;
+
+        out_i8[s] = char(int(sym_u8) - 128);
+        bit_pos += bl;
+    }
+}
 "#;

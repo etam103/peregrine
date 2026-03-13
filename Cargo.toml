@@ -89,3 +89,7 @@ required-features = ["comm"]
 [[example]]
 name = "sparse_bench"
 path = "examples/sparse_bench.rs"
+
+[[example]]
+name = "huffman_bench"
+path = "examples/huffman_bench.rs"

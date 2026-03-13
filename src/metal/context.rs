@@ -116,6 +116,8 @@ impl GpuContext {
             "causal_mask_softmax_f32",
             // 2:4 structured sparse matmul
             "matmul_sparse_24", "matmul_sparse_simd_24",
+            // Huffman decode
+            "huffman_decode_i8",
         ];
 
         let mut pipelines = HashMap::new();
@@ -2295,6 +2297,75 @@ impl GpuContext {
             enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threadgroup_size);
             enc.endEncoding();
         }
+    }
+
+    /// Dispatch Huffman decode: bitstream → i8 staging buffer.
+    pub fn dispatch_huffman_decode(
+        &self,
+        bitstream: &GpuBuffer<u8>,
+        lut: &GpuBuffer<u32>,
+        out_i8: &GpuBuffer<i8>,
+        num_symbols: u32,
+        bitstream_len: u32,
+    ) {
+        #[repr(C)]
+        struct HuffmanDecodeParams {
+            num_symbols: u32,
+            bitstream_len: u32,
+        }
+
+        let params = HuffmanDecodeParams {
+            num_symbols,
+            bitstream_len,
+        };
+
+        let pipeline = &self.pipelines["huffman_decode_i8"];
+        let cmd_ref = self.ensure_cmd();
+        let cmd = cmd_ref.as_ref().unwrap();
+        let enc = cmd.computeCommandEncoder().expect("encoder");
+
+        enc.setComputePipelineState(pipeline);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(bitstream.raw()), 0, 0);
+            enc.setBuffer_offset_atIndex(Some(lut.raw()), 0, 1);
+            enc.setBuffer_offset_atIndex(Some(out_i8.raw()), 0, 2);
+            enc.setBytes_length_atIndex(
+                std::ptr::NonNull::new(&params as *const _ as *mut _).unwrap(),
+                std::mem::size_of::<HuffmanDecodeParams>(),
+                3,
+            );
+        }
+
+        // Single thread does serial decode (variable-length codes)
+        let threadgroup_size = MTLSize { width: 1, height: 1, depth: 1 };
+        let grid = MTLSize { width: 1, height: 1, depth: 1 };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup_size);
+        enc.endEncoding();
+    }
+
+    /// Two-pass dispatch: Huffman decode → dequant matmul.
+    ///
+    /// 1. Decode Huffman bitstream to i8 staging buffer on GPU
+    /// 2. Feed staging buffer to existing `dispatch_matmul_dequant_i8`
+    pub fn dispatch_matmul_huffman(
+        &self,
+        bitstream: &GpuBuffer<u8>,
+        lut: &GpuBuffer<u32>,
+        scales: &GpuBuffer<f32>,
+        a: &GpuBuffer<f32>,
+        out: &GpuBuffer<f32>,
+        m: u32,
+        n: u32,
+        k: u32,
+        num_symbols: u32,
+        bitstream_len: u32,
+    ) {
+        // Step 1: decode huffman → i8 staging
+        let staging: GpuBuffer<i8> = self.alloc(num_symbols as usize);
+        self.dispatch_huffman_decode(bitstream, lut, &staging, num_symbols, bitstream_len);
+
+        // Step 2: dequant matmul using decoded i8
+        self.dispatch_matmul_dequant_i8(a, &staging, scales, out, m, n, k);
     }
 
     /// Dispatch 2:4 structured sparse matmul: C[M,N] = A_f32[M,K] @ W_sparse_24[K,N].

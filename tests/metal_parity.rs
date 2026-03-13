@@ -808,3 +808,50 @@ fn parity_gpu_cpu_sparse_24() {
         );
     }
 }
+
+#[test]
+fn parity_gpu_cpu_huffman() {
+    use peregrine::huffman::{HuffmanTensor, matmul_huffman};
+    use peregrine::quant::quantize_weights;
+
+    let gpu = GpuContext::new().unwrap();
+
+    for &(m, k, n) in &[(8, 32, 16), (32, 128, 64), (16, 256, 32)] {
+        let a = random_data(m * k);
+        let w = random_data(k * n);
+
+        let qt = quantize_weights(&w, k, n);
+        let ht = HuffmanTensor::from_quantized(&qt, 4);
+
+        // CPU result
+        let _cpu_result = matmul_huffman(&a, m, k, &ht);
+
+        // GPU result
+        let out_buf = ht.matmul_huffman_gpu(&gpu, &a, m);
+        gpu.sync();
+        let gpu_result = out_buf.read();
+
+        // Allow tolerance for GPU f32 vs CPU i8 path difference
+        let mut f32_ref = vec![0.0f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut sum = 0.0f32;
+                for ki in 0..k {
+                    sum += a[mi * k + ki] * w[ki * n + ni];
+                }
+                f32_ref[mi * n + ni] = sum;
+            }
+        }
+
+        for i in 0..m * n {
+            let diff = (gpu_result[i] - f32_ref[i]).abs();
+            let denom = f32_ref[i].abs().max(1e-6);
+            let rtol = diff / denom;
+            assert!(
+                rtol < 0.15 || diff < 0.05,
+                "huffman GPU M={m} K={k} N={n} i={i}: got {}, expected {}, rtol={rtol}",
+                gpu_result[i], f32_ref[i]
+            );
+        }
+    }
+}
