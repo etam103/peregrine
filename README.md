@@ -45,12 +45,14 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
 | **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
 | **`peregrine::envs`** | 10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe |
+| **`peregrine::gguf`** | GGUF binary format parser — load quantized model weights (Q8_0, Q4_0, Q4_1, F16, F32), metadata extraction, dequantization |
 | **`peregrine::metal`** | Metal GPU backend — 108 compute shaders, 41 dispatch methods, fused op pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
 | **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch speed (0.67s at 224, 13% faster at 512). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
 | **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
 | **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
+| **`examples/llama`** | Llama 3.2 inference from GGUF — loads quantized GGUF models directly (Q8_0, Q4_0, Q4_1), 16-layer 1B config (2048 dim, GQA 32/8 heads, SwiGLU), RoPE (theta=500000), BPE tokenizer from GGUF metadata, greedy/temperature/top-p sampling, streaming decode with tok/s stats |
 | **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
 | **`examples/moba`** | MOBA 3v3 with LSTM-based PPO and self-play — single-lane map (32x16), heroes, towers, creeps, bases. Train, selfplay, watch (HTML replay), video (MP4 export via FFmpeg) |
 
@@ -202,35 +204,35 @@ Input Image [1, 3, 256, 256]
 
 CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compute shaders (`--features metal`). Wall-clock benchmarks run via `./scripts/bench_compare.sh`.
 
-### Peregrine vs ML Frameworks (173 ops, CPU, wall-clock, all times in microseconds)
+### Peregrine vs ML Frameworks (141 ops, CPU, wall-clock, all times in microseconds)
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | 6.7 | **6.2** | 28.4 | 69.1 | 457.9 | 71.4 |
-| matmul 512x512 | 216.8 | **142.0** | 221.2 | 724.8 | 462.0 | 621.9 |
-| add 100k | **13.5** | 41.0 | 32.4 | 46.1 | 195.2 | 45.0 |
-| mul 100k | **13.6** | 39.5 | 33.0 | 43.6 | 205.2 | 47.4 |
-| relu 100k | **9.2** | 39.2 | 27.0 | 41.2 | 375.3 | 109.0 |
-| softmax 8x128 | **1.3** | 33.2 | 19.0 | 10.4 | 795.8 | 33.3 |
-| gelu 100k | **66.2** | 77.7 | 148.3 | 331.8 | 903.6 | 248.9 |
-| rfft 1k | **2.1** | 4.7 | 20.6 | 41.2 | — | 51.1 |
-| cross_entropy | **2.8** | 44.3 | 24.0 | 627.2 | 3812.0 | 66.7 |
-| train step 64 | 874.0 | 1316.3 | **869.1** | 8918.2 | 27402.5 | 5820.6 |
-| matmul+bias+gelu 196x768x3072 | 1680.2 | **1089.0** | — | 3659.8 | 1481.7 | 2375.9 |
-| add+layernorm 196x768 | **117.6** | 140.8 | — | 1315.4 | 1182.5 | 217.9 |
+| matmul 128x128 | 7.1 | **6.2** | 28.4 | 50.2 | 424.1 | 81.4 |
+| matmul 512x512 | 193.0 | **134.0** | 221.2 | 695.1 | 460.4 | 504.6 |
+| add 100k | **12.8** | 40.1 | 32.4 | 49.6 | 203.6 | 39.4 |
+| mul 100k | **12.4** | 40.7 | 33.0 | 43.5 | 185.7 | 30.0 |
+| relu 100k | **8.8** | 40.2 | 27.0 | 38.5 | 345.4 | 99.2 |
+| softmax 8x128 | **1.2** | 30.1 | 19.0 | 11.4 | 617.8 | 32.8 |
+| gelu 100k | 77.9 | **75.2** | 148.3 | 247.3 | 885.2 | 271.6 |
+| rfft 1k | **2.2** | 4.4 | 20.6 | 43.5 | — | 42.8 |
+| cross_entropy | **2.6** | 39.8 | 24.0 | 626.0 | 3431.6 | 60.9 |
+| train step 64 | **817.6** | 1276.8 | 869.1 | 8796.6 | 24610.8 | 5544.6 |
+| matmul+bias+gelu 196x768x3072 | 1209.0 | **934.7** | — | 2440.2 | 1259.2 | 2142.1 |
+| add+layernorm 196x768 | **108.5** | 110.3 | — | 1258.4 | 1143.5 | 231.7 |
 
-Geometric mean ratio across 173 ops (lower = Peregrine faster): **PyTorch 0.99x**, **MLX 0.75x**, TensorFlow 0.54x, tinygrad 0.10x, JAX 0.60x. Peregrine wins 96 of 173 ops.
+Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.93x**, **MLX 0.67x**, TensorFlow 0.52x, tinygrad 0.10x, JAX 0.60x. Peregrine wins 64 of 141 ops.
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
 | Resolution | CPU | GPU | GPU+Pipeline | PyTorch CPU |
 |-----------|----:|----:|-------------:|------------:|
-| 224x224 | 0.65s | 0.53s | **0.54s** | 0.67s |
-| 512x384 | 1.89s | 1.55s | **1.44s** | 2.26s |
+| 224x224 | 0.66s | 0.53s | **0.54s** | 0.67s |
+| 512x384 | 2.64s | 1.55s | **1.44s** | 2.26s |
 | Weight load | **0.6s** | 0.6s | 0.6s | 1.6s |
 
-- **224**: Peregrine is **3% faster** on CPU (0.65s vs 0.67s), **23% faster** with GPU (0.53s)
-- **512**: Peregrine is **16% faster** on CPU (1.89s vs 2.26s), **31% faster** with GPU+Pipeline (1.44s)
+- **224**: Peregrine is **1.5% faster** on CPU (0.66s vs 0.67s), **22% faster** with GPU (0.53s)
+- **512**: **36% faster** with GPU+Pipeline (1.44s vs 2.26s PyTorch)
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
 GPU mode (`--gpu`) keeps the entire attention pipeline on Metal — QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape all run as GPU kernels with no CPU round-trips. Pipeline mode (`--pipeline`) overlaps feat1 (GPU) and feat2 (CPU/AMX) decoder processing via `MTLSharedEvent` signaling — single-threaded, no `Send`/`Sync` needed.
@@ -284,6 +286,7 @@ src/
   debug.rs        model summary + training health diagnostics
   quant.rs        int8 quantized inference — per-column weight quantization, per-row activation quantization, NEON i8 GEMM, Metal dequant matmul
   sparse.rs       2:4 structured sparsity — prune/densify, nibble-packed indices, NEON sparse GEMM, Metal sparse matmul
+  gguf.rs         GGUF binary format parser — Q8_0/Q4_0/Q4_1/F16/F32 dequantization, metadata extraction
   serial.rs       model weight save/load (binary format, f32 + int8 + 2:4 sparse)
   attention.rs    core GQA attention — StandardKVCache, gqa_attention_cpu, AttentionMask, PostScoreTransform
   speculative.rs  speculative decoding — CausalLM trait, draft-propose/target-verify with stochastic acceptance
@@ -323,6 +326,12 @@ examples/
     attention.rs    MLA — Multi-head Latent Attention, compressed KV cache, YaRN RoPE
     moe.rs          MoE — sigmoid gate, group-limited top-k, shared experts
     tokenizer.rs    HuggingFace tokenizer.json BPE parser (pure Rust)
+  llama/          Llama 3.2 inference from GGUF
+    main.rs         CLI, greedy/temperature/top-p sampling, streaming decode
+    model.rs        LlamaConfig (from GGUF metadata), weight loading with transpose
+    decoder.rs      LlamaBlock — pre-norm GQA attention + SwiGLU FFN
+    attention.rs    GQA with RoPE (theta=500000), causal masking, KV cache
+    tokenizer.rs    BPE tokenizer from GGUF embedded vocabulary
   rl_demo/        RL training demos with HTML animations
     main.rs         PPO CartPole, DQN GridWorld, REINFORCE Arithmetic
   moba/           MOBA 3v3 with LSTM PPO and self-play
@@ -346,6 +355,7 @@ tests/
   metal_autograd.rs   17 GPU autograd integration tests
   quant_parity.rs     4 int8 quantization tests (roundtrip, matmul parity, Metal parity, serialization)
   sparse_parity.rs    4 structured sparsity tests (CPU parity, GPU parity, K%4 assertion, serialization roundtrip)
+  gguf_parity.rs      5 GGUF parser tests (Q8_0/Q4_0/Q4_1 dequant, invalid magic, minimal valid parse)
   generate_reference.py  script to regenerate PyTorch reference data
   fixtures/             binary reference tensors
 ```
