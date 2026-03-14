@@ -855,11 +855,65 @@ impl LSTM {
         let seq_len = shape[0];
         assert_eq!(shape[1], self.input_size);
 
-        let mut h = h0.clone();
-        let mut c = c0.clone();
         let hs = self.hidden_size;
 
-        // Pre-compute index ranges for gate splitting
+        // Fast inference path: no autograd, direct data manipulation
+        if !x.requires_grad() && !self.weight_ih.requires_grad() {
+            use crate::cpu_pool::pool_get;
+            let x_data = x.data();
+            let wih = self.weight_ih.data();
+            let whh = self.weight_hh.data();
+            let bih = self.bias_ih.data();
+            let bhh = self.bias_hh.data();
+            let mut h_data = h0.data();
+            let mut c_data = c0.data();
+            let is = self.input_size;
+            let mut output_data = pool_get(seq_len * hs);
+            let mut gates = vec![0.0f32; 4 * hs];
+
+            for t in 0..seq_len {
+                let x_t = &x_data[t * is..(t + 1) * is];
+                // gates = x_t @ W_ih + b_ih + h @ W_hh + b_hh
+                #[cfg(target_os = "macos")]
+                {
+                    // x_t[1,is] @ W_ih[is,4hs] → gates[1,4hs]
+                    crate::tensor::sgemm(false, false, 1, 4*hs, is, 1.0, x_t, is, &wih, 4*hs, 0.0, &mut gates, 4*hs);
+                    // + h[1,hs] @ W_hh[hs,4hs]
+                    let mut hh_gates = vec![0.0f32; 4 * hs];
+                    crate::tensor::sgemm(false, false, 1, 4*hs, hs, 1.0, &h_data, hs, &whh, 4*hs, 0.0, &mut hh_gates, 4*hs);
+                    for j in 0..4*hs {
+                        gates[j] += bih[j] + bhh[j] + hh_gates[j];
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    for j in 0..4*hs {
+                        let mut v = bih[j] + bhh[j];
+                        for p in 0..is { v += x_t[p] * wih[p * 4 * hs + j]; }
+                        for p in 0..hs { v += h_data[p] * whh[p * 4 * hs + j]; }
+                        gates[j] = v;
+                    }
+                }
+                // Apply activations and update c, h
+                for j in 0..hs {
+                    let ig = 1.0 / (1.0 + (-gates[j]).exp());           // sigmoid(i)
+                    let fg = 1.0 / (1.0 + (-gates[hs + j]).exp());      // sigmoid(f)
+                    let gg = gates[2*hs + j].tanh();                     // tanh(g)
+                    let og = 1.0 / (1.0 + (-gates[3*hs + j]).exp());    // sigmoid(o)
+                    c_data[j] = fg * c_data[j] + ig * gg;
+                    h_data[j] = og * c_data[j].tanh();
+                }
+                output_data[t * hs..(t + 1) * hs].copy_from_slice(&h_data[..hs]);
+            }
+            let output = Tensor::new(output_data, vec![seq_len, hs], false);
+            let h_out = Tensor::new(h_data, vec![1, hs], false);
+            let c_out = Tensor::new(c_data, vec![1, hs], false);
+            return (output, h_out, c_out);
+        }
+
+        let mut h = h0.clone();
+        let mut c = c0.clone();
+
         let i_indices: Vec<usize> = (0..hs).collect();
         let f_indices: Vec<usize> = (hs..2 * hs).collect();
         let g_indices: Vec<usize> = (2 * hs..3 * hs).collect();
@@ -868,30 +922,23 @@ impl LSTM {
         let mut h_steps: Vec<Tensor> = Vec::with_capacity(seq_len);
 
         for t in 0..seq_len {
-            // Extract x_t preserving autograd into input
-            let x_t = x.index_select(0, &[t]); // [1, input_size]
-
-            // gates = x_t @ W_ih + b_ih + h @ W_hh + b_hh  [1, 4*hidden_size]
+            let x_t = x.index_select(0, &[t]);
             let gates = x_t
                 .matmul(&self.weight_ih)
                 .add_bias(&self.bias_ih)
                 .add(&h.matmul(&self.weight_hh).add_bias(&self.bias_hh));
 
-            // Split into i, f, g, o gates preserving autograd
             let i_gate = gates.index_select(1, &i_indices).sigmoid();
             let f_gate = gates.index_select(1, &f_indices).sigmoid();
             let g_gate = gates.index_select(1, &g_indices).tanh();
             let o_gate = gates.index_select(1, &o_indices).sigmoid();
 
-            // c = f * c + i * g
             c = f_gate.mul(&c).add(&i_gate.mul(&g_gate));
-            // h = o * tanh(c)
             h = o_gate.mul(&c.tanh());
 
             h_steps.push(h.clone());
         }
 
-        // Stack all hidden states preserving autograd
         let output = Tensor::stack(&h_steps, 0).reshape(vec![seq_len, hs]);
         (output, h, c)
     }
@@ -935,10 +982,53 @@ impl GRU {
         let seq_len = shape[0];
         assert_eq!(shape[1], self.input_size);
 
+        let hs = self.hidden_size;
+        let is = self.input_size;
+
+        // Fused inference path: direct sgemm + scalar gate computation
+        if !x.requires_grad() && !self.weight_ih.requires_grad() {
+            use crate::cpu_pool::pool_get;
+            let x_data = x.data();
+            let wih = self.weight_ih.data();
+            let whh = self.weight_hh.data();
+            let bih = self.bias_ih.data();
+            let bhh = self.bias_hh.data();
+            let mut h_data = h0.data();
+            let mut output_data = pool_get(seq_len * hs);
+            let mut ih_buf = vec![0.0f32; 3 * hs];
+            let mut hh_buf = vec![0.0f32; 3 * hs];
+
+            for t in 0..seq_len {
+                let x_t = &x_data[t * is..(t + 1) * is];
+                #[cfg(target_os = "macos")]
+                {
+                    crate::tensor::sgemm(false, false, 1, 3*hs, is, 1.0, x_t, is, &wih, 3*hs, 0.0, &mut ih_buf, 3*hs);
+                    crate::tensor::sgemm(false, false, 1, 3*hs, hs, 1.0, &h_data, hs, &whh, 3*hs, 0.0, &mut hh_buf, 3*hs);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    for j in 0..3*hs {
+                        ih_buf[j] = bih[j]; hh_buf[j] = bhh[j];
+                        for p in 0..is { ih_buf[j] += x_t[p] * wih[p * 3 * hs + j]; }
+                        for p in 0..hs { hh_buf[j] += h_data[p] * whh[p * 3 * hs + j]; }
+                    }
+                }
+                for j in 0..hs {
+                    let r = 1.0 / (1.0 + (-(ih_buf[j] + bih[j] + hh_buf[j] + bhh[j])).exp());
+                    let z = 1.0 / (1.0 + (-(ih_buf[hs+j] + bih[hs+j] + hh_buf[hs+j] + bhh[hs+j])).exp());
+                    let n = (ih_buf[2*hs+j] + bih[2*hs+j] + r * (hh_buf[2*hs+j] + bhh[2*hs+j])).tanh();
+                    h_data[j] = (1.0 - z) * n + z * h_data[j];
+                }
+                output_data[t * hs..(t + 1) * hs].copy_from_slice(&h_data[..hs]);
+            }
+            let output = Tensor::new(output_data, vec![seq_len, hs], false);
+            let h_out = Tensor::new(h_data, vec![1, hs], false);
+            return (output, h_out);
+        }
+
         let x_data = x.data();
         let mut h = h0.clone();
-        let mut outputs = Vec::with_capacity(seq_len * self.hidden_size);
-        let hs = self.hidden_size;
+        let mut outputs = Vec::with_capacity(seq_len * hs);
 
         for t in 0..seq_len {
             let start = t * self.input_size;
