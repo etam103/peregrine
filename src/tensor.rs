@@ -3859,26 +3859,9 @@ impl Tensor {
         {
             let mut data = pool_get(len);
             #[cfg(target_arch = "aarch64")]
-            if len >= 200_000 {
-                // Parallel NEON: split into rayon chunks, each using NEON
-                use rayon::prelude::*;
-                let chunk_size = (len / rayon::current_num_threads()).max(1024);
-                inner.data.par_chunks(chunk_size)
-                    .zip(data.par_chunks_mut(chunk_size))
-                    .for_each(|(src, dst)| {
-                        simd_kernels::vec_exp_f32(src, dst);
-                    });
-            } else {
-                #[cfg(target_arch = "aarch64")]
-                simd_kernels::vec_exp_f32(&inner.data, &mut data);
-            }
+            simd_kernels::vec_exp_f32(&inner.data, &mut data);
             #[cfg(not(target_arch = "aarch64"))]
-            if len >= PAR_THRESHOLD_CHEAP {
-                let par_data: Vec<f32> = inner.data.par_iter().map(|&x| x.exp()).collect();
-                data = par_data;
-            } else {
-                for i in 0..len { data[i] = inner.data[i].exp(); }
-            }
+            for i in 0..len { data[i] = inner.data[i].exp(); }
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         }
     }
