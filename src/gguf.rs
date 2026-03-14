@@ -351,7 +351,7 @@ pub fn dequant_q4_1(data: &[u8], num_elements: usize) -> Vec<f32> {
 }
 
 /// Convert IEEE 754 half-precision (f16) to f32.
-fn f16_to_f32(bits: u16) -> f32 {
+pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1F) as u32;
     let mant = (bits & 0x3FF) as u32;

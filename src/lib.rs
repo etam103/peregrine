@@ -10,6 +10,10 @@ pub mod quant;
 pub mod sparse;
 pub mod huffman;
 pub mod gguf;
+pub mod safetensors;
+pub mod hf_config;
+#[cfg(feature = "hf")]
+pub mod hf_hub;
 pub mod random;
 pub mod init;
 pub mod fft;

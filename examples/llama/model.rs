@@ -1,9 +1,14 @@
 use peregrine::gguf::GgufFile;
 use peregrine::nn::{Embedding, RMSNorm};
+use peregrine::safetensors::SafetensorsFile;
+use peregrine::hf_config::ModelConfig;
 use peregrine::tensor::Tensor;
 
 use crate::attention::KVCache;
 use crate::decoder::LlamaBlock;
+
+use std::collections::HashMap;
+use std::path::Path;
 
 /// Llama model configuration — extracted from GGUF metadata.
 #[derive(Clone, Debug)]
@@ -245,4 +250,276 @@ fn load_transposed_weight(gguf: &GgufFile, name: &str, target: &mut Tensor) {
         }
     }
     *target = Tensor::new(transposed, vec![cols, rows], false);
+}
+
+/// Map HuggingFace weight name to Peregrine's internal naming convention.
+/// Returns (mapped_name, is_2d_weight) — 2D weights need transposing.
+fn map_hf_name(hf_name: &str) -> Option<(String, bool)> {
+    // Strip "model." prefix if present
+    let name = hf_name.strip_prefix("model.").unwrap_or(hf_name);
+
+    // Embedding
+    if name == "embed_tokens.weight" {
+        return Some(("embed_tokens.weight".to_string(), false));
+    }
+
+    // LM head
+    if hf_name == "lm_head.weight" {
+        return Some(("lm_head.weight".to_string(), true));
+    }
+
+    // Final norm
+    if name == "norm.weight" {
+        return Some(("norm.weight".to_string(), false));
+    }
+
+    // Layer weights: "layers.{i}.self_attn.{q,k,v,o}_proj.weight"
+    //                "layers.{i}.mlp.{gate,up,down}_proj.weight"
+    //                "layers.{i}.input_layernorm.weight"
+    //                "layers.{i}.post_attention_layernorm.weight"
+    if let Some(rest) = name.strip_prefix("layers.") {
+        // Extract layer index
+        let dot = rest.find('.')?;
+        let layer_idx = &rest[..dot];
+        let suffix = &rest[dot + 1..];
+
+        let (mapped, is_2d) = match suffix {
+            "self_attn.q_proj.weight" => (format!("blk.{}.attn_q.weight", layer_idx), true),
+            "self_attn.k_proj.weight" => (format!("blk.{}.attn_k.weight", layer_idx), true),
+            "self_attn.v_proj.weight" => (format!("blk.{}.attn_v.weight", layer_idx), true),
+            "self_attn.o_proj.weight" => (format!("blk.{}.attn_output.weight", layer_idx), true),
+            "mlp.gate_proj.weight" => (format!("blk.{}.ffn_gate.weight", layer_idx), true),
+            "mlp.up_proj.weight" => (format!("blk.{}.ffn_up.weight", layer_idx), true),
+            "mlp.down_proj.weight" => (format!("blk.{}.ffn_down.weight", layer_idx), true),
+            "input_layernorm.weight" => (format!("blk.{}.attn_norm.weight", layer_idx), false),
+            "post_attention_layernorm.weight" => (format!("blk.{}.ffn_norm.weight", layer_idx), false),
+            _ => return None,
+        };
+        return Some((mapped, is_2d));
+    }
+
+    None
+}
+
+impl Llama {
+    /// Load a Llama model from a directory of safetensors files (HuggingFace format).
+    /// The directory should contain config.json and one or more .safetensors files.
+    pub fn from_safetensors(dir: &str) -> Self {
+        let dir_path = Path::new(dir);
+
+        // Load config.json
+        let config_path = dir_path.join("config.json");
+        let config_json = std::fs::read_to_string(&config_path)
+            .unwrap_or_else(|e| panic!("failed to read config.json at {:?}: {}", config_path, e));
+        let hf_config = ModelConfig::from_json(&config_json);
+
+        let config = LlamaConfig {
+            vocab_size: hf_config.vocab_size,
+            model_dim: hf_config.hidden_size,
+            num_layers: hf_config.num_hidden_layers,
+            num_q_heads: hf_config.num_attention_heads,
+            num_kv_heads: hf_config.num_key_value_heads,
+            head_dim: hf_config.head_dim,
+            ffn_dim: hf_config.intermediate_size,
+            rope_base: hf_config.rope_theta as f32,
+            rms_eps: hf_config.rms_norm_eps as f32,
+            max_seq_len: hf_config.max_position_embeddings,
+        };
+
+        eprintln!(
+            "Llama config (safetensors): {} layers, {} dim, {} q_heads, {} kv_heads, head_dim={}, ffn={}, vocab={}",
+            config.num_layers, config.model_dim, config.num_q_heads,
+            config.num_kv_heads, config.head_dim, config.ffn_dim, config.vocab_size
+        );
+
+        let mut model = Llama::new(config.clone());
+
+        // Determine safetensors files to load
+        let st_files = list_safetensors_in_dir(dir_path);
+        if st_files.is_empty() {
+            panic!("no safetensors files found in {}", dir);
+        }
+        eprintln!("Loading from {} safetensors file(s)", st_files.len());
+
+        // Collect all tensor names → which file they come from
+        let mut tensor_file_map: HashMap<String, usize> = HashMap::new();
+        let mut files: Vec<SafetensorsFile> = Vec::new();
+
+        for (idx, path) in st_files.iter().enumerate() {
+            let path_str = path.to_str().unwrap();
+            let sf = SafetensorsFile::open(path_str)
+                .unwrap_or_else(|e| panic!("failed to open {:?}: {}", path, e));
+            for name in sf.tensor_names() {
+                tensor_file_map.insert(name.to_string(), idx);
+            }
+            files.push(sf);
+        }
+
+        let mut loaded_count = 0usize;
+
+        // Load all tensors across all files
+        for (hf_name, &file_idx) in &tensor_file_map {
+            let sf = &files[file_idx];
+            let mapped = match map_hf_name(hf_name) {
+                Some(m) => m,
+                None => continue,
+            };
+            let (mapped_name, is_2d) = mapped;
+
+            let data = sf.load_tensor_f32(hf_name);
+            let shape = sf.tensor_shape(hf_name).unwrap();
+
+            // Route the tensor to the right model field
+            if mapped_name == "embed_tokens.weight" {
+                model.embedding.weight = Tensor::new(data, shape.to_vec(), false);
+            } else if mapped_name == "lm_head.weight" {
+                // [vocab, dim] → [dim, vocab]
+                let vocab = shape[0];
+                let dim = shape[1];
+                let transposed = transpose_2d(&data, vocab, dim);
+                model.output_weight = Tensor::new(transposed, vec![dim, vocab], false);
+            } else if mapped_name == "norm.weight" {
+                model.final_norm.weight = Tensor::new(data.clone(), vec![data.len()], false);
+            } else if mapped_name.starts_with("blk.") {
+                // Parse layer index from "blk.{i}.xxx"
+                let rest = &mapped_name[4..]; // after "blk."
+                let dot = rest.find('.').unwrap();
+                let layer_idx: usize = rest[..dot].parse().unwrap();
+                let suffix = &rest[dot + 1..];
+                let layer = &mut model.layers[layer_idx];
+
+                if is_2d && shape.len() == 2 {
+                    // HF stores [out, in], Peregrine needs [in, out]
+                    let (rows, cols) = (shape[0], shape[1]);
+                    let transposed = transpose_2d(&data, rows, cols);
+                    let tensor = Tensor::new(transposed, vec![cols, rows], false);
+                    match suffix {
+                        "attn_q.weight" => layer.attention.q_proj = tensor,
+                        "attn_k.weight" => layer.attention.k_proj = tensor,
+                        "attn_v.weight" => layer.attention.v_proj = tensor,
+                        "attn_output.weight" => layer.attention.o_proj = tensor,
+                        "ffn_gate.weight" => layer.gate_proj = tensor,
+                        "ffn_up.weight" => layer.up_proj = tensor,
+                        "ffn_down.weight" => layer.down_proj = tensor,
+                        _ => continue,
+                    }
+                } else {
+                    // 1D norm weights
+                    let tensor = Tensor::new(data.clone(), vec![data.len()], false);
+                    match suffix {
+                        "attn_norm.weight" => layer.attn_norm.weight = tensor,
+                        "ffn_norm.weight" => layer.ffn_norm.weight = tensor,
+                        _ => continue,
+                    }
+                }
+            } else {
+                continue;
+            }
+
+            loaded_count += 1;
+        }
+
+        // Handle tied embeddings: if lm_head wasn't loaded, use embedding
+        if !tensor_file_map.keys().any(|n| n == "lm_head.weight") && hf_config.tie_word_embeddings {
+            eprintln!("  Using tied embeddings for lm_head");
+            let emb_data = model.embedding.weight.data();
+            let vocab = config.vocab_size;
+            let dim = config.model_dim;
+            let transposed = transpose_2d(&emb_data, vocab, dim);
+            model.output_weight = Tensor::new(transposed, vec![dim, vocab], false);
+            loaded_count += 1;
+        }
+
+        eprintln!("  Loaded {} tensors from safetensors", loaded_count);
+        model
+    }
+}
+
+/// Transpose a 2D matrix from [rows, cols] to [cols, rows].
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut transposed = vec![0.0f32; cols * rows];
+    for r in 0..rows {
+        for c in 0..cols {
+            transposed[c * rows + r] = data[r * cols + c];
+        }
+    }
+    transposed
+}
+
+/// List safetensors files in a directory.
+/// Uses the index file if present, otherwise falls back to the single file.
+fn list_safetensors_in_dir(dir: &Path) -> Vec<std::path::PathBuf> {
+    let index_path = dir.join("model.safetensors.index.json");
+    if index_path.exists() {
+        if let Ok(index_str) = std::fs::read_to_string(&index_path) {
+            let filenames = parse_weight_map_filenames(&index_str);
+            if !filenames.is_empty() {
+                return filenames.iter().map(|f| dir.join(f)).collect();
+            }
+        }
+    }
+    let single = dir.join("model.safetensors");
+    if single.exists() {
+        return vec![single];
+    }
+    vec![]
+}
+
+/// Parse unique filenames from a safetensors index JSON weight_map.
+fn parse_weight_map_filenames(index_json: &str) -> Vec<String> {
+    let mut filenames = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    if let Some(wm_idx) = index_json.find("\"weight_map\"") {
+        let after = &index_json[wm_idx + "\"weight_map\"".len()..];
+        if let Some(brace) = after.find('{') {
+            let map_str = &after[brace..];
+            let bytes = map_str.as_bytes();
+            let mut pos = 1;
+
+            while pos < bytes.len() {
+                if bytes[pos] == b'}' {
+                    break;
+                }
+                if bytes[pos] == b'"' {
+                    // Skip key
+                    pos += 1;
+                    while pos < bytes.len() && bytes[pos] != b'"' {
+                        if bytes[pos] == b'\\' { pos += 1; }
+                        pos += 1;
+                    }
+                    pos += 1;
+
+                    // Skip to colon
+                    while pos < bytes.len() && bytes[pos] != b':' { pos += 1; }
+                    pos += 1;
+
+                    // Skip whitespace
+                    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\n' | b'\r' | b'\t') {
+                        pos += 1;
+                    }
+
+                    // Parse value string
+                    if pos < bytes.len() && bytes[pos] == b'"' {
+                        pos += 1;
+                        let start = pos;
+                        while pos < bytes.len() && bytes[pos] != b'"' {
+                            if bytes[pos] == b'\\' { pos += 1; }
+                            pos += 1;
+                        }
+                        let filename = std::str::from_utf8(&bytes[start..pos])
+                            .unwrap_or("")
+                            .to_string();
+                        if !filename.is_empty() && seen.insert(filename.clone()) {
+                            filenames.push(filename);
+                        }
+                        pos += 1;
+                    }
+                } else {
+                    pos += 1;
+                }
+            }
+        }
+    }
+    filenames
 }

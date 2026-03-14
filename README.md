@@ -46,6 +46,9 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
 | **`peregrine::envs`** | 10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe |
 | **`peregrine::gguf`** | GGUF binary format parser — load quantized model weights (Q8_0, Q4_0, Q4_1, F16, F32), metadata extraction, dequantization |
+| **`peregrine::safetensors`** | Safetensors binary format parser — mmap-based loading on Unix, F32/F16/BF16 dequantization, handwritten JSON header parser |
+| **`peregrine::hf_config`** | HuggingFace config.json parser — `ModelConfig` with Llama/Mistral fields, JSON value extraction with scientific notation |
+| **`peregrine::hf_hub`** | HuggingFace Hub integration — download and cache safetensors weights, config.json, tokenizer.json. Auth via `HF_TOKEN`, multi-shard support (`--features hf`) |
 | **`peregrine::metal`** | Metal GPU backend — 108 compute shaders, 41 dispatch methods, fused op pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling, thermal-aware scheduling (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
@@ -54,11 +57,11 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
 | **`peregrine::sched`** | Request scheduler for managed prefill/decode aggregation — `Priority` (Background/Normal/High), `ChunkedPrefiller`, dynamic chunk-size tuning with EMA latency tracking, `SchedulerAction`-based model-agnostic API. Supports multiple concurrent requests with priority-based interleaving |
 | **`peregrine::thermal`** | Thermal monitoring via Darwin notifications — `ThermalState` (Nominal/Moderate/Heavy/Trapping/Sleeping), rate-limited polling (100ms cache), thread-local singleton. Used by `het_execute_thermal` for thermal-aware GPU/CPU scheduling |
-| **`examples/llama`** | Llama 3.2 inference from GGUF — loads quantized GGUF models directly (Q8_0, Q4_0, Q4_1), 16-layer 1B config (2048 dim, GQA 32/8 heads, SwiGLU), RoPE (theta=500000), BPE tokenizer from GGUF metadata, greedy/temperature/top-p sampling, streaming decode with tok/s stats. `--sustained SECS` for sustained throughput profiling (p50/p95/p99 latency, thermal distribution), `--chunked-prefill SIZE` for chunked prefill via scheduler, `--multi-request N` for N concurrent priority-scheduled requests, `--wandb` for W&B logging |
+| **`examples/llama`** | Llama 3.2 inference — auto-detects GGUF, safetensors directories, or HuggingFace Hub repos (`org/repo`). Loads quantized GGUF (Q8_0, Q4_0, Q4_1) or HF safetensors (F32/F16/BF16) with mmap. 16-layer 1B config (2048 dim, GQA 32/8 heads, SwiGLU), RoPE (theta=500000), BPE tokenizer from GGUF metadata or HF tokenizer.json, greedy/temperature/top-p sampling, streaming decode with tok/s stats. `--sustained SECS` for sustained throughput profiling (p50/p95/p99 latency, thermal distribution), `--chunked-prefill SIZE` for chunked prefill via scheduler, `--multi-request N` for N concurrent priority-scheduled requests, `--wandb` for W&B logging |
 | **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
 | **`examples/moba`** | MOBA 3v3 with LSTM-based PPO and self-play — single-lane map (32x16), heroes, towers, creeps, bases. Train, selfplay, watch (HTML replay), video (MP4 export via FFmpeg) |
 
-The entire library is ~35,400 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
+The entire library is ~36,200 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
 ---
 
@@ -210,20 +213,20 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | 35.8 | **6.5** | 21.2 | 52.5 | 442.5 | 58.4 |
-| matmul 512x512 | 277.5 | **146.5** | 197.0 | 702.2 | 428.8 | 556.6 |
-| add 100k | **10.2** | 48.8 | 33.8 | 60.3 | 194.6 | 34.3 |
-| mul 100k | **12.7** | 42.6 | 33.5 | 48.0 | 197.2 | 38.1 |
-| relu 100k | **8.8** | 45.8 | 36.2 | 39.5 | 354.2 | 100.5 |
-| softmax 8x128 | **1.2** | 37.0 | 23.5 | 12.4 | 642.1 | 33.0 |
-| gelu 100k | **83.2** | 83.7 | 143.1 | 249.7 | 895.4 | 222.3 |
-| rfft 1k | **2.0** | 4.5 | 30.6 | 46.1 | — | 23.0 |
-| cross_entropy | **2.7** | 47.2 | 24.3 | 635.8 | 3823.9 | 58.2 |
-| train step 64 | **821.1** | 1543.1 | 1029.1 | 9305.1 | 25607.6 | 5264.5 |
-| matmul+bias+gelu 196x768x3072 | 1207.2 | **1099.6** | — | 2463.9 | 1314.8 | 2155.1 |
-| add+layernorm 196x768 | **107.5** | 109.7 | — | 1280.5 | 1159.9 | 237.2 |
+| matmul 128x128 | **6.0** | 7.4 | 22.5 | 53.3 | 430.6 | 59.1 |
+| matmul 512x512 | 216.3 | 154.5 | **146.3** | 689.5 | 474.7 | 552.0 |
+| add 100k | **13.0** | 35.4 | 28.7 | 53.1 | 187.3 | 44.5 |
+| mul 100k | **12.5** | 43.0 | 29.0 | 41.1 | 195.8 | 31.1 |
+| relu 100k | **8.8** | 35.1 | 26.5 | 37.4 | 340.2 | 99.0 |
+| softmax 8x128 | **1.2** | 30.6 | 15.3 | 11.2 | 640.7 | 30.9 |
+| gelu 100k | 78.3 | **48.4** | 140.8 | 251.2 | 888.2 | 210.8 |
+| rfft 1k | **2.1** | 4.7 | 22.7 | 39.6 | — | 22.8 |
+| cross_entropy | **2.7** | 44.2 | 23.0 | 601.5 | 3528.0 | 53.2 |
+| train step 64 | **818.9** | 1268.2 | 857.0 | 8654.6 | 28348.8 | 5194.2 |
+| matmul+bias+gelu 196x768x3072 | 1214.5 | **919.9** | — | 2420.7 | 1281.0 | 2140.6 |
+| add+layernorm 196x768 | 104.2 | **101.8** | — | 1221.2 | 1164.3 | 219.5 |
 
-Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.90x**, **MLX 0.66x**, TensorFlow 0.53x, tinygrad 0.10x, JAX 0.67x. Peregrine wins 68 of 141 ops.
+Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 1.02x** (tied), **MLX 0.73x**, TensorFlow 0.54x, tinygrad 0.09x, JAX 0.67x. Peregrine wins 62 of 141 ops.
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
@@ -233,8 +236,8 @@ Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.90x*
 | 512x384 | 1.95s | 1.55s | **1.44s** | 2.26s |
 | Weight load | **0.6s** | 0.6s | 0.6s | 1.6s |
 
-- **224**: Peregrine is **4.5% faster** on CPU (0.64s vs 0.67s), **22% faster** with GPU (0.53s)
-- **512**: Peregrine is **14% faster** on CPU (1.95s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
+- **224**: Peregrine is **3% faster** on CPU (0.65s vs 0.67s), **22% faster** with GPU (0.53s)
+- **512**: Peregrine is **10% faster** on CPU (2.04s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
 GPU mode (`--gpu`) keeps the entire attention pipeline on Metal — QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape all run as GPU kernels with no CPU round-trips. Pipeline mode (`--pipeline`) overlaps feat1 (GPU) and feat2 (CPU/AMX) decoder processing via `MTLSharedEvent` signaling — single-threaded, no `Send`/`Sync` needed.
@@ -289,6 +292,9 @@ src/
   quant.rs        int8 quantized inference — per-column weight quantization, per-row activation quantization, NEON i8 GEMM, Metal dequant matmul
   sparse.rs       2:4 structured sparsity — prune/densify, nibble-packed indices, NEON sparse GEMM, Metal sparse matmul
   gguf.rs         GGUF binary format parser — Q8_0/Q4_0/Q4_1/F16/F32 dequantization, metadata extraction
+  safetensors.rs  safetensors binary parser — mmap loading, F32/F16/BF16 dequant, JSON header parser
+  hf_config.rs    HuggingFace config.json parser — ModelConfig, JSON value extraction
+  hf_hub.rs       HuggingFace Hub download & cache — safetensors + config + tokenizer (--features hf)
   serial.rs       model weight save/load (binary format, f32 + int8 + 2:4 sparse)
   attention.rs    core GQA attention — StandardKVCache, gqa_attention_cpu, AttentionMask, PostScoreTransform
   speculative.rs  speculative decoding — CausalLM trait, draft-propose/target-verify with stochastic acceptance
@@ -330,13 +336,13 @@ examples/
     attention.rs    MLA — Multi-head Latent Attention, compressed KV cache, YaRN RoPE
     moe.rs          MoE — sigmoid gate, group-limited top-k, shared experts
     tokenizer.rs    HuggingFace tokenizer.json BPE parser (pure Rust)
-  llama/          Llama 3.2 inference from GGUF
-    main.rs         CLI, greedy/temperature/top-p sampling, streaming decode, sustained profiling, chunked prefill, multi-request scheduling
+  llama/          Llama 3.2 inference (GGUF, safetensors, or HF Hub)
+    main.rs         CLI, auto-detect model format, greedy/temperature/top-p sampling, streaming decode, sustained profiling, chunked prefill, multi-request scheduling
     wandb.rs        W&B logging for sustained profiling metrics
-    model.rs        LlamaConfig (from GGUF metadata), weight loading with transpose
+    model.rs        LlamaConfig (from GGUF or config.json), weight loading from GGUF or safetensors with transpose
     decoder.rs      LlamaBlock — pre-norm GQA attention + SwiGLU FFN
     attention.rs    GQA with RoPE (theta=500000), causal masking, KV cache
-    tokenizer.rs    BPE tokenizer from GGUF embedded vocabulary
+    tokenizer.rs    BPE tokenizer from GGUF embedded vocabulary or HF tokenizer.json (byte-level BPE)
   rl_demo/        RL training demos with HTML animations
     main.rs         PPO CartPole, DQN GridWorld, REINFORCE Arithmetic
   moba/           MOBA 3v3 with LSTM PPO and self-play

@@ -7,6 +7,54 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.29.0] - 2026-03-13
+
+### Added — Safetensors model loading + HuggingFace Hub integration
+
+Native safetensors binary format parser with mmap-based loading and HuggingFace Hub download/caching. The llama example now auto-detects GGUF, safetensors directories, or `org/repo` HF Hub references — no conversion scripts needed for HuggingFace models.
+
+**New modules**
+- `src/safetensors.rs` — Safetensors binary parser with mmap on Unix (fallback to `fs::read`), handwritten JSON header parser, F32/F16/BF16 dequantization to f32. 6 unit tests (F32 roundtrip, BF16, metadata skip, scalar, tensor names)
+- `src/hf_config.rs` — HuggingFace `config.json` parser. `ModelConfig` struct with all standard Llama/Mistral fields, `json_str/u64/f64/bool_value()` extraction helpers supporting scientific notation. 5 unit tests (Llama, Mistral, helpers, missing keys, scientific notation)
+- `src/hf_hub.rs` (`--features hf`) — HuggingFace Hub download & caching. `HfRepo::new("org/repo@revision")`, `ensure_file()` with progress reporting, `ensure_model()` downloads config.json + tokenizer.json + safetensors shards. Auth via `HF_TOKEN` env or `~/.cache/huggingface/token`. Cache at `~/.peregrine/models/org/repo/`. Multi-shard index support
+
+**Extended modules**
+- `src/gguf.rs` — `f16_to_f32` made `pub` for reuse by safetensors F16 dequantization
+- `src/lib.rs` — `pub mod safetensors`, `pub mod hf_config`, `#[cfg(feature = "hf")] pub mod hf_hub`
+- `Cargo.toml` — `hf = ["ureq"]` feature gate, `libc` now non-optional (needed for mmap)
+- `examples/llama/model.rs` — `Llama::from_safetensors(dir)` loads from HF-format directory (config.json + safetensors), HF→Peregrine weight name mapping (`model.layers.N.self_attn.q_proj.weight` → `blk.N.attn_q.weight` etc.), tied embedding support
+- `examples/llama/main.rs` — `load_model_and_tokenizer()` auto-detects format: `.gguf` → GGUF, directory with `config.json` → safetensors, `org/repo` → HF Hub download. Usage message updated
+- `examples/llama/tokenizer.rs` — `Tokenizer::from_hf_json()` for GPT-2 style byte-level BPE from HF tokenizer.json, with `encode_byte_level_bpe()` and `decode_byte_level_bpe()` methods, full JSON parsing (vocab, merges, added_tokens)
+
+**Usage**
+```bash
+# GGUF (existing)
+cargo run --example llama --release -- model.gguf "prompt"
+# Local safetensors directory
+cargo run --example llama --release -- ./Llama-3.2-1B/ "prompt"
+# HuggingFace Hub (auto-download + cache)
+cargo run --example llama --release --features hf -- meta-llama/Llama-3.2-1B "prompt"
+```
+
+### Benchmark Results
+
+MUSt3R 3D reconstruction (423M params, Apple Silicon):
+
+| Resolution | Peregrine | PyTorch |
+|-----------|----------:|--------:|
+| 224x224 | **0.65s** | 0.67s |
+| 512x384 | **2.04s** | 2.26s |
+
+Op-level benchmarks (141 ops, CPU, all frameworks):
+- **Peregrine vs PyTorch: 1.02x** (effectively tied)
+- **Peregrine vs MLX: 0.73x** (Peregrine faster)
+- **Peregrine vs TensorFlow: 0.54x** (Peregrine faster)
+- **Peregrine vs JAX: 0.67x** (Peregrine faster)
+- **Peregrine vs tinygrad: 0.09x** (Peregrine faster)
+- Peregrine wins 62/141 ops
+
+---
+
 ## [0.28.0] - 2026-03-13
 
 ### Added — Managed prefill/decode aggregation with priority scheduling

@@ -9,6 +9,7 @@ use tokenizer::Tokenizer;
 use peregrine::thermal::{thermal_init, thermal_state, ThermalState};
 use peregrine::sched::{Priority, Scheduler, SchedulerAction, SchedulerConfig};
 use std::env;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn greedy_decode(logits_data: &[f32], vocab_size: usize) -> usize {
@@ -201,6 +202,69 @@ fn print_sustained_stats(records: &[TokenRecord], total_secs: f64) {
     }
 }
 
+/// Auto-detect model format and load model + tokenizer.
+/// Supports:
+///   - `.gguf` file → GGUF loader with embedded tokenizer
+///   - directory with `config.json` → safetensors loader
+///   - `org/repo` string → HF Hub download + safetensors loader (requires --features hf)
+fn load_model_and_tokenizer(model_path: &str) -> (Llama, Tokenizer) {
+    let path = Path::new(model_path);
+
+    if model_path.ends_with(".gguf") || (path.is_file() && path.extension().map_or(false, |e| e == "gguf")) {
+        // GGUF format
+        eprintln!("Loading GGUF model: {}", model_path);
+        let (model, gguf) = Llama::from_gguf(model_path);
+        let tok = Tokenizer::from_gguf(&gguf);
+        return (model, tok);
+    }
+
+    if path.is_dir() && path.join("config.json").exists() {
+        // Safetensors directory
+        eprintln!("Loading safetensors model from: {}", model_path);
+        let model = Llama::from_safetensors(model_path);
+        let tok = load_tokenizer_from_dir(model_path);
+        return (model, tok);
+    }
+
+    // Try HF Hub: "org/repo" format
+    if model_path.contains('/') && !path.exists() {
+        #[cfg(feature = "hf")]
+        {
+            eprintln!("Downloading from HuggingFace Hub: {}", model_path);
+            let repo = peregrine::hf_hub::HfRepo::new(model_path)
+                .unwrap_or_else(|e| panic!("invalid HF repo spec '{}': {}", model_path, e));
+            let dir = peregrine::hf_hub::ensure_model(&repo)
+                .unwrap_or_else(|e| panic!("failed to download model: {}", e));
+            let dir_str = dir.to_str().unwrap();
+            let model = Llama::from_safetensors(dir_str);
+            let tok = load_tokenizer_from_dir(dir_str);
+            return (model, tok);
+        }
+        #[cfg(not(feature = "hf"))]
+        {
+            eprintln!("Error: '{}' looks like an HF repo, but the 'hf' feature is not enabled.", model_path);
+            eprintln!("Rebuild with: cargo build --example llama --features hf --release");
+            std::process::exit(1);
+        }
+    }
+
+    eprintln!("Error: cannot determine model format for '{}'", model_path);
+    eprintln!("Expected: .gguf file, directory with config.json, or org/repo for HF Hub");
+    std::process::exit(1);
+}
+
+/// Load tokenizer from a directory containing tokenizer.json (HF format).
+/// Falls back to a simple placeholder if not found.
+fn load_tokenizer_from_dir(dir: &str) -> Tokenizer {
+    let tok_path = Path::new(dir).join("tokenizer.json");
+    if tok_path.exists() {
+        Tokenizer::from_hf_json(&std::fs::read_to_string(&tok_path)
+            .unwrap_or_else(|e| panic!("failed to read tokenizer.json: {}", e)))
+    } else {
+        panic!("tokenizer.json not found in {}. HF safetensors models require a tokenizer.json file.", dir);
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
@@ -271,7 +335,8 @@ fn main() {
     };
 
     if positional.len() < 2 {
-        eprintln!("Usage: llama [--gpu] [--temperature T] [--top-p P] [--max-tokens N] [--sustained SECS] [--chunked-prefill SIZE] [--multi-request N] [--wandb] <model.gguf> <prompt>");
+        eprintln!("Usage: llama [--gpu] [--temperature T] [--top-p P] [--max-tokens N] [--sustained SECS] [--chunked-prefill SIZE] [--multi-request N] [--wandb] <model> <prompt>");
+        eprintln!("  model: path to .gguf file, directory with safetensors, or HF repo (org/repo)");
         std::process::exit(1);
     }
 
@@ -283,14 +348,11 @@ fn main() {
         eprintln!("Warning: thermal monitoring unavailable: {}", e);
     }
 
-    // Load model from GGUF
+    // Auto-detect format and load model + tokenizer
     let t0 = Instant::now();
-    let (model, gguf) = Llama::from_gguf(model_path);
+    let (model, tok) = load_model_and_tokenizer(model_path);
     let load_secs = t0.elapsed().as_secs_f64();
     eprintln!("Model loaded in {:.2}s", load_secs);
-
-    // Load tokenizer from GGUF embedded vocab
-    let tok = Tokenizer::from_gguf(&gguf);
     eprintln!("Tokenizer: {} vocab, BOS={}, EOS={}", tok.vocab_size(), tok.bos_id, tok.eos_id);
 
     // Tokenize prompt
