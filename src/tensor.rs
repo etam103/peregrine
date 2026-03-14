@@ -2899,13 +2899,13 @@ impl Tensor {
                     }
                 });
             } else {
-                let mut inner_buf = pool_get(len);
+                // 2-pass (no temp buffer): compute inner into data, vvtanhf in-place, NEON combine
                 for i in 0..len {
                     let x = src[i];
-                    inner_buf[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                    data[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
                 }
                 let n = len as i32;
-                unsafe { vvtanhf(data.as_mut_ptr(), inner_buf.as_ptr(), &n); }
+                unsafe { vvtanhf(data.as_mut_ptr(), data.as_ptr(), &n); }
                 unsafe {
                     use std::arch::aarch64::*;
                     let half = vdupq_n_f32(0.5);
@@ -2922,7 +2922,6 @@ impl Tensor {
                         data[i] = 0.5 * src[i] * (1.0 + data[i]);
                     }
                 }
-                pool_recycle(inner_buf);
             }
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
