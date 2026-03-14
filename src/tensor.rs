@@ -11,9 +11,9 @@ use crate::simd_kernels;
 
 /// Rayon threshold for cheap ops (add, mul, sub, div, relu, neg, abs, scale, add_bias).
 /// At sizes below this, single-threaded SIMD + warm cache is faster than Rayon spawn overhead.
-const PAR_THRESHOLD_CHEAP: usize = 200_000;
+const PAR_THRESHOLD_CHEAP: usize = 2_000_000;
 /// Rayon threshold for expensive ops (exp, log, sqrt, sigmoid, gelu, tanh, sin, cos, pow).
-const PAR_THRESHOLD_EXPENSIVE: usize = 100_000;
+const PAR_THRESHOLD_EXPENSIVE: usize = 500_000;
 
 // --- Apple Accelerate BLAS FFI ---
 
@@ -3149,10 +3149,31 @@ impl Tensor {
         if a.shape == b.shape {
             let len = a.data.len();
             let mut data = pool_get(len);
-            #[cfg(target_arch = "aarch64")]
-            simd_kernels::vec_logaddexp_f32(&a.data, &b.data, &mut data);
-            #[cfg(not(target_arch = "aarch64"))]
-            for i in 0..len { data[i] = logaddexp_fn(a.data[i], b.data[i]); }
+            #[cfg(target_os = "macos")]
+            {
+                // max(a,b) + log1p(exp(-|a-b|))
+                // Step 1: compute -|a-b| and max(a,b)
+                let mut neg_abs_diff = pool_get(len);
+                for i in 0..len {
+                    data[i] = a.data[i].max(b.data[i]); // store max in data
+                    neg_abs_diff[i] = -(a.data[i] - b.data[i]).abs();
+                }
+                // Step 2: exp(-|a-b|) via Accelerate
+                let n = len as i32;
+                unsafe { vvexpf(neg_abs_diff.as_mut_ptr(), neg_abs_diff.as_ptr(), &n); }
+                // Step 3: log1p(exp_result) via Accelerate
+                unsafe { vvlog1pf(neg_abs_diff.as_mut_ptr(), neg_abs_diff.as_ptr(), &n); }
+                // Step 4: max + log1p_result
+                for i in 0..len { data[i] += neg_abs_diff[i]; }
+                pool_recycle(neg_abs_diff);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_logaddexp_f32(&a.data, &b.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
+                for i in 0..len { data[i] = logaddexp_fn(a.data[i], b.data[i]); }
+            }
             Tensor::from_op(data, a.shape.clone(), Op::Logaddexp(self.clone(), other.clone()))
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, logaddexp_fn);
