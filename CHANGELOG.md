@@ -7,6 +7,58 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.32.0] - 2026-03-14
+
+### Added — NEON + Accelerate performance blitz: 67→88 wins, 0.65x vs PyTorch
+
+Comprehensive op-level optimization pass adding 12 NEON SIMD kernels, 5 NEON reduction kernels, 10 Apple Accelerate vForce integrations, fused activation pipelines, and threshold tuning. Peregrine went from effectively tied with PyTorch (0.98x) to **35% faster** (0.65x).
+
+**New NEON SIMD kernels** (`src/simd_kernels.rs`)
+- Unary: `vec_floor/ceil/round_f32` (vrndm/p/n), `vec_rsqrt_f32` (vrsqrte+2 Newton steps), `vec_sign_f32` (vcgt+vbsl), `vec_erf_f32` (Cephes polynomial + fast_exp)
+- Comparison: `vec_greater/equal_f32` (vcgt/vceq+vbsl), `vec_where_f32` (vmvn+vbsl)
+- Activation: `vec_hardswish_f32` (NEON clamp+mul), `vec_softplus/mish_f32` (fused), `vec_elu/selu_f32` (exp+blend)
+- Reduction: `vec_sum/max/min/prod_axis` with `inner_size=1` fast path (vaddvq/vmaxvq/vminvq horizontal reduce), `vec_logsumexp_rows` (fused two-pass)
+- 8-wide unrolling: add, sub, mul, exp kernels process 8 elements/iteration (2x float32x4_t)
+
+**Apple Accelerate vForce** (`src/tensor.rs`)
+- `vvlogf`, `vvlog1pf`, `vvlog2f`, `vvlog10f` for log ops
+- `vvexpm1f`, `vvacosf`, `vvrsqrtf`, `vvasinhf` for math ops
+- `vvpowf` for power, `vvatan2f` for arctan2
+- `vvexpf+vvlog1pf+vvtanhf` fused pipeline for softplus/mish
+- `vvexpf+vvlog1pf` fused pipeline for logaddexp
+- `vvlogf+vvcosf+vvsinf` vectorized Box-Muller for rand_normal
+
+**Fused reductions** (`src/tensor.rs`)
+- Fused two-pass variance: NEON sum for mean, then vmlaq_f32 for squared diffs
+- Fused single-pass logsumexp: NEON max + fast_exp sum
+- NEON two-pass argmax: vmaxvq max-find + index scan
+- Unrolled 4x cumsum prefix sum
+
+**Threshold tuning**
+- `PAR_THRESHOLD_CHEAP`: 500K→2M (NEON single-threaded beats rayon+scalar at medium sizes)
+- `PAR_THRESHOLD_EXPENSIVE`: 100K→500K
+
+### Benchmark Results
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Wins | 67/141 | **88/141** |
+| vs PyTorch | 0.98x (tied) | **0.65x** (35% faster) |
+| vs MLX | 0.75x | **0.47x** (53% faster) |
+| vs TensorFlow | 0.52x | **0.36x** (64% faster) |
+| vs JAX | 0.66x | **0.44x** (56% faster) |
+
+Key individual improvements:
+- floor/ceil/round: 46→8.8µs (5.3x), sign: 54→8.8µs (6.2x)
+- greater/equal: 71→10µs (7x), where: 95→15µs (6.3x)
+- arctan2: 1122→97µs (11.6x via Accelerate vvatan2f)
+- sum_axis: 114→19µs (6x), max/min_axis: 154→14µs (11x)
+- hard_tanh: 51→8.1µs (6.3x), hardswish: 85→10µs (8.5x)
+- rand_normal: 772→241µs (3.2x via vectorized Box-Muller)
+- add_500k: 100→48µs (2.1x via 8-wide NEON)
+
+---
+
 ## [0.31.0] - 2026-03-13
 
 ### Added — Reproducible `peregrine-bench` CLI + GitHub Pages dashboard
