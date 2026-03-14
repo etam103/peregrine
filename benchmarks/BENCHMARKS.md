@@ -1,6 +1,6 @@
 # Peregrine Benchmarks
 
-**Date**: 2026-03-13 (v0.29.0 — Safetensors + HuggingFace Hub Integration)
+**Date**: 2026-03-13 (v0.30.0 — Python Bindings via PyO3)
 **System**: Apple M1 Max, 10 cores, 64 GB RAM, arm64
 **Frameworks**: Peregrine (Rust), PyTorch 2.10.0, TensorFlow 2.20.0, JAX 0.9.0.1, MLX 0.30.6, TinyGrad
 **All benchmarks**: CPU only, median of 20-50 iterations
@@ -13,11 +13,11 @@ Model: 423M parameters (ViT-L encoder + ViT-B decoder), shared head.
 |----------------------|---------------|-------------|----------------|-------------|
 | Input resolution     | 224x224       | 224x224     | 512x384        | 512x384     |
 | Patches              | 196           | 196         | 768            | 768         |
-| **Inference time**   | **0.65s**     | **0.67s**   | **2.04s**      | **2.26s**   |
+| **Inference time**   | **0.64s**     | **0.67s**   | **1.97s**      | **2.26s**   |
 | **Weight loading**   | **0.6s**      | **1.6s**    | **0.6s**       | **1.6s**    |
 
-- **224**: Peregrine is **3% faster** (0.65s vs 0.67s)
-- **512**: Peregrine is **10% faster** (2.04s vs 2.26s)
+- **224**: Peregrine is **4.5% faster** (0.64s vs 0.67s)
+- **512**: Peregrine is **13% faster** (1.97s vs 2.26s)
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
 ### Detailed Breakdown
@@ -80,34 +80,34 @@ Winner column: PG=Peregrine, PT=PyTorch, TF=TensorFlow, JAX=JAX, MLX=MLX.
 
 | Framework | Wins (of 141 total ops) |
 |-----------|------------------------|
-| Peregrine | 62 |
-| PyTorch | 37 |
-| MLX | 20 |
-| TensorFlow | 12 |
-| JAX | 9 |
+| Peregrine | 67 |
+| PyTorch | 30 |
+| MLX | 23 |
+| TensorFlow | 14 |
+| JAX | 6 |
 | TinyGrad | 1 |
 
-Peregrine wins 62/141 ops (44%). Geometric mean ratio vs PyTorch: 1.02x (tied), vs MLX: 0.73x, vs TF: 0.54x, vs JAX: 0.67x, vs tinygrad: 0.09x.
+Peregrine wins 67/141 ops (48%). Geometric mean ratio vs PyTorch: 0.98x (2% faster), vs MLX: 0.75x, vs TF: 0.52x, vs JAX: 0.66x, vs tinygrad: 0.09x.
 
 ### Matmul
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| matmul_128x128 | **6.0** | 7.4 | 53.3 | 59.1 | 22.5 | 430.6 | PG |
-| matmul_256x256 | 69.5 | **35.9** | 128.0 | 153.8 | 51.7 | 446.8 | PT |
-| matmul_512x512 | 216.3 | 154.5 | 689.5 | 552.0 | **146.3** | 474.7 | MLX |
-| matmul_1024x1024 | **1072.7** | - | - | - | - | - | PG |
-| matmul_2048x2048 | **9059.1** | - | - | - | - | - | PG |
+| matmul_128x128 | 13.4 | **6.6** | 53.0 | 79.0 | 21.4 | 424.9 | PT |
+| matmul_256x256 | 59.0 | **30.9** | 137.3 | 171.0 | 45.6 | 428.3 | PT |
+| matmul_512x512 | 218.4 | **132.1** | 628.6 | 514.4 | 147.1 | 423.3 | PT |
+| matmul_1024x1024 | **1051.8** | - | - | - | - | - | PG |
+| matmul_2048x2048 | **9849.4** | - | - | - | - | - | PG |
 
 ### Add
 
 | Op | Peregrine | PyTorch | TF | JAX | MLX | TinyGrad | Winner |
 |----|-----------|---------|-----|-----|-----|----------|--------|
-| add_100k | **13.0** | 35.4 | 53.1 | 44.5 | 28.7 | 187.3 | PG |
-| add_500k | 111.4 | **62.9** | 78.9 | 63.4 | 80.1 | 194.8 | PT |
-| add_1M | **121.3** | - | - | - | - | - | PG |
-| add_5M | **510.0** | - | - | - | - | - | PG |
-| add_10M | **888.8** | - | - | - | - | - | PG |
+| add_100k | **12.8** | 29.2 | 53.4 | 38.1 | 28.7 | 190.5 | PG |
+| add_500k | 111.4 | **61.5** | 87.0 | 65.1 | 81.9 | 188.5 | PT |
+| add_1M | **130.8** | - | - | - | - | - | PG |
+| add_5M | **514.1** | - | - | - | - | - | PG |
+| add_10M | **971.0** | - | - | - | - | - | PG |
 
 ### Mul
 
@@ -358,13 +358,16 @@ The int8 path is currently slower than f32 because: (a) NEON `vmull_s8`+`vpadalq
 - **Linalg (large)**: eigh_256 1.9x, cholesky_256 2.6x, svd_256 1.1x
 - **LSTM**: 1.5x
 
-### Changes from Previous Run (v0.27.0 → v0.29.0)
-- **Geomean vs PyTorch**: Changed from 0.90x to **1.02x** (effectively tied — run-to-run variance)
-- **Geomean vs MLX**: Changed from 0.66x to **0.73x**
-- **Wins**: 62/141 (was 68/141)
-- **matmul_128x128**: Peregrine now wins (**6.0µs** vs 7.4µs PT — significant improvement from 35.8µs)
-- **MUSt3R 224**: **0.65s** (3% faster than PyTorch 0.67s)
-- **MUSt3R 512**: **2.04s** (10% faster than PyTorch 2.26s)
+### Changes from Previous Run (v0.29.0 → v0.30.0)
+- **Geomean vs PyTorch**: Improved from 1.02x to **0.98x** (Peregrine now 2% faster overall)
+- **Geomean vs MLX**: Changed from 0.73x to **0.75x**
+- **Wins**: 67/141 (was 62/141)
+- **det_64x64**: Peregrine now wins (**14.1µs** vs 19.4µs PT, was 22.6µs)
+- **huber_loss**: Peregrine now wins (**5.1µs** vs 6.0µs PT)
+- **solve_256x256**: Peregrine now wins (**188.5µs** vs 197.2µs PT)
+- **gru_seq32**: Peregrine now wins (**876.6µs** vs 1052.8µs PT)
+- **MUSt3R 224**: **0.64s** (4.5% faster than PyTorch 0.67s)
+- **MUSt3R 512**: **1.97s** (13% faster than PyTorch 2.26s)
 
 ## Reproducing
 

@@ -213,20 +213,20 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | **6.0** | 7.4 | 22.5 | 53.3 | 430.6 | 59.1 |
-| matmul 512x512 | 216.3 | 154.5 | **146.3** | 689.5 | 474.7 | 552.0 |
-| add 100k | **13.0** | 35.4 | 28.7 | 53.1 | 187.3 | 44.5 |
-| mul 100k | **12.5** | 43.0 | 29.0 | 41.1 | 195.8 | 31.1 |
-| relu 100k | **8.8** | 35.1 | 26.5 | 37.4 | 340.2 | 99.0 |
-| softmax 8x128 | **1.2** | 30.6 | 15.3 | 11.2 | 640.7 | 30.9 |
-| gelu 100k | 78.3 | **48.4** | 140.8 | 251.2 | 888.2 | 210.8 |
-| rfft 1k | **2.1** | 4.7 | 22.7 | 39.6 | — | 22.8 |
-| cross_entropy | **2.7** | 44.2 | 23.0 | 601.5 | 3528.0 | 53.2 |
-| train step 64 | **818.9** | 1268.2 | 857.0 | 8654.6 | 28348.8 | 5194.2 |
-| matmul+bias+gelu 196x768x3072 | 1214.5 | **919.9** | — | 2420.7 | 1281.0 | 2140.6 |
-| add+layernorm 196x768 | 104.2 | **101.8** | — | 1221.2 | 1164.3 | 219.5 |
+| matmul 128x128 | 13.4 | **6.6** | 21.4 | 53.0 | 424.9 | 79.0 |
+| matmul 512x512 | 218.4 | **132.1** | 147.1 | 628.6 | 423.3 | 514.4 |
+| add 100k | **12.8** | 29.2 | 28.7 | 53.4 | 190.5 | 38.1 |
+| mul 100k | **12.5** | 35.2 | 28.4 | 47.0 | 189.1 | 32.2 |
+| relu 100k | **8.8** | 30.0 | 23.9 | 32.4 | 337.0 | 100.0 |
+| softmax 8x128 | **1.2** | 27.1 | 16.2 | 12.2 | 638.8 | 30.8 |
+| gelu 100k | 77.9 | **68.1** | 135.6 | 246.1 | 887.5 | 214.7 |
+| rfft 1k | **2.1** | 4.6 | 21.6 | 43.5 | — | 49.8 |
+| cross_entropy | **2.6** | 43.7 | 25.0 | 673.5 | 3482.9 | 53.6 |
+| train step 64 | 808.9 | 1316.8 | **778.6** | 8907.3 | 26141.4 | 5078.6 |
+| matmul+bias+gelu 196x768x3072 | 1109.4 | **909.6** | — | 2435.3 | 1332.6 | 2177.8 |
+| add+layernorm 196x768 | 109.9 | **102.6** | — | 1277.7 | 1158.2 | 235.9 |
 
-Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 1.02x** (tied), **MLX 0.73x**, TensorFlow 0.54x, tinygrad 0.09x, JAX 0.67x. Peregrine wins 62 of 141 ops.
+Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.98x**, **MLX 0.75x**, TensorFlow 0.52x, tinygrad 0.09x, JAX 0.66x. Peregrine wins 67 of 141 ops.
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
@@ -236,8 +236,8 @@ Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 1.02x*
 | 512x384 | 1.95s | 1.55s | **1.44s** | 2.26s |
 | Weight load | **0.6s** | 0.6s | 0.6s | 1.6s |
 
-- **224**: Peregrine is **3% faster** on CPU (0.65s vs 0.67s), **22% faster** with GPU (0.53s)
-- **512**: Peregrine is **10% faster** on CPU (2.04s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
+- **224**: Peregrine is **4.5% faster** on CPU (0.64s vs 0.67s), **22% faster** with GPU (0.53s)
+- **512**: Peregrine is **13% faster** on CPU (1.97s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
 GPU mode (`--gpu`) keeps the entire attention pipeline on Metal — QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape all run as GPU kernels with no CPU round-trips. Pipeline mode (`--pipeline`) overlaps feat1 (GPU) and feat2 (CPU/AMX) decoder processing via `MTLSharedEvent` signaling — single-threaded, no `Send`/`Sync` needed.
