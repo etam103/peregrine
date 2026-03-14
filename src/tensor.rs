@@ -1271,6 +1271,26 @@ impl Tensor {
                 }
             }
         }
+        // Fast path: skip Op recording, Rc clones, and size assertion for inference
+        if !a.requires_grad && !b.requires_grad {
+            drop(a);
+            drop(b);
+            return Tensor(Rc::new(RefCell::new(TensorInner {
+                data,
+                shape: vec![m, n],
+                grad: None,
+                op: Op::None,
+                requires_grad: false,
+                #[cfg(feature = "metal")]
+                gpu_data: None,
+                #[cfg(feature = "metal")]
+                gpu_grad: None,
+                #[cfg(feature = "metal")]
+                gpu_dirty: false,
+            })));
+        }
+        drop(a);
+        drop(b);
         Tensor::from_op(data, vec![m, n], Op::MatMul(self.clone(), other.clone()))
     }
 

@@ -160,6 +160,7 @@ pub fn amx_sgemm(
 mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
+    #[ignore] // AMX is blocked on macOS 26 for userspace — test would SIGILL
     fn test_amx_sgemm_identity() {
         use super::amx_sgemm;
 
@@ -180,6 +181,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
+    #[ignore] // AMX is blocked on macOS 26 for userspace — test would SIGILL
     fn test_amx_sgemm_128() {
         use super::amx_sgemm;
 
