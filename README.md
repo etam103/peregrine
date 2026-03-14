@@ -55,7 +55,7 @@ pip install ./peregrine-py && python -c "import peregrine"  # Python bindings
 | **`peregrine::metal`** | Metal GPU backend — 108 compute shaders, 41 dispatch methods, fused op pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling, thermal-aware scheduling (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
-| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, 4.5% faster than PyTorch at 224 (0.64s vs 0.67s), 14% faster at 512 (1.95s vs 2.26s). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
+| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, matches PyTorch at 224 (0.69s vs 0.67s), 14% faster at 512 (1.95s vs 2.26s). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
 | **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
 | **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
 | **`peregrine::sched`** | Request scheduler for managed prefill/decode aggregation — `Priority` (Background/Normal/High), `ChunkedPrefiller`, dynamic chunk-size tuning with EMA latency tracking, `SchedulerAction`-based model-agnostic API. Supports multiple concurrent requests with priority-based interleaving |
@@ -218,31 +218,31 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | **5.7** | 5.9 | 19.9 | 94.0 | 417.4 | 79.8 |
-| matmul 512x512 | 222.2 | **141.8** | 166.7 | 689.8 | 444.5 | 536.2 |
-| add 100k | **12.7** | 42.2 | 28.9 | 48.1 | 188.5 | 36.9 |
-| mul 100k | **12.5** | 37.7 | 29.0 | 44.2 | 186.1 | 30.9 |
-| relu 100k | **8.8** | 39.3 | 24.9 | 41.8 | 341.5 | 97.5 |
-| softmax 8x128 | **1.3** | 32.8 | 15.9 | 11.5 | 633.1 | 30.9 |
-| gelu 100k | 77.7 | **73.8** | 135.6 | 243.9 | 847.8 | 211.7 |
-| rfft 1k | **2.0** | 4.5 | 23.3 | 44.1 | — | 60.8 |
-| cross_entropy | **2.6** | 39.2 | 23.8 | 622.6 | 3348.2 | 53.7 |
-| train step 64 | 818.1 | 1200.7 | **775.3** | 8619.5 | 22984.0 | 5055.2 |
-| matmul+bias+gelu 196x768x3072 | 1059.8 | **852.6** | — | 2356.8 | 1231.9 | 2115.6 |
-| add+layernorm 196x768 | 107.6 | **102.0** | — | 1212.0 | 1138.7 | 231.6 |
+| matmul 128x128 | **4.7** | 5.5 | 21.7 | 91.8 | 420.6 | 79.5 |
+| matmul 512x512 | **137.5** | 143.1 | 164.6 | 673.0 | 426.1 | 517.8 |
+| add 100k | **12.5** | 43.7 | 27.9 | 45.9 | 186.7 | 38.1 |
+| mul 100k | **12.5** | 44.3 | 28.0 | 45.5 | 191.5 | 27.3 |
+| relu 100k | **10.2** | 40.6 | 28.3 | 40.2 | 335.6 | 99.3 |
+| softmax 8x128 | **1.1** | 37.6 | 19.0 | 10.3 | 614.3 | 31.0 |
+| gelu 100k | 102.2 | **75.6** | 136.7 | 233.2 | 847.2 | 204.9 |
+| rfft 1k | **2.2** | 4.4 | 19.1 | 38.1 | — | 59.7 |
+| cross_entropy | **2.8** | 39.9 | 23.0 | 582.0 | 3399.0 | 51.9 |
+| train step 64 | 827.9 | 1249.5 | **768.9** | 7974.1 | 23270.2 | 5134.2 |
+| matmul+bias+gelu 196x768x3072 | 2406.1 | **924.7** | — | 2386.8 | 1257.7 | 2093.7 |
+| add+layernorm 196x768 | 112.3 | **104.1** | — | 1161.2 | 1137.8 | 237.9 |
 
-Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.54x** (46% faster), **MLX 0.40x**, TensorFlow 0.29x, tinygrad 0.05x, JAX 0.37x. Peregrine wins 100 of 141 ops.
+Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.52x** (48% faster), **MLX 0.38x**, TensorFlow 0.30x, tinygrad 0.05x, JAX 0.36x. Peregrine wins 102 of 141 ops.
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
 | Resolution | CPU | GPU | GPU+Pipeline | PyTorch CPU |
 |-----------|----:|----:|-------------:|------------:|
-| 224x224 | 0.64s | 0.53s | **0.54s** | 0.67s |
+| 224x224 | 0.69s | 0.53s | **0.54s** | 0.67s |
 | 512x384 | 1.95s | 1.55s | **1.44s** | 2.26s |
 | Weight load | **0.6s** | 0.6s | 0.6s | 1.6s |
 
-- **224**: Peregrine is **4.5% faster** on CPU (0.64s vs 0.67s), **22% faster** with GPU (0.53s)
-- **512**: Peregrine is **13% faster** on CPU (1.97s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
+- **224**: Peregrine CPU matches PyTorch (0.69s vs 0.67s), **22% faster** with GPU (0.53s)
+- **512**: Peregrine is **13% faster** on CPU (1.95s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
 - **NEON vectorized**: floor/ceil/round/sign 5-6x speedup, comparison ops 6-7x speedup via NEON intrinsics
 - **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
 
