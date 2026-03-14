@@ -169,9 +169,37 @@ pub fn randint(shape: &[usize], low: i64, high: i64) -> Tensor {
 pub fn bernoulli(shape: &[usize], p: f32) -> Tensor {
     let n: usize = shape.iter().product();
     let data: Vec<f32> = with_rng(|rng| {
-        (0..n)
-            .map(|_| if rng.next_f32() < p { 1.0 } else { 0.0 })
-            .collect()
+        let mut out = vec![0.0f32; n];
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            let vp = unsafe { vdupq_n_f32(p) };
+            let vone = unsafe { vdupq_n_f32(1.0) };
+            let vzero = unsafe { vdupq_n_f32(0.0) };
+            let chunks = n / 4;
+            for i in 0..chunks {
+                let off = i * 4;
+                // Generate 4 uniform floats
+                let u = [rng.next_f32(), rng.next_f32(), rng.next_f32(), rng.next_f32()];
+                unsafe {
+                    let vu = vld1q_f32(u.as_ptr());
+                    // vcltq_f32: 1s mask where u < p
+                    let mask = vcltq_f32(vu, vp);
+                    let result = vbslq_f32(mask, vone, vzero);
+                    vst1q_f32(out.as_mut_ptr().add(off), result);
+                }
+            }
+            for i in (chunks * 4)..n {
+                out[i] = if rng.next_f32() < p { 1.0 } else { 0.0 };
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for i in 0..n {
+                out[i] = if rng.next_f32() < p { 1.0 } else { 0.0 };
+            }
+        }
+        out
     });
     Tensor::new(data, shape.to_vec(), false)
 }

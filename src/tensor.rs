@@ -5296,22 +5296,30 @@ impl Tensor {
         let total = data.len();
         let mut out_data = vec![0.0f32; total];
         if inner_size == 1 {
-            // Optimized prefix sum for last-axis: sequential but with minimized overhead
+            // Optimized prefix sum for last-axis: sequential with unsafe to elide bounds checks
             for o in 0..outer_size {
                 let base = o * reduce_size;
                 let mut acc = 0.0f32;
-                // Unroll by 4 for ILP
-                let chunks = reduce_size / 4;
-                for c in 0..chunks {
-                    let off = base + c * 4;
-                    acc += data[off];     out_data[off] = acc;
-                    acc += data[off + 1]; out_data[off + 1] = acc;
-                    acc += data[off + 2]; out_data[off + 2] = acc;
-                    acc += data[off + 3]; out_data[off + 3] = acc;
-                }
-                for r in (chunks * 4)..reduce_size {
-                    acc += data[base + r];
-                    out_data[base + r] = acc;
+                // Unroll by 8 for better ILP on wide pipelines
+                let chunks8 = reduce_size / 8;
+                unsafe {
+                    let sp = data.as_ptr().add(base);
+                    let dp = out_data.as_mut_ptr().add(base);
+                    for c in 0..chunks8 {
+                        let off = c * 8;
+                        acc += *sp.add(off);     *dp.add(off) = acc;
+                        acc += *sp.add(off + 1); *dp.add(off + 1) = acc;
+                        acc += *sp.add(off + 2); *dp.add(off + 2) = acc;
+                        acc += *sp.add(off + 3); *dp.add(off + 3) = acc;
+                        acc += *sp.add(off + 4); *dp.add(off + 4) = acc;
+                        acc += *sp.add(off + 5); *dp.add(off + 5) = acc;
+                        acc += *sp.add(off + 6); *dp.add(off + 6) = acc;
+                        acc += *sp.add(off + 7); *dp.add(off + 7) = acc;
+                    }
+                    for r in (chunks8 * 8)..reduce_size {
+                        acc += *sp.add(r);
+                        *dp.add(r) = acc;
+                    }
                 }
             }
         } else {
@@ -6071,13 +6079,13 @@ impl Tensor {
         let batch: usize = shape[..shape.len() - 2].iter().product::<usize>().max(1);
         let mut data = inner.data.clone();
         for b in 0..batch {
+            let mat = b * rows * cols;
             for r in 0..rows {
-                for c in 0..cols {
-                    let idx = b * rows * cols + r * cols + c;
-                    // Keep if row >= col - k, i.e., col <= row + k
-                    if (c as i32) > (r as i32) + k {
-                        data[idx] = 0.0;
-                    }
+                let row_base = mat + r * cols;
+                // Keep cols 0..=min(r+k, cols-1), zero the rest
+                let keep = ((r as i32) + k + 1).max(0) as usize;
+                if keep < cols {
+                    data[row_base + keep..row_base + cols].fill(0.0);
                 }
             }
         }
@@ -6099,13 +6107,14 @@ impl Tensor {
         let batch: usize = shape[..shape.len() - 2].iter().product::<usize>().max(1);
         let mut data = inner.data.clone();
         for b in 0..batch {
+            let mat = b * rows * cols;
             for r in 0..rows {
-                for c in 0..cols {
-                    let idx = b * rows * cols + r * cols + c;
-                    // Keep if col - row >= k, zero otherwise
-                    if (c as i32) - (r as i32) < k {
-                        data[idx] = 0.0;
-                    }
+                let row_base = mat + r * cols;
+                // Zero cols 0..min(r+k, cols), keep the rest
+                let zero_end = ((r as i32) + k).max(0) as usize;
+                if zero_end > 0 {
+                    let end = zero_end.min(cols);
+                    data[row_base..row_base + end].fill(0.0);
                 }
             }
         }

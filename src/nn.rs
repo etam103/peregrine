@@ -372,6 +372,54 @@ pub fn kl_div_loss(input: &Tensor, target: &Tensor) -> Tensor {
 /// where cos_sim = dot(a, b) / (||a|| * ||b||).
 /// `a` and `b` must have the same shape.
 pub fn cosine_similarity_loss(a: &Tensor, b: &Tensor) -> Tensor {
+    // Fused single-pass path when no gradients are needed
+    if !a.requires_grad() && !b.requires_grad() {
+        let ad = a.data();
+        let bd = b.data();
+        let n = ad.len();
+        debug_assert_eq!(n, bd.len());
+        let mut dot = 0.0f64;
+        let mut sum_a2 = 0.0f64;
+        let mut sum_b2 = 0.0f64;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            let chunks = n / 4;
+            let mut vdot = unsafe { vdupq_n_f32(0.0) };
+            let mut va2 = unsafe { vdupq_n_f32(0.0) };
+            let mut vb2 = unsafe { vdupq_n_f32(0.0) };
+            for i in 0..chunks {
+                let off = i * 4;
+                unsafe {
+                    let va = vld1q_f32(ad.as_ptr().add(off));
+                    let vb = vld1q_f32(bd.as_ptr().add(off));
+                    vdot = vfmaq_f32(vdot, va, vb);
+                    va2 = vfmaq_f32(va2, va, va);
+                    vb2 = vfmaq_f32(vb2, vb, vb);
+                }
+            }
+            dot = unsafe { vaddvq_f32(vdot) } as f64;
+            sum_a2 = unsafe { vaddvq_f32(va2) } as f64;
+            sum_b2 = unsafe { vaddvq_f32(vb2) } as f64;
+            for i in (chunks * 4)..n {
+                dot += (ad[i] * bd[i]) as f64;
+                sum_a2 += (ad[i] * ad[i]) as f64;
+                sum_b2 += (bd[i] * bd[i]) as f64;
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for i in 0..n {
+                dot += (ad[i] * bd[i]) as f64;
+                sum_a2 += (ad[i] * ad[i]) as f64;
+                sum_b2 += (bd[i] * bd[i]) as f64;
+            }
+        }
+        let cos_sim = dot / ((sum_a2.sqrt() * sum_b2.sqrt()) + 1e-8);
+        return Tensor::new(vec![1.0 - cos_sim as f32], vec![1], false);
+    }
+
+    // Autograd-compatible path
     // dot = sum(a * b), norm_a = sqrt(sum(a^2)), norm_b = sqrt(sum(b^2))
     let dot = a.mul(b).sum();
     let norm_a = a.square().sum().sqrt();
@@ -1273,6 +1321,108 @@ impl GroupNorm {
         let spatial: usize = shape[2..].iter().product();
         let cpg = channels / self.num_groups; // channels per group
 
+        // Fused inference path: single-pass mean+var with NEON, no autograd overhead
+        if !x.requires_grad() && !self.weight.requires_grad() {
+            let data = x.data();
+            let w = self.weight.data();
+            let b = self.bias.data();
+            let total = data.len();
+            let mut out = crate::cpu_pool::pool_get(total);
+
+            for n in 0..batch {
+                for g in 0..self.num_groups {
+                    let group_size = cpg * spatial;
+                    let inv_group = 1.0 / group_size as f32;
+
+                    // Single-pass mean + variance with NEON
+                    let mut sum = 0.0f64;
+                    let mut sum_sq = 0.0f64;
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        use std::arch::aarch64::*;
+                        for c_in_g in 0..cpg {
+                            let c = g * cpg + c_in_g;
+                            let base = n * channels * spatial + c * spatial;
+                            let ptr = data[base..].as_ptr();
+                            let chunks4 = spatial / 4;
+                            let mut vsum = unsafe { vdupq_n_f32(0.0) };
+                            let mut vsum_sq = unsafe { vdupq_n_f32(0.0) };
+                            for i in 0..chunks4 {
+                                unsafe {
+                                    let v = vld1q_f32(ptr.add(i * 4));
+                                    vsum = vaddq_f32(vsum, v);
+                                    vsum_sq = vfmaq_f32(vsum_sq, v, v);
+                                }
+                            }
+                            sum += unsafe { vaddvq_f32(vsum) } as f64;
+                            sum_sq += unsafe { vaddvq_f32(vsum_sq) } as f64;
+                            for s in (chunks4 * 4)..spatial {
+                                let v = data[base + s] as f64;
+                                sum += v;
+                                sum_sq += v * v;
+                            }
+                        }
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        for c_in_g in 0..cpg {
+                            let c = g * cpg + c_in_g;
+                            let base = n * channels * spatial + c * spatial;
+                            for s in 0..spatial {
+                                let v = data[base + s] as f64;
+                                sum += v;
+                                sum_sq += v * v;
+                            }
+                        }
+                    }
+                    let mean = (sum * inv_group as f64) as f32;
+                    let var = ((sum_sq * inv_group as f64) - (mean as f64 * mean as f64)) as f32;
+                    let inv_std = 1.0 / (var + self.eps).sqrt();
+
+                    // Normalize with fused scale/bias using NEON
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        use std::arch::aarch64::*;
+                        for c_in_g in 0..cpg {
+                            let c = g * cpg + c_in_g;
+                            let fused_scale = inv_std * w[c];
+                            let fused_bias = b[c] - mean * fused_scale;
+                            let base = n * channels * spatial + c * spatial;
+                            let sp = data[base..].as_ptr();
+                            let dp = out[base..].as_mut_ptr();
+                            let chunks4 = spatial / 4;
+                            let vs = unsafe { vdupq_n_f32(fused_scale) };
+                            let vb = unsafe { vdupq_n_f32(fused_bias) };
+                            for i in 0..chunks4 {
+                                unsafe {
+                                    let v = vld1q_f32(sp.add(i * 4));
+                                    let r = vfmaq_f32(vb, v, vs);
+                                    vst1q_f32(dp.add(i * 4), r);
+                                }
+                            }
+                            for s in (chunks4 * 4)..spatial {
+                                out[base + s] = data[base + s] * fused_scale + fused_bias;
+                            }
+                        }
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        for c_in_g in 0..cpg {
+                            let c = g * cpg + c_in_g;
+                            let fused_scale = inv_std * w[c];
+                            let fused_bias = b[c] - mean * fused_scale;
+                            let base = n * channels * spatial + c * spatial;
+                            for s in 0..spatial {
+                                out[base + s] = data[base + s] * fused_scale + fused_bias;
+                            }
+                        }
+                    }
+                }
+            }
+            return Tensor::new(out, shape, false);
+        }
+
+        // Autograd-compatible path
         let data = x.data();
         let w = self.weight.data();
         let b = self.bias.data();
@@ -1284,7 +1434,6 @@ impl GroupNorm {
                 let group_size = cpg * spatial;
                 let inv_group = 1.0 / group_size as f32;
 
-                // Fused single-pass mean + variance (Welford-like two-sum approach)
                 let mut sum = 0.0f64;
                 let mut sum_sq = 0.0f64;
                 for c_in_g in 0..cpg {
@@ -1300,7 +1449,6 @@ impl GroupNorm {
                 let var = ((sum_sq * inv_group as f64) - (mean as f64 * mean as f64)) as f32;
                 let inv_std = 1.0 / (var + self.eps).sqrt();
 
-                // Normalize with fused scale/bias: fused_scale = inv_std * w[c], fused_bias = b[c] - mean * fused_scale
                 for c_in_g in 0..cpg {
                     let c = g * cpg + c_in_g;
                     let fused_scale = inv_std * w[c];
