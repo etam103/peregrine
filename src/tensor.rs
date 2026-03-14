@@ -5723,9 +5723,22 @@ impl Tensor {
             let inner = self.0.borrow();
             let len = inner.data.len();
             let mut data = pool_get(len);
-            #[cfg(target_arch = "aarch64")]
-            simd_kernels::vec_softplus_f32(&inner.data, &mut data);
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_os = "macos")]
+            {
+                // softplus(x) = log(1 + exp(x)) = log1p(exp(x))
+                // Use Accelerate: vvexpf then vvlog1pf
+                let n = len as i32;
+                unsafe {
+                    vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n);
+                    vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n);
+                }
+                // Clamp: for x > 20, softplus ≈ x; for x < -20, softplus ≈ 0
+                for i in 0..len {
+                    if inner.data[i] > 20.0 { data[i] = inner.data[i]; }
+                    else if inner.data[i] < -20.0 { data[i] = 0.0; }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
             for i in 0..len {
                 let x = inner.data[i];
                 data[i] = if x > 20.0 { x } else if x < -20.0 { 0.0 } else { (1.0 + x.exp()).ln() };
@@ -5738,14 +5751,41 @@ impl Tensor {
 
     /// Mish: x * tanh(softplus(x)).
     pub fn mish(&self) -> Tensor {
-        #[cfg(target_arch = "aarch64")]
         if !self.requires_grad() {
             #[cfg(feature = "metal")]
             self.sync_gpu_to_cpu();
             let inner = self.0.borrow();
             let len = inner.data.len();
             let mut data = pool_get(len);
-            simd_kernels::vec_mish_f32(&inner.data, &mut data);
+            #[cfg(target_os = "macos")]
+            {
+                // softplus = log1p(exp(x))
+                let n = len as i32;
+                unsafe {
+                    vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n);
+                    vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n);
+                    // tanh(softplus) via Accelerate
+                    vvtanhf(data.as_mut_ptr(), data.as_ptr(), &n);
+                }
+                // x * tanh(softplus(x)), with clamp for large |x|
+                for i in 0..len {
+                    let x = inner.data[i];
+                    if x > 20.0 { data[i] = x; }
+                    else if x < -20.0 { data[i] = 0.0; }
+                    else { data[i] = x * data[i]; }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_mish_f32(&inner.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
+                for i in 0..len {
+                    let x = inner.data[i];
+                    let sp = if x > 20.0 { x } else if x < -20.0 { 0.0 } else { (1.0 + x.exp()).ln() };
+                    data[i] = x * sp.tanh();
+                }
+            }
             return Tensor::from_op(data, inner.shape.clone(), Op::None);
         }
         self.mul(&self.softplus(1.0).tanh())
