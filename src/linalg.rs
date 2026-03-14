@@ -193,7 +193,8 @@ pub fn cholesky(a: &Tensor) -> Tensor {
     let n = shape[0] as i32;
 
     let mut data = a.data();
-    transpose_buf(&mut data, n as usize, n as usize);
+    // Symmetric: A = A^T, so skip input transpose
+    // But use uplo='L' to tell LAPACK to read lower triangle of column-major = upper of row-major
 
     let uplo = b'L';
     let mut info = 0i32;
@@ -203,13 +204,14 @@ pub fn cholesky(a: &Tensor) -> Tensor {
     }
     assert!(info == 0, "LAPACK spotrf failed with info={} (matrix not positive definite?)", info);
 
-    // Zero out upper triangle (LAPACK only writes the lower part)
+    // Zero upper triangle in column-major (= lower in row-major that LAPACK didn't touch)
     for i in 0..n as usize {
         for j in (i + 1)..n as usize {
-            data[j * n as usize + i] = 0.0; // column-major upper
+            data[j * n as usize + i] = 0.0;
         }
     }
 
+    // Transpose result from column-major to row-major
     transpose_buf(&mut data, n as usize, n as usize);
     Tensor::new(data, shape.to_vec(), false)
 }
@@ -381,7 +383,7 @@ pub fn eigh(a: &Tensor) -> (Tensor, Tensor) {
     let n = shape[0] as i32;
 
     let mut a_data = a.data();
-    transpose_buf(&mut a_data, n as usize, n as usize);
+    // Skip input transpose: symmetric matrix A = A^T, so row-major = column-major
 
     let mut w = vec![0.0f32; n as usize];
     let mut info = 0i32;
@@ -490,7 +492,7 @@ pub fn det(a: &Tensor) -> Tensor {
     {
         let n = shape[0] as i32;
         let mut data = a.data();
-        transpose_buf(&mut data, n as usize, n as usize);
+        // Skip transpose: det(A) = det(A^T), so row-major = column-major for det
 
         let mut ipiv = vec![0i32; n as usize];
         let mut info = 0i32;
