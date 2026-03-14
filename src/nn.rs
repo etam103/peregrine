@@ -871,22 +871,30 @@ impl LSTM {
             let mut output_data = pool_get(seq_len * hs);
             let mut gates = vec![0.0f32; 4 * hs];
 
+            // Batched input projection: x[seq_len, is] @ W_ih[is, 4*hs] = ih_all[seq_len, 4*hs]
+            // This reduces sgemm calls from 2*seq_len to 1 + seq_len
+            #[cfg(target_os = "macos")]
+            let ih_all = {
+                let mut buf = vec![0.0f32; seq_len * 4 * hs];
+                crate::tensor::sgemm(false, false, seq_len, 4*hs, is, 1.0, &x_data, is, &wih, 4*hs, 0.0, &mut buf, 4*hs);
+                buf
+            };
+
             for t in 0..seq_len {
-                let x_t = &x_data[t * is..(t + 1) * is];
-                // gates = x_t @ W_ih + b_ih + h @ W_hh + b_hh
+                // gates = ih_all[t] + b_ih + h @ W_hh + b_hh
                 #[cfg(target_os = "macos")]
                 {
-                    // x_t[1,is] @ W_ih[is,4hs] → gates[1,4hs]
-                    crate::tensor::sgemm(false, false, 1, 4*hs, is, 1.0, x_t, is, &wih, 4*hs, 0.0, &mut gates, 4*hs);
-                    // + h[1,hs] @ W_hh[hs,4hs]
+                    let ih_t = &ih_all[t * 4 * hs..(t + 1) * 4 * hs];
+                    // h[1,hs] @ W_hh[hs,4hs]
                     let mut hh_gates = vec![0.0f32; 4 * hs];
                     crate::tensor::sgemm(false, false, 1, 4*hs, hs, 1.0, &h_data, hs, &whh, 4*hs, 0.0, &mut hh_gates, 4*hs);
                     for j in 0..4*hs {
-                        gates[j] += bih[j] + bhh[j] + hh_gates[j];
+                        gates[j] = ih_t[j] + bih[j] + bhh[j] + hh_gates[j];
                     }
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
+                    let x_t = &x_data[t * is..(t + 1) * is];
                     for j in 0..4*hs {
                         let mut v = bih[j] + bhh[j];
                         for p in 0..is { v += x_t[p] * wih[p * 4 * hs + j]; }
