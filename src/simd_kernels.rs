@@ -1408,29 +1408,46 @@ pub fn vec_where_f32(cond: &[f32], x: &[f32], y: &[f32], out: &mut [f32]) {
 #[inline]
 pub fn vec_sum_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_size: usize, inner_size: usize) {
     let stride = reduce_size * inner_size;
-    for o in 0..outer_size {
-        let base = o * stride;
-        let out_base = o * inner_size;
-        // Process inner_size in chunks of 4
-        let chunks = inner_size / 4;
-        unsafe {
-            for c in 0..chunks {
-                let inner_off = c * 4;
-                let mut acc = vdupq_n_f32(0.0);
-                for r in 0..reduce_size {
-                    let src = base + r * inner_size + inner_off;
-                    acc = vaddq_f32(acc, vld1q_f32(data.as_ptr().add(src)));
-                }
-                vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
-            }
-        }
-        // Scalar tail
-        for i in (chunks * 4)..inner_size {
+    if inner_size == 1 {
+        // Reducing last axis: vectorize along reduce_size
+        let chunks = reduce_size / 4;
+        for o in 0..outer_size {
+            let base = o * stride;
             let mut acc = 0.0f32;
-            for r in 0..reduce_size {
-                acc += data[base + r * inner_size + i];
+            unsafe {
+                let mut vacc = vdupq_n_f32(0.0);
+                for c in 0..chunks {
+                    vacc = vaddq_f32(vacc, vld1q_f32(data.as_ptr().add(base + c * 4)));
+                }
+                acc = vaddvq_f32(vacc);
             }
-            out[out_base + i] = acc;
+            for r in (chunks * 4)..reduce_size {
+                acc += data[base + r];
+            }
+            out[o] = acc;
+        }
+    } else {
+        for o in 0..outer_size {
+            let base = o * stride;
+            let out_base = o * inner_size;
+            let chunks = inner_size / 4;
+            unsafe {
+                for c in 0..chunks {
+                    let inner_off = c * 4;
+                    let mut acc = vdupq_n_f32(0.0);
+                    for r in 0..reduce_size {
+                        acc = vaddq_f32(acc, vld1q_f32(data.as_ptr().add(base + r * inner_size + inner_off)));
+                    }
+                    vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
+                }
+            }
+            for i in (chunks * 4)..inner_size {
+                let mut acc = 0.0f32;
+                for r in 0..reduce_size {
+                    acc += data[base + r * inner_size + i];
+                }
+                out[out_base + i] = acc;
+            }
         }
     }
 }
@@ -1440,28 +1457,47 @@ pub fn vec_sum_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_siz
 #[inline]
 pub fn vec_max_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_size: usize, inner_size: usize) {
     let stride = reduce_size * inner_size;
-    for o in 0..outer_size {
-        let base = o * stride;
-        let out_base = o * inner_size;
-        let chunks = inner_size / 4;
-        unsafe {
-            for c in 0..chunks {
-                let inner_off = c * 4;
-                let mut acc = vdupq_n_f32(f32::NEG_INFINITY);
-                for r in 0..reduce_size {
-                    let src = base + r * inner_size + inner_off;
-                    acc = vmaxq_f32(acc, vld1q_f32(data.as_ptr().add(src)));
-                }
-                vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
-            }
-        }
-        for i in (chunks * 4)..inner_size {
+    if inner_size == 1 {
+        let chunks = reduce_size / 4;
+        for o in 0..outer_size {
+            let base = o * stride;
             let mut acc = f32::NEG_INFINITY;
-            for r in 0..reduce_size {
-                let val = data[base + r * inner_size + i];
-                if val > acc { acc = val; }
+            unsafe {
+                let mut vacc = vdupq_n_f32(f32::NEG_INFINITY);
+                for c in 0..chunks {
+                    vacc = vmaxq_f32(vacc, vld1q_f32(data.as_ptr().add(base + c * 4)));
+                }
+                acc = vmaxvq_f32(vacc);
             }
-            out[out_base + i] = acc;
+            for r in (chunks * 4)..reduce_size {
+                let v = data[base + r];
+                if v > acc { acc = v; }
+            }
+            out[o] = acc;
+        }
+    } else {
+        for o in 0..outer_size {
+            let base = o * stride;
+            let out_base = o * inner_size;
+            let chunks = inner_size / 4;
+            unsafe {
+                for c in 0..chunks {
+                    let inner_off = c * 4;
+                    let mut acc = vdupq_n_f32(f32::NEG_INFINITY);
+                    for r in 0..reduce_size {
+                        acc = vmaxq_f32(acc, vld1q_f32(data.as_ptr().add(base + r * inner_size + inner_off)));
+                    }
+                    vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
+                }
+            }
+            for i in (chunks * 4)..inner_size {
+                let mut acc = f32::NEG_INFINITY;
+                for r in 0..reduce_size {
+                    let v = data[base + r * inner_size + i];
+                    if v > acc { acc = v; }
+                }
+                out[out_base + i] = acc;
+            }
         }
     }
 }
@@ -1471,28 +1507,47 @@ pub fn vec_max_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_siz
 #[inline]
 pub fn vec_min_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_size: usize, inner_size: usize) {
     let stride = reduce_size * inner_size;
-    for o in 0..outer_size {
-        let base = o * stride;
-        let out_base = o * inner_size;
-        let chunks = inner_size / 4;
-        unsafe {
-            for c in 0..chunks {
-                let inner_off = c * 4;
-                let mut acc = vdupq_n_f32(f32::INFINITY);
-                for r in 0..reduce_size {
-                    let src = base + r * inner_size + inner_off;
-                    acc = vminq_f32(acc, vld1q_f32(data.as_ptr().add(src)));
-                }
-                vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
-            }
-        }
-        for i in (chunks * 4)..inner_size {
+    if inner_size == 1 {
+        let chunks = reduce_size / 4;
+        for o in 0..outer_size {
+            let base = o * stride;
             let mut acc = f32::INFINITY;
-            for r in 0..reduce_size {
-                let val = data[base + r * inner_size + i];
-                if val < acc { acc = val; }
+            unsafe {
+                let mut vacc = vdupq_n_f32(f32::INFINITY);
+                for c in 0..chunks {
+                    vacc = vminq_f32(vacc, vld1q_f32(data.as_ptr().add(base + c * 4)));
+                }
+                acc = vminvq_f32(vacc);
             }
-            out[out_base + i] = acc;
+            for r in (chunks * 4)..reduce_size {
+                let v = data[base + r];
+                if v < acc { acc = v; }
+            }
+            out[o] = acc;
+        }
+    } else {
+        for o in 0..outer_size {
+            let base = o * stride;
+            let out_base = o * inner_size;
+            let chunks = inner_size / 4;
+            unsafe {
+                for c in 0..chunks {
+                    let inner_off = c * 4;
+                    let mut acc = vdupq_n_f32(f32::INFINITY);
+                    for r in 0..reduce_size {
+                        acc = vminq_f32(acc, vld1q_f32(data.as_ptr().add(base + r * inner_size + inner_off)));
+                    }
+                    vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
+                }
+            }
+            for i in (chunks * 4)..inner_size {
+                let mut acc = f32::INFINITY;
+                for r in 0..reduce_size {
+                    let v = data[base + r * inner_size + i];
+                    if v < acc { acc = v; }
+                }
+                out[out_base + i] = acc;
+            }
         }
     }
 }
@@ -1502,27 +1557,45 @@ pub fn vec_min_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_siz
 #[inline]
 pub fn vec_prod_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_size: usize, inner_size: usize) {
     let stride = reduce_size * inner_size;
-    for o in 0..outer_size {
-        let base = o * stride;
-        let out_base = o * inner_size;
-        let chunks = inner_size / 4;
-        unsafe {
-            for c in 0..chunks {
-                let inner_off = c * 4;
-                let mut acc = vdupq_n_f32(1.0);
-                for r in 0..reduce_size {
-                    let src = base + r * inner_size + inner_off;
-                    acc = vmulq_f32(acc, vld1q_f32(data.as_ptr().add(src)));
+    if inner_size == 1 {
+        let chunks = reduce_size / 4;
+        for o in 0..outer_size {
+            let base = o * stride;
+            unsafe {
+                let mut vacc = vdupq_n_f32(1.0);
+                for c in 0..chunks {
+                    vacc = vmulq_f32(vacc, vld1q_f32(data.as_ptr().add(base + c * 4)));
                 }
-                vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
+                let mut buf = [0.0f32; 4];
+                vst1q_f32(buf.as_mut_ptr(), vacc);
+                out[o] = buf[0] * buf[1] * buf[2] * buf[3];
+            }
+            for r in (chunks * 4)..reduce_size {
+                out[o] *= data[base + r];
             }
         }
-        for i in (chunks * 4)..inner_size {
-            let mut acc = 1.0f32;
-            for r in 0..reduce_size {
-                acc *= data[base + r * inner_size + i];
+    } else {
+        for o in 0..outer_size {
+            let base = o * stride;
+            let out_base = o * inner_size;
+            let chunks = inner_size / 4;
+            unsafe {
+                for c in 0..chunks {
+                    let inner_off = c * 4;
+                    let mut acc = vdupq_n_f32(1.0);
+                    for r in 0..reduce_size {
+                        acc = vmulq_f32(acc, vld1q_f32(data.as_ptr().add(base + r * inner_size + inner_off)));
+                    }
+                    vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
+                }
             }
-            out[out_base + i] = acc;
+            for i in (chunks * 4)..inner_size {
+                let mut acc = 1.0f32;
+                for r in 0..reduce_size {
+                    acc *= data[base + r * inner_size + i];
+                }
+                out[out_base + i] = acc;
+            }
         }
     }
 }
