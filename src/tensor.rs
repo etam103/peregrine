@@ -3744,10 +3744,18 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         } else {
             let mut data = pool_get(len);
-            #[cfg(target_arch = "aarch64")]
-            simd_kernels::vec_exp_f32(&inner.data, &mut data);
-            #[cfg(not(target_arch = "aarch64"))]
-            for i in 0..len { data[i] = inner.data[i].exp(); }
+            #[cfg(target_os = "macos")]
+            {
+                let n = len as i32;
+                unsafe { vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n); }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_exp_f32(&inner.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
+                for i in 0..len { data[i] = inner.data[i].exp(); }
+            }
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         }
     }
@@ -5181,14 +5189,36 @@ impl Tensor {
         self.sync_gpu_to_cpu();
 
         let data = &self.0.borrow().data;
-        let mut out_data = vec![0.0f32; data.len()];
-        for o in 0..outer_size {
-            for i in 0..inner_size {
+        let total = data.len();
+        let mut out_data = vec![0.0f32; total];
+        if inner_size == 1 {
+            // Optimized prefix sum for last-axis: sequential but with minimized overhead
+            for o in 0..outer_size {
+                let base = o * reduce_size;
                 let mut acc = 0.0f32;
-                for r in 0..reduce_size {
-                    let pos = o * reduce_size * inner_size + r * inner_size + i;
-                    acc += data[pos];
-                    out_data[pos] = acc;
+                // Unroll by 4 for ILP
+                let chunks = reduce_size / 4;
+                for c in 0..chunks {
+                    let off = base + c * 4;
+                    acc += data[off];     out_data[off] = acc;
+                    acc += data[off + 1]; out_data[off + 1] = acc;
+                    acc += data[off + 2]; out_data[off + 2] = acc;
+                    acc += data[off + 3]; out_data[off + 3] = acc;
+                }
+                for r in (chunks * 4)..reduce_size {
+                    acc += data[base + r];
+                    out_data[base + r] = acc;
+                }
+            }
+        } else {
+            for o in 0..outer_size {
+                for i in 0..inner_size {
+                    let mut acc = 0.0f32;
+                    for r in 0..reduce_size {
+                        let pos = o * reduce_size * inner_size + r * inner_size + i;
+                        acc += data[pos];
+                        out_data[pos] = acc;
+                    }
                 }
             }
         }
@@ -5316,16 +5346,53 @@ impl Tensor {
 
         let data = &self.0.borrow().data;
         let mut out_data = vec![0.0f32; out_len];
+        #[cfg(target_arch = "aarch64")]
+        if inner_size == 1 {
+            // Two-pass: NEON max, then scan for index
+            use std::arch::aarch64::*;
+            let chunks = reduce_size / 4;
+            for o in 0..outer_size {
+                let base = o * reduce_size;
+                let mut max_val;
+                unsafe {
+                    let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
+                    for c in 0..chunks {
+                        vmax = vmaxq_f32(vmax, vld1q_f32(data.as_ptr().add(base + c * 4)));
+                    }
+                    max_val = vmaxvq_f32(vmax);
+                }
+                for r in (chunks * 4)..reduce_size {
+                    if data[base + r] > max_val { max_val = data[base + r]; }
+                }
+                // Scan for first occurrence of max
+                let mut best_r = 0usize;
+                for r in 0..reduce_size {
+                    if data[base + r] == max_val { best_r = r; break; }
+                }
+                out_data[o] = best_r as f32;
+            }
+        } else {
+            #[cfg(target_arch = "aarch64")]
+            for o in 0..outer_size {
+                for i in 0..inner_size {
+                    let mut best = f32::NEG_INFINITY;
+                    let mut best_r = 0usize;
+                    for r in 0..reduce_size {
+                        let val = data[o * reduce_size * inner_size + r * inner_size + i];
+                        if val > best { best = val; best_r = r; }
+                    }
+                    out_data[o * inner_size + i] = best_r as f32;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         for o in 0..outer_size {
             for i in 0..inner_size {
                 let mut best = f32::NEG_INFINITY;
                 let mut best_r = 0usize;
                 for r in 0..reduce_size {
                     let val = data[o * reduce_size * inner_size + r * inner_size + i];
-                    if val > best {
-                        best = val;
-                        best_r = r;
-                    }
+                    if val > best { best = val; best_r = r; }
                 }
                 out_data[o * inner_size + i] = best_r as f32;
             }
