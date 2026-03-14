@@ -918,18 +918,18 @@ impl LSTM {
                             let vg = vld1q_f32(gates.as_ptr().add(2 * hs + off));
                             let vo = vld1q_f32(gates.as_ptr().add(3 * hs + off));
                             // Sigmoid: 1 / (1 + exp(-x))
-                            let ig = crate::simd_kernels::fast_recip_f32x4(vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vi))));
-                            let fg = crate::simd_kernels::fast_recip_f32x4(vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vf))));
-                            let og = crate::simd_kernels::fast_recip_f32x4(vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vo))));
+                            let ig = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vi))));
+                            let fg = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vf))));
+                            let og = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vo))));
                             // Tanh(g) via 2*sigmoid(2g)-1
-                            let sig_2g = crate::simd_kernels::fast_recip_f32x4(vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vmulq_f32(two, vg)))));
+                            let sig_2g = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vmulq_f32(two, vg)))));
                             let gg = vsubq_f32(vmulq_f32(two, sig_2g), one);
                             // c = f*c + i*g
                             let vc = vld1q_f32(c_data.as_ptr().add(off));
                             let new_c = vaddq_f32(vmulq_f32(fg, vc), vmulq_f32(ig, gg));
                             vst1q_f32(c_data.as_mut_ptr().add(off), new_c);
                             // h = o * tanh(c)
-                            let sig_2c = crate::simd_kernels::fast_recip_f32x4(vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vmulq_f32(two, new_c)))));
+                            let sig_2c = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vmulq_f32(two, new_c)))));
                             let tanh_c = vsubq_f32(vmulq_f32(two, sig_2c), one);
                             vst1q_f32(h_data.as_mut_ptr().add(off), vmulq_f32(og, tanh_c));
                         }

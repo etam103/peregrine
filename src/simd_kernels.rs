@@ -385,7 +385,7 @@ pub fn vec_sigmoid_f32(a: &[f32], out: &mut [f32]) {
             let neg_x = vnegq_f32(vx);
             let exp_neg_x = fast_exp_f32x4(neg_x);
             let denom = vaddq_f32(one, exp_neg_x);
-            vst1q_f32(out.as_mut_ptr().add(off), fast_recip_f32x4(denom));
+            vst1q_f32(out.as_mut_ptr().add(off), vdivq_f32(one, denom));
         }
     }
     for i in (chunks * 4)..len {
@@ -443,7 +443,7 @@ pub fn vec_gelu_f32(a: &[f32], out: &mut [f32]) {
             let two_inner = vmulq_f32(two, inner);
             let neg_2inner = vnegq_f32(two_inner);
             let exp_neg = fast_exp_f32x4(neg_2inner);
-            let sig = fast_recip_f32x4(vaddq_f32(one, exp_neg));
+            let sig = vdivq_f32(one, vaddq_f32(one, exp_neg));
             let tanh_val = vsubq_f32(vmulq_f32(two, sig), one);
             let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_val)));
             vst1q_f32(out.as_mut_ptr().add(off), result);
@@ -758,7 +758,7 @@ pub fn vec_silu_f32(a: &[f32], out: &mut [f32]) {
             let vx = vld1q_f32(a.as_ptr().add(off));
             let neg_x = vnegq_f32(vx);
             let exp_neg_x = fast_exp_f32x4(neg_x);
-            let sigmoid = fast_recip_f32x4(vaddq_f32(one, exp_neg_x));
+            let sigmoid = vdivq_f32(one, vaddq_f32(one, exp_neg_x));
             vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vx, sigmoid));
         }
     }
@@ -1372,7 +1372,7 @@ pub fn vec_erf_f32(a: &[f32], out: &mut [f32]) {
             let vx = vld1q_f32(a.as_ptr().add(off));
             let abs_x = vabsq_f32(vx);
             // t = 1 / (1 + p * |x|)
-            let t = fast_recip_f32x4(vmlaq_f32(one, p, abs_x));
+            let t = vdivq_f32(one, vmlaq_f32(one, p, abs_x));
             // Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t
             let poly = vmulq_f32(
                 vmlaq_f32(a1,

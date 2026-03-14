@@ -1561,8 +1561,70 @@ impl Tensor {
             }
         }
 
-        // CPU fallback: unfused (composed ops with NEON kernels are faster)
-        self.matmul(weight).add_bias(bias).relu()
+        // CPU fused: pre-fill bias + sgemm(beta=1) + in-place relu (1 alloc, linear passes)
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); weight.sync_gpu_to_cpu(); bias.sync_gpu_to_cpu(); }
+        let a_inner = self.0.borrow();
+        let w_inner = weight.0.borrow();
+        let b_inner = bias.0.borrow();
+        let m = a_inner.shape[0];
+        let k = a_inner.shape[1];
+        let n = w_inner.shape[1];
+        let mut out_data = pool_get(m * n);
+
+        // Step 1: pre-fill output with bias (replicated across M rows)
+        for row in 0..m {
+            out_data[row * n..(row + 1) * n].copy_from_slice(&b_inner.data[..n]);
+        }
+
+        // Step 2: matmul via cblas_sgemm with beta=1.0 (accumulate onto pre-filled bias)
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                m as i32, n as i32, k as i32,
+                1.0,
+                a_inner.data.as_ptr(), k as i32,
+                w_inner.data.as_ptr(), n as i32,
+                1.0,
+                out_data.as_mut_ptr(), n as i32,
+            );
+        }
+
+        // Step 3: in-place relu over entire buffer linearly (cache-friendly)
+        let total = m * n;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            unsafe {
+                let zero = vdupq_n_f32(0.0);
+                let chunks = total / 4;
+                for c in 0..chunks {
+                    let off = c * 4;
+                    let ptr = out_data.as_mut_ptr().add(off);
+                    vst1q_f32(ptr, vmaxq_f32(vld1q_f32(ptr), zero));
+                }
+                for i in (chunks * 4)..total {
+                    if out_data[i] < 0.0 { out_data[i] = 0.0; }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for i in 0..total {
+                if out_data[i] < 0.0 { out_data[i] = 0.0; }
+            }
+        }
+
+        let shape = vec![m, n];
+        let no_grad = !a_inner.requires_grad && !w_inner.requires_grad;
+        drop(a_inner);
+        drop(w_inner);
+        drop(b_inner);
+        if no_grad {
+            Tensor::from_data(out_data, shape)
+        } else {
+            Tensor::from_op(out_data, shape, Op::MatMulBiasRelu(self.clone(), weight.clone(), bias.clone()))
+        }
     }
 
     /// Fused matmul + bias + gelu: self=[M,K] x weight=[K,N] + bias=[1,N] -> gelu -> [M,N].
@@ -1599,7 +1661,7 @@ impl Tensor {
             }
         }
 
-        // CPU fused: matmul then in-place bias+gelu (1 alloc, 2 passes)
+        // CPU fused: pre-fill bias + sgemm(beta=1) + in-place gelu (1 alloc, linear passes)
         #[cfg(feature = "metal")]
         { self.sync_gpu_to_cpu(); weight.sync_gpu_to_cpu(); bias.sync_gpu_to_cpu(); }
         let a_inner = self.0.borrow();
@@ -1610,7 +1672,12 @@ impl Tensor {
         let n = w_inner.shape[1];
         let mut out_data = pool_get(m * n);
 
-        // Step 1: matmul via cblas_sgemm
+        // Step 1: pre-fill output with bias (replicated across M rows)
+        for row in 0..m {
+            out_data[row * n..(row + 1) * n].copy_from_slice(&b_inner.data[..n]);
+        }
+
+        // Step 2: matmul via cblas_sgemm with beta=1.0 (accumulate onto pre-filled bias)
         unsafe {
             cblas_sgemm(
                 CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
@@ -1618,13 +1685,14 @@ impl Tensor {
                 1.0,
                 a_inner.data.as_ptr(), k as i32,
                 w_inner.data.as_ptr(), n as i32,
-                0.0,
+                1.0,
                 out_data.as_mut_ptr(), n as i32,
             );
         }
 
-        // Step 2: in-place bias + gelu
+        // Step 3: in-place gelu over entire buffer linearly (cache-friendly)
         let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+        let total = m * n;
         #[cfg(target_arch = "aarch64")]
         {
             use std::arch::aarch64::*;
@@ -1634,43 +1702,34 @@ impl Tensor {
                 let two = vdupq_n_f32(2.0);
                 let coeff = vdupq_n_f32(0.044715);
                 let s2p = vdupq_n_f32(sqrt_2_over_pi);
-                for row in 0..m {
-                    let base = row * n;
-                    let chunks = n / 4;
-                    for c in 0..chunks {
-                        let off = base + c * 4;
-                        let ptr = out_data.as_mut_ptr().add(off);
-                        // Add bias
-                        let vx = vaddq_f32(vld1q_f32(ptr), vld1q_f32(b_inner.data.as_ptr().add(c * 4)));
-                        // GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-                        let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
-                        let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
-                        // tanh via 2*sigmoid(2x)-1
-                        let two_inner = vmulq_f32(two, inner);
-                        let neg_2inner = vnegq_f32(two_inner);
-                        let exp_neg = simd_kernels::fast_exp_f32x4(neg_2inner);
-                        let sig = vdivq_f32(one, vaddq_f32(one, exp_neg));
-                        let tanh_val = vsubq_f32(vmulq_f32(two, sig), one);
-                        let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_val)));
-                        vst1q_f32(ptr, result);
-                    }
-                    for i in (chunks * 4)..n {
-                        let x = out_data[base + i] + b_inner.data[i];
-                        let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-                        out_data[base + i] = 0.5 * x * (1.0 + inner.tanh());
-                    }
+                let chunks = total / 4;
+                for c in 0..chunks {
+                    let off = c * 4;
+                    let ptr = out_data.as_mut_ptr().add(off);
+                    let vx = vld1q_f32(ptr);
+                    let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
+                    let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
+                    let two_inner = vmulq_f32(two, inner);
+                    let neg_2inner = vnegq_f32(two_inner);
+                    let exp_neg = simd_kernels::fast_exp_f32x4(neg_2inner);
+                    let sig = vdivq_f32(one, vaddq_f32(one, exp_neg));
+                    let tanh_val = vsubq_f32(vmulq_f32(two, sig), one);
+                    let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_val)));
+                    vst1q_f32(ptr, result);
+                }
+                for i in (chunks * 4)..total {
+                    let x = out_data[i];
+                    let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                    out_data[i] = 0.5 * x * (1.0 + inner.tanh());
                 }
             }
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            for row in 0..m {
-                let base = row * n;
-                for i in 0..n {
-                    let x = out_data[base + i] + b_inner.data[i];
-                    let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-                    out_data[base + i] = 0.5 * x * (1.0 + inner.tanh());
-                }
+            for i in 0..total {
+                let x = out_data[i];
+                let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                out_data[i] = 0.5 * x * (1.0 + inner.tanh());
             }
         }
         let shape = vec![m, n];
@@ -3360,28 +3419,10 @@ impl Tensor {
         if a.shape == b.shape {
             let len = a.data.len();
             let mut data = pool_get(len);
-            #[cfg(target_os = "macos")]
-            {
-                // logaddexp(a,b) = max(a,b) + log1p(exp(-|a-b|))
-                let n = len as i32;
-                for i in 0..len {
-                    data[i] = -(a.data[i] - b.data[i]).abs();
-                }
-                unsafe {
-                    vvexpf(data.as_mut_ptr(), data.as_ptr(), &n);
-                    vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n);
-                }
-                for i in 0..len {
-                    data[i] += a.data[i].max(b.data[i]);
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                #[cfg(target_arch = "aarch64")]
-                simd_kernels::vec_logaddexp_f32(&a.data, &b.data, &mut data);
-                #[cfg(not(target_arch = "aarch64"))]
-                for i in 0..len { data[i] = logaddexp_fn(a.data[i], b.data[i]); }
-            }
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_logaddexp_f32(&a.data, &b.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
+            for i in 0..len { data[i] = logaddexp_fn(a.data[i], b.data[i]); }
             Tensor::from_op(data, a.shape.clone(), Op::Logaddexp(self.clone(), other.clone()))
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, logaddexp_fn);
@@ -5976,7 +6017,6 @@ impl Tensor {
             let mut data = pool_get(len);
             #[cfg(target_os = "macos")]
             {
-                // softplus(x) = log1p(exp(x)) via Accelerate
                 let n = len as i32;
                 unsafe {
                     vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n);
@@ -5988,9 +6028,14 @@ impl Tensor {
                 }
             }
             #[cfg(not(target_os = "macos"))]
-            for i in 0..len {
-                let x = inner.data[i];
-                data[i] = if x > 20.0 { x } else if x < -20.0 { 0.0 } else { (1.0 + x.exp()).ln() };
+            {
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_softplus_f32(&inner.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
+                for i in 0..len {
+                    let x = inner.data[i];
+                    data[i] = if x > 20.0 { x } else if x < -20.0 { 0.0 } else { (1.0 + x.exp()).ln() };
+                }
             }
             return Tensor::from_op(data, inner.shape.clone(), Op::None);
         }

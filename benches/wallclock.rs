@@ -177,8 +177,8 @@ fn bench_mlp_forward() -> Vec<serde_json::Value> {
         let x = Tensor::randn(&[64, 784], false);
 
         let times = bench(|| {
-            let h1 = x.matmul(&w1).add_bias(&b1).relu();
-            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let h1 = x.matmul_bias_relu(&w1, &b1);
+            let h2 = h1.matmul_bias_relu(&w2, &b2);
             let out = h2.matmul(&w3).add_bias(&b3);
             black_box(out);
         }, ITERS_FAST);
@@ -196,8 +196,8 @@ fn bench_mlp_forward() -> Vec<serde_json::Value> {
         let x = Tensor::randn(&[256, 784], false);
 
         let times = bench(|| {
-            let h1 = x.matmul(&w1).add_bias(&b1).relu();
-            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let h1 = x.matmul_bias_relu(&w1, &b1);
+            let h2 = h1.matmul_bias_relu(&w2, &b2);
             let out = h2.matmul(&w3).add_bias(&b3);
             black_box(out);
         }, ITERS_SLOW);
@@ -893,8 +893,8 @@ fn bench_gpu_mlp_forward() -> Vec<serde_json::Value> {
         let x = gpu_tensor(&[64, 784], false);
 
         let times = bench(|| {
-            let h1 = x.matmul(&w1).add_bias(&b1).relu();
-            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let h1 = x.matmul_bias_relu(&w1, &b1);
+            let h2 = h1.matmul_bias_relu(&w2, &b2);
             let out = h2.matmul(&w3).add_bias(&b3);
             black_box(out);
         }, ITERS_FAST);
@@ -912,8 +912,8 @@ fn bench_gpu_mlp_forward() -> Vec<serde_json::Value> {
         let x = gpu_tensor(&[256, 784], false);
 
         let times = bench(|| {
-            let h1 = x.matmul(&w1).add_bias(&b1).relu();
-            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
+            let h1 = x.matmul_bias_relu(&w1, &b1);
+            let h2 = h1.matmul_bias_relu(&w2, &b2);
             let out = h2.matmul(&w3).add_bias(&b3);
             black_box(out);
         }, ITERS_SLOW);
