@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Peregrine Benchmarks</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.6; }
+.container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+h1 { color: #f0f6fc; font-size: 2em; margin-bottom: 4px; }
+h1 span { color: #58a6ff; }
+.subtitle { color: #8b949e; margin-bottom: 24px; }
+.cards { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px 20px; flex: 1; min-width: 150px; }
+.card .label { color: #8b949e; font-size: 0.85em; }
+.card .value { color: #f0f6fc; font-size: 1.8em; font-weight: 700; }
+.card .detail { color: #58a6ff; font-size: 0.85em; }
+.controls { display: flex; gap: 12px; margin-bottom: 16px; align-items: center; flex-wrap: wrap; }
+select, input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; font-size: 0.9em; }
+select:focus, input:focus { border-color: #58a6ff; outline: none; }
+table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
+th { background: #21262d; color: #f0f6fc; padding: 10px 12px; text-align: left; cursor: pointer; user-select: none; font-size: 0.85em; border-bottom: 1px solid #30363d; }
+th:hover { background: #30363d; }
+td { padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 0.9em; font-family: 'SF Mono', 'Fira Code', monospace; }
+tr:hover { background: #1c2128; }
+.win { color: #3fb950; font-weight: 600; }
+.cat-badge { display: inline-block; background: #21262d; border: 1px solid #30363d; border-radius: 12px; padding: 2px 8px; font-size: 0.75em; color: #8b949e; }
+.hw-info { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 0.85em; color: #8b949e; }
+.section { margin-top: 32px; }
+.section h2 { color: #f0f6fc; font-size: 1.3em; margin-bottom: 12px; border-bottom: 1px solid #21262d; padding-bottom: 8px; }
+code { background: #21262d; padding: 2px 6px; border-radius: 4px; font-size: 0.85em; }
+a { color: #58a6ff; text-decoration: none; }
+a:hover { text-decoration: underline; }
+.footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #21262d; color: #484f58; font-size: 0.85em; text-align: center; }
+#loading { text-align: center; padding: 40px; color: #8b949e; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1><span>&#x1F985;</span> Peregrine Benchmarks</h1>
+  <p class="subtitle">Reproducible wall-clock benchmarks for <a href="https://github.com/etam103/peregrine">Peregrine</a> — a from-scratch deep learning engine in Rust for Apple Silicon.</p>
+
+  <div class="controls">
+    <label>Hardware: <select id="hwSelect" onchange="loadSubmission(this.value)"></select></label>
+    <label>Category: <select id="catFilter" onchange="filterTable()"><option value="all">All</option></select></label>
+    <label>Search: <input id="search" type="text" placeholder="Filter ops..." oninput="filterTable()"></label>
+  </div>
+
+  <div id="hwInfo" class="hw-info" style="display:none"></div>
+
+  <div class="cards" id="cards">
+    <div class="card"><div class="label">Total Ops</div><div class="value" id="totalOps">—</div></div>
+    <div class="card"><div class="label">Median Range</div><div class="value" id="medRange">—</div><div class="detail" id="medDetail"></div></div>
+    <div class="card"><div class="label">Categories</div><div class="value" id="totalCats">—</div></div>
+    <div class="card"><div class="label">Mode</div><div class="value" id="benchMode">—</div></div>
+  </div>
+
+  <div id="loading">Loading benchmark data...</div>
+  <table id="benchTable" style="display:none">
+    <thead>
+      <tr>
+        <th onclick="sortTable(0)">Operation</th>
+        <th onclick="sortTable(1)">Category</th>
+        <th onclick="sortTable(2)">Median (us)</th>
+        <th onclick="sortTable(3)">Std (us)</th>
+        <th onclick="sortTable(4)">Min (us)</th>
+        <th onclick="sortTable(5)">Max (us)</th>
+        <th onclick="sortTable(6)">Iters</th>
+      </tr>
+    </thead>
+    <tbody id="benchBody"></tbody>
+  </table>
+
+  <div class="section">
+    <h2>How to Contribute</h2>
+    <p>Run the benchmark suite on your machine and submit results:</p>
+    <pre style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin:12px 0;overflow-x:auto"><code># Install and run
+cargo install --path peregrine-bench
+peregrine-bench --json > my_results.json
+
+# Or from the repo
+cargo run -p peregrine-bench --release -- --json > my_results.json
+
+# Quick mode (fewer iterations, ~2 min)
+cargo run -p peregrine-bench --release -- --quick --json > my_results.json</code></pre>
+    <p>Then open a PR adding your JSON file to <code>docs/results/</code>.</p>
+  </div>
+
+  <div class="footer">
+    Built with <a href="https://github.com/etam103/peregrine">Peregrine</a> &middot; Benchmarks are median of timed iterations (warmup excluded)
+  </div>
+</div>
+
+<script>
+const RESULTS_DIR = './results/';
+let allData = [];
+let currentData = null;
+let sortCol = 2, sortAsc = true;
+
+async function init() {
+  try {
+    const resp = await fetch(RESULTS_DIR + 'index.json');
+    const index = await resp.json();
+    const select = document.getElementById('hwSelect');
+    for (const entry of index) {
+      const opt = document.createElement('option');
+      opt.value = entry.file;
+      opt.textContent = entry.label;
+      select.appendChild(opt);
+    }
+    if (index.length > 0) {
+      await loadSubmission(index[0].file);
+    }
+  } catch (e) {
+    document.getElementById('loading').textContent = 'No benchmark data found. Run peregrine-bench to generate results.';
+  }
+}
+
+async function loadSubmission(file) {
+  try {
+    const resp = await fetch(RESULTS_DIR + file);
+    currentData = await resp.json();
+    renderData(currentData);
+  } catch (e) {
+    document.getElementById('loading').textContent = 'Failed to load ' + file;
+  }
+}
+
+function renderData(data) {
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('benchTable').style.display = '';
+
+  // Hardware info
+  if (data.hardware) {
+    const hw = data.hardware;
+    document.getElementById('hwInfo').style.display = '';
+    document.getElementById('hwInfo').innerHTML =
+      `<strong>${hw.chip}</strong> &middot; ${hw.model} &middot; ${hw.memory_gb}GB RAM &middot; ${hw.cores_total} cores (${hw.cores_perf}P/${hw.cores_efficiency}E) &middot; macOS ${hw.os_version} &middot; ${hw.arch}`;
+  }
+
+  const results = data.results || [];
+  allData = results;
+
+  // Summary cards
+  document.getElementById('totalOps').textContent = results.length;
+  const medians = results.map(r => r.median_us).sort((a,b) => a-b);
+  if (medians.length > 0) {
+    document.getElementById('medRange').textContent = medians[0].toFixed(1) + ' - ' + medians[medians.length-1].toFixed(0);
+    document.getElementById('medDetail').textContent = 'microseconds';
+  }
+  const cats = [...new Set(results.map(r => r.category))];
+  document.getElementById('totalCats').textContent = cats.length;
+  document.getElementById('benchMode').textContent = (data.config && data.config.mode) || 'full';
+
+  // Populate category filter
+  const catSelect = document.getElementById('catFilter');
+  catSelect.innerHTML = '<option value="all">All</option>';
+  for (const c of cats.sort()) {
+    const opt = document.createElement('option');
+    opt.value = c;
+    opt.textContent = c;
+    catSelect.appendChild(opt);
+  }
+
+  renderTable(results);
+}
+
+function renderTable(results) {
+  const tbody = document.getElementById('benchBody');
+  tbody.innerHTML = '';
+  // Find fastest median for highlighting
+  const minMedian = Math.min(...results.map(r => r.median_us));
+  for (const r of results) {
+    const tr = document.createElement('tr');
+    const isMin = r.median_us <= minMedian * 1.01;
+    tr.innerHTML = `
+      <td>${r.op}</td>
+      <td><span class="cat-badge">${r.category}</span></td>
+      <td class="${isMin ? 'win' : ''}">${r.median_us.toFixed(1)}</td>
+      <td>${r.std_us.toFixed(1)}</td>
+      <td>${r.min_us.toFixed(1)}</td>
+      <td>${r.max_us.toFixed(1)}</td>
+      <td>${r.iters}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function filterTable() {
+  const cat = document.getElementById('catFilter').value;
+  const search = document.getElementById('search').value.toLowerCase();
+  let filtered = allData;
+  if (cat !== 'all') filtered = filtered.filter(r => r.category === cat);
+  if (search) filtered = filtered.filter(r => r.op.toLowerCase().includes(search));
+  renderTable(filtered);
+}
+
+function sortTable(col) {
+  if (sortCol === col) sortAsc = !sortAsc;
+  else { sortCol = col; sortAsc = true; }
+  const keys = ['op', 'category', 'median_us', 'std_us', 'min_us', 'max_us', 'iters'];
+  const key = keys[col];
+  allData.sort((a, b) => {
+    const va = a[key], vb = b[key];
+    if (typeof va === 'string') return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+    return sortAsc ? va - vb : vb - va;
+  });
+  filterTable();
+}
+
+init();
+</script>
+</body>
+</html>

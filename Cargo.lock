@@ -1024,6 +1024,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "peregrine-bench"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "peregrine",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "peregrine-py"
 version = "0.1.0"
 dependencies = [
