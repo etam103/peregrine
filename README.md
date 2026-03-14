@@ -17,10 +17,12 @@ Tensors, reverse-mode autograd, neural network layers, optimizers, and working m
 
 ```
 cargo build --release                          # build the library
-cargo test                                     # 633 tests
+cargo test                                     # 600+ tests
 cargo run --example mnist --release            # train MNIST digit classifier (97.5% accuracy)
 cargo run --example rt_detr --release          # train RT-DETR on COCO images
 ./scripts/bench_compare.sh                     # wall-clock benchmark vs PyTorch, MLX, TF, tinygrad, JAX
+cargo run -p peregrine-bench --release         # reproducible benchmark suite (141 ops, JSON output)
+pip install ./peregrine-py && python -c "import peregrine"  # Python bindings
 ```
 
 ---
@@ -49,6 +51,7 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`peregrine::safetensors`** | Safetensors binary format parser — mmap-based loading on Unix, F32/F16/BF16 dequantization, handwritten JSON header parser |
 | **`peregrine::hf_config`** | HuggingFace config.json parser — `ModelConfig` with Llama/Mistral fields, JSON value extraction with scientific notation |
 | **`peregrine::hf_hub`** | HuggingFace Hub integration — download and cache safetensors weights, config.json, tokenizer.json. Auth via `HF_TOKEN`, multi-shard support (`--features hf`) |
+| **`peregrine::models::llama`** | Library-level Llama model — `Llama`, `LlamaConfig`, `LlamaBlock`, `LlamaAttention`, `KVCache`, `Tokenizer`. Loadable from GGUF or safetensors. Used by both the CLI example and Python bindings |
 | **`peregrine::metal`** | Metal GPU backend — 108 compute shaders, 41 dispatch methods, fused op pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling, thermal-aware scheduling (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
@@ -60,8 +63,10 @@ cargo run --example rt_detr --release          # train RT-DETR on COCO images
 | **`examples/llama`** | Llama 3.2 inference — auto-detects GGUF, safetensors directories, or HuggingFace Hub repos (`org/repo`). Loads quantized GGUF (Q8_0, Q4_0, Q4_1) or HF safetensors (F32/F16/BF16) with mmap. 16-layer 1B config (2048 dim, GQA 32/8 heads, SwiGLU), RoPE (theta=500000), BPE tokenizer from GGUF metadata or HF tokenizer.json, greedy/temperature/top-p sampling, streaming decode with tok/s stats. `--sustained SECS` for sustained throughput profiling (p50/p95/p99 latency, thermal distribution), `--chunked-prefill SIZE` for chunked prefill via scheduler, `--multi-request N` for N concurrent priority-scheduled requests, `--wandb` for W&B logging |
 | **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
 | **`examples/moba`** | MOBA 3v3 with LSTM-based PPO and self-play — single-lane map (32x16), heroes, towers, creeps, bases. Train, selfplay, watch (HTML replay), video (MP4 export via FFmpeg) |
+| **`peregrine-py`** | Python bindings via PyO3 — `peregrine.Tensor` with NumPy interop, `peregrine.nn` (Linear, Embedding, RMSNorm, LayerNorm), `peregrine.load_model()` for streaming LLM inference. `pip install peregrine-ml` on macOS arm64 |
+| **`peregrine-bench`** | Reproducible benchmark CLI — 141 ops across 18 categories, hardware auto-detection (Apple Silicon chip/cores/RAM via sysctl), structured JSON output with schema versioning. GitHub Pages dashboard at `docs/index.html` |
 
-The entire library is ~36,200 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
+The entire library is ~37,900 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
 ---
 
@@ -300,9 +305,19 @@ src/
   speculative.rs  speculative decoding — CausalLM trait, draft-propose/target-verify with stochastic acceptance
   sched.rs        request scheduler — priority-based prefill/decode aggregation, chunked prefill, dynamic chunk-size tuning, EMA latency tracking
   thermal.rs      thermal monitoring via Darwin notifications — ThermalState, rate-limited polling, thread-local singleton
+  models/
+    llama/        Library-level Llama model (attention, decoder, model, tokenizer)
   rl.rs           RL algorithms — PPO, DQN, REINFORCE, replay/rollout buffers, Environment trait (~1,750 lines)
   envs.rs         10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe (~2,150 lines)
   metal/          Metal GPU backend (108 shaders, 41 dispatch methods, fused pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd, het scheduling, thermal-aware scheduling)
+peregrine-py/     Python bindings (PyO3 + maturin)
+  src/            py_tensor.rs, py_nn.rs, py_inference.rs
+  python/         peregrine/__init__.py
+peregrine-bench/  Reproducible benchmark CLI
+  src/            main.rs, suite.rs (141 ops), hardware.rs (sysctl detection)
+docs/             GitHub Pages benchmark dashboard
+  index.html      Interactive results viewer
+  results/        JSON benchmark submissions
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
   wallclock.rs    wall-clock comparison benchmark (JSON output)

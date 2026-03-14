@@ -7,6 +7,70 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [0.31.0] - 2026-03-13
+
+### Added — Reproducible `peregrine-bench` CLI + GitHub Pages dashboard
+
+New workspace crate `peregrine-bench` providing a standalone, installable benchmark binary with hardware auto-detection and structured JSON output.
+
+**New crate** (`peregrine-bench/`)
+- `src/suite.rs` — 141 ops across 18 categories (matmul, elementwise, activation, softmax, MLP, training, unary/binary math, reduction, shape, loss, nn layer, optimizer, random, FFT, linalg, pipeline, quantized), ported from `benches/wallclock.rs`
+- `src/hardware.rs` — Apple Silicon detection via `sysctl` (chip model, P/E core counts, RAM, macOS version)
+- `src/main.rs` — CLI with `--json`, `--quick`, `--output FILE`, `--help` flags
+- JSON output schema v1 with hardware metadata, timestamps, and per-op stats (median/std/min/max/iters)
+
+**GitHub Pages dashboard** (`docs/`)
+- `docs/index.html` — interactive single-page dashboard with sortable table, category filter, search, hardware selector
+- `docs/results/` — JSON submissions directory with M1 Max seed data
+- Supports crowdsourced hardware submissions via PR
+
+**Usage**
+```bash
+cargo run -p peregrine-bench --release -- --json > results.json
+cargo run -p peregrine-bench --release -- --quick  # ~2 min
+```
+
+---
+
+## [0.30.0] - 2026-03-13
+
+### Added — Python bindings via PyO3 (`pip install peregrine-ml`)
+
+New workspace crate `peregrine-py` providing Python bindings via PyO3 + maturin. Three-line quickstart from install to streaming LLM tokens.
+
+**New crate** (`peregrine-py/`)
+- `src/py_tensor.rs` — `peregrine.Tensor` with NumPy interop (`__array__`, `from_numpy`), 30+ ops (`+`, `-`, `*`, `@`, `relu`, `gelu`, `silu`, `sigmoid`, `tanh`, `exp`, `log`, `sqrt`, `softmax`, `sum`, `mean`, `reshape`, `transpose`), Jupyter rich repr (`_repr_html_`)
+- `src/py_nn.rs` — `peregrine.nn.Linear`, `Embedding`, `RMSNorm`, `LayerNorm` with `forward()` and `__call__()`, PyTorch-familiar API
+- `src/py_inference.rs` — `peregrine.load_model()` auto-detects GGUF/safetensors/HF Hub, returns `TextGenerator` with streaming `generate()` iterator
+- `python/peregrine/__init__.py` — clean re-exports
+- 15 Python tests (tensor creation, NumPy interop, arithmetic, matmul, unary ops, nn modules, Jupyter repr)
+
+**Library refactor** (`src/models/llama/`)
+- Moved Llama model code from `examples/llama/` into `src/models/llama/` for library-level access
+- `mod.rs`, `model.rs`, `decoder.rs`, `attention.rs`, `tokenizer.rs` — re-exports `Llama`, `LlamaConfig`, `LlamaBlock`, `LlamaAttention`, `KVCache`, `Tokenizer`
+
+**Usage**
+```python
+import peregrine
+model = peregrine.load_model("model.gguf")
+for token in model.generate("The capital of France is", max_tokens=50):
+    print(token, end="", flush=True)
+```
+
+### Benchmark Results
+
+Op-level benchmarks (141 ops, CPU, all frameworks):
+- **Peregrine vs PyTorch: 0.98x** (Peregrine 2% faster)
+- **Peregrine vs MLX: 0.75x** (Peregrine faster)
+- **Peregrine vs TensorFlow: 0.52x** (Peregrine faster)
+- **Peregrine vs JAX: 0.66x** (Peregrine faster)
+- **Peregrine vs tinygrad: 0.09x** (Peregrine faster)
+- Peregrine wins 67/141 ops
+
+MUSt3R: 0.64s@224 (4.5% faster), 1.97s@512 (13% faster) vs PyTorch.
+
+---
+
 ## [0.29.0] - 2026-03-13
 
 ### Added — Safetensors model loading + HuggingFace Hub integration
