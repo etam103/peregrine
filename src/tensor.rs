@@ -914,6 +914,24 @@ impl Tensor {
         })))
     }
 
+    /// Fast tensor creation for inference (no autograd overhead).
+    #[inline(always)]
+    fn from_data(data: Vec<f32>, shape: Vec<usize>) -> Self {
+        Tensor(Rc::new(RefCell::new(TensorInner {
+            data,
+            shape,
+            grad: None,
+            op: Op::None,
+            requires_grad: false,
+            #[cfg(feature = "metal")]
+            gpu_data: None,
+            #[cfg(feature = "metal")]
+            gpu_grad: None,
+            #[cfg(feature = "metal")]
+            gpu_dirty: false,
+        })))
+    }
+
     /// Create a GPU-produced tensor. CPU data is empty; the GPU buffer is authoritative.
     #[cfg(feature = "metal")]
     fn from_gpu_op(
@@ -1150,16 +1168,19 @@ impl Tensor {
         let b = other.0.borrow();
         if a.shape == b.shape {
             let len = a.data.len();
+            let no_grad = !a.requires_grad && !b.requires_grad;
             if len >= PAR_THRESHOLD_CHEAP {
                 let data: Vec<f32> = a.data.par_iter().zip(&b.data).map(|(x, y)| x + y).collect();
-                Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
+                if no_grad { Tensor::from_data(data, a.shape.clone()) }
+                else { drop(a); drop(b); Tensor::from_op(data, self.shape(), Op::Add(self.clone(), other.clone())) }
             } else {
                 let mut data = pool_get(len);
                 #[cfg(target_arch = "aarch64")]
                 simd_kernels::vec_add_f32(&a.data, &b.data, &mut data);
                 #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..len { data[i] = a.data[i] + b.data[i]; }
-                Tensor::from_op(data, a.shape.clone(), Op::Add(self.clone(), other.clone()))
+                if no_grad { Tensor::from_data(data, a.shape.clone()) }
+                else { let s = a.shape.clone(); drop(a); drop(b); Tensor::from_op(data, s, Op::Add(self.clone(), other.clone())) }
             }
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x + y);
