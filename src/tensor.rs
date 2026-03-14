@@ -48,6 +48,7 @@ extern "C" {
     fn vvcoshf(result: *mut f32, input: *const f32, count: *const i32);
     fn vvasinf(result: *mut f32, input: *const f32, count: *const i32);
     fn vvatanf(result: *mut f32, input: *const f32, count: *const i32);
+    fn vvatan2f(result: *mut f32, y: *const f32, x: *const f32, count: *const i32);
 }
 
 /// Safe wrapper around cblas_sgemm. Computes C = alpha * op(A) * op(B) + beta * C.
@@ -3087,7 +3088,13 @@ impl Tensor {
         if a.shape == b.shape {
             let len = a.data.len();
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = a.data[i].atan2(b.data[i]); }
+            #[cfg(target_os = "macos")]
+            {
+                let n = len as i32;
+                unsafe { vvatan2f(data.as_mut_ptr(), a.data.as_ptr(), b.data.as_ptr(), &n); }
+            }
+            #[cfg(not(target_os = "macos"))]
+            { for i in 0..len { data[i] = a.data[i].atan2(b.data[i]); } }
             Tensor::from_op(data, a.shape.clone(), Op::Arctan2(self.clone(), other.clone()))
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x.atan2(y));
@@ -3208,8 +3215,13 @@ impl Tensor {
         assert_eq!(c.shape, yi.shape, "where_cond: cond and y must have the same shape");
         let len = c.data.len();
         let mut data = pool_get(len);
-        for i in 0..len {
-            data[i] = if c.data[i] != 0.0 { xi.data[i] } else { yi.data[i] };
+        #[cfg(target_arch = "aarch64")]
+        { simd_kernels::vec_where_f32(&c.data[..len], &xi.data[..len], &yi.data[..len], &mut data[..len]); }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for i in 0..len {
+                data[i] = if c.data[i] != 0.0 { xi.data[i] } else { yi.data[i] };
+            }
         }
         Tensor::from_op(data, c.shape.clone(), Op::Where { cond: cond.clone(), x: x.clone(), y: y.clone() })
     }
@@ -3284,7 +3296,10 @@ impl Tensor {
         assert_eq!(a.shape, b.shape, "equal: shapes must match");
         let len = a.data.len();
         let mut data = pool_get(len);
-        for i in 0..len { data[i] = if a.data[i] == b.data[i] { 1.0 } else { 0.0 }; }
+        #[cfg(target_arch = "aarch64")]
+        { simd_kernels::vec_equal_f32(&a.data[..len], &b.data[..len], &mut data[..len]); }
+        #[cfg(not(target_arch = "aarch64"))]
+        { for i in 0..len { data[i] = if a.data[i] == b.data[i] { 1.0 } else { 0.0 }; } }
         Tensor::from_op(data, a.shape.clone(), Op::None)
     }
 
@@ -3354,7 +3369,10 @@ impl Tensor {
         assert_eq!(a.shape, b.shape, "greater: shapes must match");
         let len = a.data.len();
         let mut data = pool_get(len);
-        for i in 0..len { data[i] = if a.data[i] > b.data[i] { 1.0 } else { 0.0 }; }
+        #[cfg(target_arch = "aarch64")]
+        { simd_kernels::vec_greater_f32(&a.data[..len], &b.data[..len], &mut data[..len]); }
+        #[cfg(not(target_arch = "aarch64"))]
+        { for i in 0..len { data[i] = if a.data[i] > b.data[i] { 1.0 } else { 0.0 }; } }
         Tensor::from_op(data, a.shape.clone(), Op::None)
     }
 
@@ -3979,7 +3997,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Rsqrt(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = 1.0 / inner.data[i].sqrt(); }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_rsqrt_f32(&inner.data[..len], &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = 1.0 / inner.data[i].sqrt(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Rsqrt(self.clone()))
         }
     }
@@ -4009,7 +4030,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::None)
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].floor(); }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_floor_f32(&inner.data[..len], &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = inner.data[i].floor(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::None)
         }
     }
@@ -4039,7 +4063,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::None)
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].ceil(); }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_ceil_f32(&inner.data[..len], &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = inner.data[i].ceil(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::None)
         }
     }
@@ -4069,7 +4096,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::None)
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].round(); }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_round_f32(&inner.data[..len], &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = inner.data[i].round(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::None)
         }
     }
@@ -4102,7 +4132,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::None)
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = sign_fn(inner.data[i]); }
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_sign_f32(&inner.data[..len], &mut data[..len]); }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = sign_fn(inner.data[i]); } }
             Tensor::from_op(data, inner.shape.clone(), Op::None)
         }
     }
@@ -4252,7 +4285,12 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Erf(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = erf_approx(inner.data[i]); }
+            #[cfg(target_arch = "aarch64")]
+            {
+                crate::simd_kernels::vec_erf_f32(&inner.data, &mut data);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = erf_approx(inner.data[i]); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Erf(self.clone()))
         }
     }
@@ -4672,13 +4710,18 @@ impl Tensor {
 
         let data = &self.0.borrow().data;
         let mut out_data = vec![0.0f32; out_len];
-        for o in 0..outer_size {
-            for i in 0..inner_size {
-                let mut acc = 0.0f32;
-                for r in 0..reduce_size {
-                    acc += data[o * reduce_size * inner_size + r * inner_size + i];
+        #[cfg(target_arch = "aarch64")]
+        { simd_kernels::vec_sum_axis(data, &mut out_data, outer_size, reduce_size, inner_size); }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for o in 0..outer_size {
+                for i in 0..inner_size {
+                    let mut acc = 0.0f32;
+                    for r in 0..reduce_size {
+                        acc += data[o * reduce_size * inner_size + r * inner_size + i];
+                    }
+                    out_data[o * inner_size + i] = acc;
                 }
-                out_data[o * inner_size + i] = acc;
             }
         }
         Tensor::from_op(out_data, out_shape,
@@ -4716,13 +4759,22 @@ impl Tensor {
 
         let data = &self.0.borrow().data;
         let mut out_data = vec![0.0f32; out_len];
-        for o in 0..outer_size {
-            for i in 0..inner_size {
-                let mut acc = 0.0f32;
-                for r in 0..reduce_size {
-                    acc += data[o * reduce_size * inner_size + r * inner_size + i];
+        #[cfg(target_arch = "aarch64")]
+        {
+            simd_kernels::vec_sum_axis(data, &mut out_data, outer_size, reduce_size, inner_size);
+            let inv = 1.0 / reduce_size as f32;
+            for v in out_data.iter_mut() { *v *= inv; }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for o in 0..outer_size {
+                for i in 0..inner_size {
+                    let mut acc = 0.0f32;
+                    for r in 0..reduce_size {
+                        acc += data[o * reduce_size * inner_size + r * inner_size + i];
+                    }
+                    out_data[o * inner_size + i] = acc / reduce_size as f32;
                 }
-                out_data[o * inner_size + i] = acc / reduce_size as f32;
             }
         }
         Tensor::from_op(out_data, out_shape,
@@ -4760,14 +4812,19 @@ impl Tensor {
 
         let data = &self.0.borrow().data;
         let mut out_data = vec![f32::NEG_INFINITY; out_len];
-        for o in 0..outer_size {
-            for i in 0..inner_size {
-                let mut acc = f32::NEG_INFINITY;
-                for r in 0..reduce_size {
-                    let val = data[o * reduce_size * inner_size + r * inner_size + i];
-                    if val > acc { acc = val; }
+        #[cfg(target_arch = "aarch64")]
+        { simd_kernels::vec_max_axis(data, &mut out_data, outer_size, reduce_size, inner_size); }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for o in 0..outer_size {
+                for i in 0..inner_size {
+                    let mut acc = f32::NEG_INFINITY;
+                    for r in 0..reduce_size {
+                        let val = data[o * reduce_size * inner_size + r * inner_size + i];
+                        if val > acc { acc = val; }
+                    }
+                    out_data[o * inner_size + i] = acc;
                 }
-                out_data[o * inner_size + i] = acc;
             }
         }
         Tensor::from_op(out_data, out_shape,
@@ -4805,14 +4862,19 @@ impl Tensor {
 
         let data = &self.0.borrow().data;
         let mut out_data = vec![f32::INFINITY; out_len];
-        for o in 0..outer_size {
-            for i in 0..inner_size {
-                let mut acc = f32::INFINITY;
-                for r in 0..reduce_size {
-                    let val = data[o * reduce_size * inner_size + r * inner_size + i];
-                    if val < acc { acc = val; }
+        #[cfg(target_arch = "aarch64")]
+        { simd_kernels::vec_min_axis(data, &mut out_data, outer_size, reduce_size, inner_size); }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for o in 0..outer_size {
+                for i in 0..inner_size {
+                    let mut acc = f32::INFINITY;
+                    for r in 0..reduce_size {
+                        let val = data[o * reduce_size * inner_size + r * inner_size + i];
+                        if val < acc { acc = val; }
+                    }
+                    out_data[o * inner_size + i] = acc;
                 }
-                out_data[o * inner_size + i] = acc;
             }
         }
         Tensor::from_op(out_data, out_shape,
@@ -4908,13 +4970,18 @@ impl Tensor {
 
         let data = &self.0.borrow().data;
         let mut out_data = vec![1.0f32; out_len];
-        for o in 0..outer_size {
-            for i in 0..inner_size {
-                let mut acc = 1.0f32;
-                for r in 0..reduce_size {
-                    acc *= data[o * reduce_size * inner_size + r * inner_size + i];
+        #[cfg(target_arch = "aarch64")]
+        { simd_kernels::vec_prod_axis(data, &mut out_data, outer_size, reduce_size, inner_size); }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for o in 0..outer_size {
+                for i in 0..inner_size {
+                    let mut acc = 1.0f32;
+                    for r in 0..reduce_size {
+                        acc *= data[o * reduce_size * inner_size + r * inner_size + i];
+                    }
+                    out_data[o * inner_size + i] = acc;
                 }
-                out_data[o * inner_size + i] = acc;
             }
         }
         Tensor::from_op(out_data, out_shape,

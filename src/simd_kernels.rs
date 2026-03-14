@@ -1151,6 +1151,382 @@ pub fn gemm_sparse_24(
 // Tests
 // ========================================================================
 
+// ========================================================================
+// Phase 5: Unary math kernels (floor, ceil, round, rsqrt, sign, erf)
+// ========================================================================
+
+/// floor: out[i] = floor(a[i]) via NEON vrndmq_f32
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_floor_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            vst1q_f32(out.as_mut_ptr().add(off), vrndmq_f32(va));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i].floor();
+    }
+}
+
+/// ceil: out[i] = ceil(a[i]) via NEON vrndpq_f32
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_ceil_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            vst1q_f32(out.as_mut_ptr().add(off), vrndpq_f32(va));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i].ceil();
+    }
+}
+
+/// round: out[i] = round(a[i]) via NEON vrndnq_f32 (round to nearest even)
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_round_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            vst1q_f32(out.as_mut_ptr().add(off), vrndnq_f32(va));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i].round();
+    }
+}
+
+/// rsqrt: out[i] = 1/sqrt(a[i]) via NEON vrsqrteq_f32 + 2 Newton steps
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_rsqrt_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            let est = vrsqrteq_f32(va);
+            // Newton step 1: est = est * (3 - va * est * est) / 2
+            let step1 = vmulq_f32(est, vrsqrtsq_f32(vmulq_f32(va, est), est));
+            // Newton step 2
+            let step2 = vmulq_f32(step1, vrsqrtsq_f32(vmulq_f32(va, step1), step1));
+            vst1q_f32(out.as_mut_ptr().add(off), step2);
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = 1.0 / a[i].sqrt();
+    }
+}
+
+/// sign: out[i] = sign(a[i]) — 1.0 if positive, -1.0 if negative, 0.0 if zero
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_sign_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let one = vdupq_n_f32(1.0);
+        let neg_one = vdupq_n_f32(-1.0);
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            // pos_mask: a > 0 → all 1s
+            let pos_mask = vcgtq_f32(va, zero);
+            // neg_mask: a < 0 → all 1s
+            let neg_mask = vcltq_f32(va, zero);
+            // result = select(pos_mask, 1.0, select(neg_mask, -1.0, 0.0))
+            let result = vbslq_f32(pos_mask, one, vbslq_f32(neg_mask, neg_one, zero));
+            vst1q_f32(out.as_mut_ptr().add(off), result);
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = if a[i] > 0.0 { 1.0 } else if a[i] < 0.0 { -1.0 } else { 0.0 };
+    }
+}
+
+/// erf: out[i] = erf(a[i]) — Abramowitz & Stegun polynomial via NEON
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_erf_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let one = vdupq_n_f32(1.0);
+        let p = vdupq_n_f32(0.3275911);
+        let a1 = vdupq_n_f32(0.254829592);
+        let a2 = vdupq_n_f32(-0.284496736);
+        let a3 = vdupq_n_f32(1.421413741);
+        let a4 = vdupq_n_f32(-1.453152027);
+        let a5 = vdupq_n_f32(1.061405429);
+        let zero = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            let abs_x = vabsq_f32(vx);
+            // t = 1 / (1 + p * |x|)
+            let t = vdivq_f32(one, vmlaq_f32(one, p, abs_x));
+            // Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t
+            let poly = vmulq_f32(
+                vmlaq_f32(a1,
+                    vmlaq_f32(a2,
+                        vmlaq_f32(a3,
+                            vmlaq_f32(a4, a5, t),
+                        t),
+                    t),
+                t),
+            t);
+            // exp(-x*x)
+            let neg_x2 = vnegq_f32(vmulq_f32(abs_x, abs_x));
+            let exp_val = fast_exp_f32x4(neg_x2);
+            // y = 1 - poly * exp(-x²)
+            let y = vsubq_f32(one, vmulq_f32(poly, exp_val));
+            // Apply sign: result = copysign(y, x)
+            let neg_mask = vcltq_f32(vx, zero);
+            let result = vbslq_f32(neg_mask, vnegq_f32(y), y);
+            vst1q_f32(out.as_mut_ptr().add(off), result);
+        }
+    }
+    for i in (chunks * 4)..len {
+        let x = a[i];
+        let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+        let y = 1.0
+            - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+                + 0.254829592)
+                * t
+                * (-x * x).exp();
+        out[i] = y.copysign(x);
+    }
+}
+
+// ========================================================================
+// Phase 6: Comparison/conditional kernels
+// ========================================================================
+
+/// greater: out[i] = (a[i] > b[i]) ? 1.0 : 0.0
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_greater_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, b.len());
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let one = vdupq_n_f32(1.0);
+        let zero = vdupq_n_f32(0.0);
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            let vb = vld1q_f32(b.as_ptr().add(off));
+            let mask = vcgtq_f32(va, vb);
+            vst1q_f32(out.as_mut_ptr().add(off), vbslq_f32(mask, one, zero));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = if a[i] > b[i] { 1.0 } else { 0.0 };
+    }
+}
+
+/// equal: out[i] = (a[i] == b[i]) ? 1.0 : 0.0
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_equal_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, b.len());
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let one = vdupq_n_f32(1.0);
+        let zero = vdupq_n_f32(0.0);
+        for i in 0..chunks {
+            let off = i * 4;
+            let va = vld1q_f32(a.as_ptr().add(off));
+            let vb = vld1q_f32(b.as_ptr().add(off));
+            let mask = vceqq_f32(va, vb);
+            vst1q_f32(out.as_mut_ptr().add(off), vbslq_f32(mask, one, zero));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = if a[i] == b[i] { 1.0 } else { 0.0 };
+    }
+}
+
+/// where_cond: out[i] = (cond[i] != 0) ? x[i] : y[i]
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_where_f32(cond: &[f32], x: &[f32], y: &[f32], out: &mut [f32]) {
+    let len = cond.len();
+    debug_assert_eq!(len, x.len());
+    debug_assert_eq!(len, y.len());
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vc = vld1q_f32(cond.as_ptr().add(off));
+            let vx = vld1q_f32(x.as_ptr().add(off));
+            let vy = vld1q_f32(y.as_ptr().add(off));
+            // mask: cond != 0
+            let mask = vmvnq_u32(vceqq_f32(vc, zero));
+            vst1q_f32(out.as_mut_ptr().add(off), vbslq_f32(mask, vx, vy));
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = if cond[i] != 0.0 { x[i] } else { y[i] };
+    }
+}
+
+// ========================================================================
+// Phase 7: Reduction kernels
+// ========================================================================
+
+/// NEON-accelerated axis sum reduction.
+/// Reduces `data` of shape [outer_size, reduce_size, inner_size] along the middle axis.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_sum_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_size: usize, inner_size: usize) {
+    let stride = reduce_size * inner_size;
+    for o in 0..outer_size {
+        let base = o * stride;
+        let out_base = o * inner_size;
+        // Process inner_size in chunks of 4
+        let chunks = inner_size / 4;
+        unsafe {
+            for c in 0..chunks {
+                let inner_off = c * 4;
+                let mut acc = vdupq_n_f32(0.0);
+                for r in 0..reduce_size {
+                    let src = base + r * inner_size + inner_off;
+                    acc = vaddq_f32(acc, vld1q_f32(data.as_ptr().add(src)));
+                }
+                vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
+            }
+        }
+        // Scalar tail
+        for i in (chunks * 4)..inner_size {
+            let mut acc = 0.0f32;
+            for r in 0..reduce_size {
+                acc += data[base + r * inner_size + i];
+            }
+            out[out_base + i] = acc;
+        }
+    }
+}
+
+/// NEON-accelerated axis max reduction.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_max_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_size: usize, inner_size: usize) {
+    let stride = reduce_size * inner_size;
+    for o in 0..outer_size {
+        let base = o * stride;
+        let out_base = o * inner_size;
+        let chunks = inner_size / 4;
+        unsafe {
+            for c in 0..chunks {
+                let inner_off = c * 4;
+                let mut acc = vdupq_n_f32(f32::NEG_INFINITY);
+                for r in 0..reduce_size {
+                    let src = base + r * inner_size + inner_off;
+                    acc = vmaxq_f32(acc, vld1q_f32(data.as_ptr().add(src)));
+                }
+                vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
+            }
+        }
+        for i in (chunks * 4)..inner_size {
+            let mut acc = f32::NEG_INFINITY;
+            for r in 0..reduce_size {
+                let val = data[base + r * inner_size + i];
+                if val > acc { acc = val; }
+            }
+            out[out_base + i] = acc;
+        }
+    }
+}
+
+/// NEON-accelerated axis min reduction.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_min_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_size: usize, inner_size: usize) {
+    let stride = reduce_size * inner_size;
+    for o in 0..outer_size {
+        let base = o * stride;
+        let out_base = o * inner_size;
+        let chunks = inner_size / 4;
+        unsafe {
+            for c in 0..chunks {
+                let inner_off = c * 4;
+                let mut acc = vdupq_n_f32(f32::INFINITY);
+                for r in 0..reduce_size {
+                    let src = base + r * inner_size + inner_off;
+                    acc = vminq_f32(acc, vld1q_f32(data.as_ptr().add(src)));
+                }
+                vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
+            }
+        }
+        for i in (chunks * 4)..inner_size {
+            let mut acc = f32::INFINITY;
+            for r in 0..reduce_size {
+                let val = data[base + r * inner_size + i];
+                if val < acc { acc = val; }
+            }
+            out[out_base + i] = acc;
+        }
+    }
+}
+
+/// NEON-accelerated axis product reduction.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_prod_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_size: usize, inner_size: usize) {
+    let stride = reduce_size * inner_size;
+    for o in 0..outer_size {
+        let base = o * stride;
+        let out_base = o * inner_size;
+        let chunks = inner_size / 4;
+        unsafe {
+            for c in 0..chunks {
+                let inner_off = c * 4;
+                let mut acc = vdupq_n_f32(1.0);
+                for r in 0..reduce_size {
+                    let src = base + r * inner_size + inner_off;
+                    acc = vmulq_f32(acc, vld1q_f32(data.as_ptr().add(src)));
+                }
+                vst1q_f32(out.as_mut_ptr().add(out_base + inner_off), acc);
+            }
+        }
+        for i in (chunks * 4)..inner_size {
+            let mut acc = 1.0f32;
+            for r in 0..reduce_size {
+                acc *= data[base + r * inner_size + i];
+            }
+            out[out_base + i] = acc;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "aarch64")]
