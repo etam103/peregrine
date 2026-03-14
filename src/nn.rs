@@ -331,6 +331,68 @@ pub fn smooth_l1_loss(pred: &Tensor, target: &Tensor, beta: f32) -> Tensor {
 ///   delta * (|x| - 0.5*delta)  otherwise
 pub fn huber_loss(pred: &Tensor, target: &Tensor, delta: f32) -> Tensor {
     assert!(delta > 0.0, "delta must be positive");
+
+    // Fused single-pass path when no gradients are needed — avoids ~8 intermediate tensor allocations
+    if !pred.requires_grad() && !target.requires_grad() {
+        let pd = pred.data();
+        let td = target.data();
+        let n = pd.len();
+        debug_assert_eq!(n, td.len());
+        let half_delta = 0.5 * delta;
+        let mut sum = 0.0f64;
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            let chunks = n / 4;
+            let vdelta = unsafe { vdupq_n_f32(delta) };
+            let vhalf = unsafe { vdupq_n_f32(0.5) };
+            let vhalf_delta = unsafe { vdupq_n_f32(half_delta) };
+            let mut vacc = unsafe { vdupq_n_f32(0.0) };
+            unsafe {
+                for c in 0..chunks {
+                    let off = c * 4;
+                    let vp = vld1q_f32(pd.as_ptr().add(off));
+                    let vt = vld1q_f32(td.as_ptr().add(off));
+                    let diff = vsubq_f32(vp, vt);
+                    let abs_diff = vabsq_f32(diff);
+                    // quadratic = 0.5 * diff^2
+                    let quad = vmulq_f32(vhalf, vmulq_f32(diff, diff));
+                    // linear = delta * (|diff| - 0.5 * delta)
+                    let lin = vmulq_f32(vdelta, vsubq_f32(abs_diff, vhalf_delta));
+                    // mask: |diff| < delta => quad, else => lin
+                    let mask = vcltq_f32(abs_diff, vdelta);
+                    let result = vbslq_f32(mask, quad, lin);
+                    vacc = vaddq_f32(vacc, result);
+                }
+                sum = vaddvq_f32(vacc) as f64;
+            }
+            for i in (chunks * 4)..n {
+                let diff = pd[i] - td[i];
+                let abs_diff = diff.abs();
+                if abs_diff < delta {
+                    sum += (0.5 * diff * diff) as f64;
+                } else {
+                    sum += (delta * (abs_diff - half_delta)) as f64;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for i in 0..n {
+                let diff = pd[i] - td[i];
+                let abs_diff = diff.abs();
+                if abs_diff < delta {
+                    sum += (0.5 * diff * diff) as f64;
+                } else {
+                    sum += (delta * (abs_diff - half_delta)) as f64;
+                }
+            }
+        }
+        let mean = (sum / n as f64) as f32;
+        return Tensor::new(vec![mean], vec![1], false);
+    }
+
+    // Grad-tracking path: compose from tensor ops for autograd
     let diff = pred.sub(target);
     let abs_diff = diff.abs();
     let abs_data = abs_diff.data();

@@ -2392,7 +2392,7 @@ impl Tensor {
         }
 
         let total: usize = inner.data.len();
-        let mut data = vec![0.0f32; total];
+        let mut data = pool_get(total);
 
         for flat in 0..total {
             let mut coords = vec![0usize; ndim];
@@ -2459,7 +2459,7 @@ impl Tensor {
         let dim_size = inner.shape[dim];
         let inner_size: usize = inner.shape[dim + 1..].iter().product();
 
-        let mut data = vec![0.0f32; inner.data.len()];
+        let mut data = pool_get(inner.data.len());
 
         // Fast NEON path: softmax over last dim (inner_size == 1), contiguous slices
         #[cfg(target_arch = "aarch64")]
@@ -2740,9 +2740,9 @@ impl Tensor {
         let num_instances = total / normalized_shape;
         let eps = 1e-5f32;
 
-        let mut normalized = vec![0.0f32; total];
-        let mut inv_std = vec![0.0f32; num_instances];
-        let mut data = vec![0.0f32; total];
+        let mut normalized = pool_get(total);
+        let mut inv_std = pool_get(num_instances);
+        let mut data = pool_get(total);
 
         // NEON-accelerated single-pass LayerNorm
         #[cfg(target_arch = "aarch64")]
@@ -4870,7 +4870,7 @@ impl Tensor {
         self.sync_gpu_to_cpu();
 
         let data = &self.0.borrow().data;
-        let mut out_data = vec![0.0f32; out_len];
+        let mut out_data = pool_get(out_len);
         #[cfg(target_arch = "aarch64")]
         { simd_kernels::vec_sum_axis(data, &mut out_data, outer_size, reduce_size, inner_size); }
         #[cfg(not(target_arch = "aarch64"))]
@@ -4919,7 +4919,7 @@ impl Tensor {
         self.sync_gpu_to_cpu();
 
         let data = &self.0.borrow().data;
-        let mut out_data = vec![0.0f32; out_len];
+        let mut out_data = pool_get(out_len);
         #[cfg(target_arch = "aarch64")]
         {
             simd_kernels::vec_sum_axis(data, &mut out_data, outer_size, reduce_size, inner_size);
@@ -5073,7 +5073,7 @@ impl Tensor {
         self.sync_gpu_to_cpu();
 
         let data = &self.0.borrow().data;
-        let mut out_data = vec![0.0f32; out_len];
+        let mut out_data = pool_get(out_len);
         #[cfg(target_arch = "aarch64")]
         if inner_size == 1 {
             // Fused NEON two-pass variance for last-axis reduction
@@ -5237,7 +5237,7 @@ impl Tensor {
         self.sync_gpu_to_cpu();
 
         let data = &self.0.borrow().data;
-        let mut out_data = vec![0.0f32; out_len];
+        let mut out_data = pool_get(out_len);
         #[cfg(target_arch = "aarch64")]
         if inner_size == 1 {
             simd_kernels::vec_logsumexp_rows(data, &mut out_data, outer_size, reduce_size);
@@ -5382,7 +5382,7 @@ impl Tensor {
         self.sync_gpu_to_cpu();
 
         let data = &self.0.borrow().data;
-        let mut out_data = vec![0.0f32; data.len()];
+        let mut out_data = pool_get(data.len());
         for o in 0..outer_size {
             for i in 0..inner_size {
                 let mut acc = 1.0f32;
