@@ -1690,59 +1690,19 @@ impl Tensor {
             );
         }
 
-        // Step 3: in-place gelu using Accelerate vvtanhf for optimal cache behavior
-        let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+        // Step 3: in-place erf-based gelu — single fused pass, no temp buffer
         let total = m * n;
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_arch = "aarch64")]
         {
-            use std::arch::aarch64::*;
-
-            // Back up x values — out_data will be overwritten by inner then tanh
+            // Back up x values — out_data will be overwritten in-place
             let mut x_backup = pool_get(total);
             x_backup[..total].copy_from_slice(&out_data[..total]);
-
-            // Pass 1: compute inner = sqrt(2/pi) * (x + 0.044715 * x³) into out_data
-            unsafe {
-                let s2p = vdupq_n_f32(sqrt_2_over_pi);
-                let coeff = vdupq_n_f32(0.044715);
-                let chunks = total / 4;
-                for c in 0..chunks {
-                    let off = c * 4;
-                    let vx = vld1q_f32(x_backup.as_ptr().add(off));
-                    let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
-                    let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
-                    vst1q_f32(out_data.as_mut_ptr().add(off), inner);
-                }
-                for i in (chunks * 4)..total {
-                    let x = x_backup[i];
-                    out_data[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-                }
-            }
-
-            // Pass 2: tanh via Accelerate vvtanhf (one optimized call)
-            let n_i32 = total as i32;
-            unsafe { vvtanhf(out_data.as_mut_ptr(), out_data.as_ptr(), &n_i32); }
-
-            // Pass 3: result = 0.5 * x * (1 + tanh_val)
-            unsafe {
-                let half = vdupq_n_f32(0.5);
-                let one = vdupq_n_f32(1.0);
-                let chunks = total / 4;
-                for c in 0..chunks {
-                    let off = c * 4;
-                    let vx = vld1q_f32(x_backup.as_ptr().add(off));
-                    let tanh_v = vld1q_f32(out_data.as_ptr().add(off));
-                    let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_v)));
-                    vst1q_f32(out_data.as_mut_ptr().add(off), result);
-                }
-                for i in (chunks * 4)..total {
-                    out_data[i] = 0.5 * x_backup[i] * (1.0 + out_data[i]);
-                }
-            }
+            simd_kernels::vec_gelu_f32(&x_backup[..total], &mut out_data[..total]);
             pool_recycle(x_backup);
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(not(target_arch = "aarch64"))]
         {
+            let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
             for i in 0..total {
                 let x = out_data[i];
                 let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
@@ -3050,114 +3010,25 @@ impl Tensor {
         let inner = self.0.borrow();
         let len = inner.data.len();
         let src = &inner.data[..]; // plain &[f32] — Send+Sync for rayon
-        let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
         let mut data = pool_get(len);
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(target_arch = "aarch64")]
         {
-            // Fast path: vvtanhf + NEON combine, parallelized per-chunk for large tensors.
-            // Each rayon chunk does its own prep → vvtanhf → NEON combine pipeline.
+            // Erf-based GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+            // Uses exp-free polynomial erf — faster than vvtanhf-based tanh approximation.
             if len >= PAR_THRESHOLD_EXPENSIVE {
                 const CHUNK: usize = 32768; // 128KB per chunk — fits in L1/L2
                 let src_chunks: Vec<&[f32]> = src.chunks(CHUNK).collect();
                 let out_chunks: Vec<&mut [f32]> = data.chunks_mut(CHUNK).collect();
                 src_chunks.into_par_iter().zip(out_chunks).for_each(|(s, d)| {
-                    let clen = s.len();
-                    let mut tmp = vec![0.0f32; clen];
-                    unsafe {
-                        use std::arch::aarch64::*;
-                        let va = vdupq_n_f32(0.7978845608_f32);  // sqrt(2/pi)
-                        let vb = vdupq_n_f32(0.0356774222_f32);  // sqrt(2/pi) * 0.044715
-                        let simd_n = clen / 8;
-                        for c in 0..simd_n {
-                            let off = c * 8;
-                            let vx0 = vld1q_f32(s.as_ptr().add(off));
-                            let vx1 = vld1q_f32(s.as_ptr().add(off + 4));
-                            let x2_0 = vmulq_f32(vx0, vx0);
-                            let x2_1 = vmulq_f32(vx1, vx1);
-                            let inner0 = vmulq_f32(vx0, vmlaq_f32(va, vb, x2_0));
-                            let inner1 = vmulq_f32(vx1, vmlaq_f32(va, vb, x2_1));
-                            vst1q_f32(tmp.as_mut_ptr().add(off), inner0);
-                            vst1q_f32(tmp.as_mut_ptr().add(off + 4), inner1);
-                        }
-                        for i in (simd_n * 8)..clen {
-                            let x = s[i];
-                            let x2 = x * x;
-                            tmp[i] = x * (0.7978845608 + 0.0356774222 * x2);
-                        }
-                    }
-                    let n = clen as i32;
-                    unsafe { vvtanhf(d.as_mut_ptr(), tmp.as_ptr(), &n); }
-                    unsafe {
-                        use std::arch::aarch64::*;
-                        let half = vdupq_n_f32(0.5);
-                        let one = vdupq_n_f32(1.0);
-                        let simd_chunks8 = clen / 8;
-                        for i in 0..simd_chunks8 {
-                            let off = i * 8;
-                            let vx0 = vld1q_f32(s.as_ptr().add(off));
-                            let vx1 = vld1q_f32(s.as_ptr().add(off + 4));
-                            let vt0 = vld1q_f32(d.as_ptr().add(off));
-                            let vt1 = vld1q_f32(d.as_ptr().add(off + 4));
-                            let r0 = vmulq_f32(half, vmulq_f32(vx0, vaddq_f32(one, vt0)));
-                            let r1 = vmulq_f32(half, vmulq_f32(vx1, vaddq_f32(one, vt1)));
-                            vst1q_f32(d.as_mut_ptr().add(off), r0);
-                            vst1q_f32(d.as_mut_ptr().add(off + 4), r1);
-                        }
-                        for i in (simd_chunks8 * 8)..clen {
-                            d[i] = 0.5 * s[i] * (1.0 + d[i]);
-                        }
-                    }
+                    simd_kernels::vec_gelu_f32(s, d);
                 });
             } else {
-                // 2-pass (no temp buffer): compute inner into data, vvtanhf in-place, NEON combine
-                unsafe {
-                    use std::arch::aarch64::*;
-                    let va = vdupq_n_f32(0.7978845608_f32);  // sqrt(2/pi)
-                    let vb = vdupq_n_f32(0.0356774222_f32);  // sqrt(2/pi) * 0.044715
-                    let chunks = len / 8;
-                    for c in 0..chunks {
-                        let off = c * 8;
-                        let vx0 = vld1q_f32(src.as_ptr().add(off));
-                        let vx1 = vld1q_f32(src.as_ptr().add(off + 4));
-                        let x2_0 = vmulq_f32(vx0, vx0);
-                        let x2_1 = vmulq_f32(vx1, vx1);
-                        let inner0 = vmulq_f32(vx0, vmlaq_f32(va, vb, x2_0));
-                        let inner1 = vmulq_f32(vx1, vmlaq_f32(va, vb, x2_1));
-                        vst1q_f32(data.as_mut_ptr().add(off), inner0);
-                        vst1q_f32(data.as_mut_ptr().add(off + 4), inner1);
-                    }
-                    for i in (chunks * 8)..len {
-                        let x = src[i];
-                        let x2 = x * x;
-                        data[i] = x * (0.7978845608 + 0.0356774222 * x2);
-                    }
-                }
-                let n = len as i32;
-                unsafe { vvtanhf(data.as_mut_ptr(), data.as_ptr(), &n); }
-                unsafe {
-                    use std::arch::aarch64::*;
-                    let half = vdupq_n_f32(0.5);
-                    let one = vdupq_n_f32(1.0);
-                    let chunks8 = len / 8;
-                    for i in 0..chunks8 {
-                        let off = i * 8;
-                        let vx0 = vld1q_f32(src.as_ptr().add(off));
-                        let vx1 = vld1q_f32(src.as_ptr().add(off + 4));
-                        let vt0 = vld1q_f32(data.as_ptr().add(off));
-                        let vt1 = vld1q_f32(data.as_ptr().add(off + 4));
-                        let r0 = vmulq_f32(half, vmulq_f32(vx0, vaddq_f32(one, vt0)));
-                        let r1 = vmulq_f32(half, vmulq_f32(vx1, vaddq_f32(one, vt1)));
-                        vst1q_f32(data.as_mut_ptr().add(off), r0);
-                        vst1q_f32(data.as_mut_ptr().add(off + 4), r1);
-                    }
-                    for i in (chunks8 * 8)..len {
-                        data[i] = 0.5 * src[i] * (1.0 + data[i]);
-                    }
-                }
+                simd_kernels::vec_gelu_f32(src, &mut data);
             }
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(not(target_arch = "aarch64"))]
         {
+            let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
             if len >= PAR_THRESHOLD_EXPENSIVE {
                 data.par_iter_mut().enumerate().for_each(|(i, out)| {
                     let x = src[i];
@@ -3165,9 +3036,6 @@ impl Tensor {
                     *out = 0.5 * x * (1.0 + inner_val.tanh());
                 });
             } else {
-                #[cfg(target_arch = "aarch64")]
-                simd_kernels::vec_gelu_f32(src, &mut data);
-                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..len {
                     let x = src[i];
                     let inner_val = sqrt_2_over_pi * (x + 0.044715 * x * x * x);

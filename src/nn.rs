@@ -1075,11 +1075,68 @@ impl GRU {
                         for p in 0..hs { hh_buf[j] += h_data[p] * whh[p * 3 * hs + j]; }
                     }
                 }
-                for j in 0..hs {
-                    let r = 1.0 / (1.0 + (-(ih_t[j] + bih[j] + hh_buf[j] + bhh[j])).exp());
-                    let z = 1.0 / (1.0 + (-(ih_t[hs+j] + bih[hs+j] + hh_buf[hs+j] + bhh[hs+j])).exp());
-                    let n = (ih_t[2*hs+j] + bih[2*hs+j] + r * (hh_buf[2*hs+j] + bhh[2*hs+j])).tanh();
-                    h_data[j] = (1.0 - z) * n + z * h_data[j];
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if hs >= 512 {
+                        // NEON vectorized path for large hidden sizes
+                        use std::arch::aarch64::*;
+                        let chunks = hs / 4;
+                        unsafe {
+                            let one = vdupq_n_f32(1.0);
+                            let two = vdupq_n_f32(2.0);
+                            for c in 0..chunks {
+                                let off = c * 4;
+                                // r = sigmoid(ih_r + bih_r + hh_r + bhh_r)
+                                let vr_in = vaddq_f32(
+                                    vaddq_f32(vld1q_f32(ih_t.as_ptr().add(off)), vld1q_f32(bih.as_ptr().add(off))),
+                                    vaddq_f32(vld1q_f32(hh_buf.as_ptr().add(off)), vld1q_f32(bhh.as_ptr().add(off))),
+                                );
+                                let r_gate = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vr_in))));
+                                // z = sigmoid(ih_z + bih_z + hh_z + bhh_z)
+                                let vz_in = vaddq_f32(
+                                    vaddq_f32(vld1q_f32(ih_t.as_ptr().add(hs + off)), vld1q_f32(bih.as_ptr().add(hs + off))),
+                                    vaddq_f32(vld1q_f32(hh_buf.as_ptr().add(hs + off)), vld1q_f32(bhh.as_ptr().add(hs + off))),
+                                );
+                                let z_gate = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vz_in))));
+                                // n = tanh(ih_n + bih_n + r * (hh_n + bhh_n))
+                                let vn_hh = vaddq_f32(vld1q_f32(hh_buf.as_ptr().add(2 * hs + off)), vld1q_f32(bhh.as_ptr().add(2 * hs + off)));
+                                let vn_in = vaddq_f32(
+                                    vaddq_f32(vld1q_f32(ih_t.as_ptr().add(2 * hs + off)), vld1q_f32(bih.as_ptr().add(2 * hs + off))),
+                                    vmulq_f32(r_gate, vn_hh),
+                                );
+                                // tanh via 2*sigmoid(2x)-1
+                                let sig_2n = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vmulq_f32(two, vn_in)))));
+                                let n_gate = vsubq_f32(vmulq_f32(two, sig_2n), one);
+                                // h = (1 - z) * n + z * h
+                                let vh = vld1q_f32(h_data.as_ptr().add(off));
+                                let new_h = vaddq_f32(vmulq_f32(vsubq_f32(one, z_gate), n_gate), vmulq_f32(z_gate, vh));
+                                vst1q_f32(h_data.as_mut_ptr().add(off), new_h);
+                            }
+                            for j in (chunks * 4)..hs {
+                                let r = 1.0 / (1.0 + (-(ih_t[j] + bih[j] + hh_buf[j] + bhh[j])).exp());
+                                let z = 1.0 / (1.0 + (-(ih_t[hs+j] + bih[hs+j] + hh_buf[hs+j] + bhh[hs+j])).exp());
+                                let n = (ih_t[2*hs+j] + bih[2*hs+j] + r * (hh_buf[2*hs+j] + bhh[2*hs+j])).tanh();
+                                h_data[j] = (1.0 - z) * n + z * h_data[j];
+                            }
+                        }
+                    } else {
+                        // Scalar path — compiler auto-vectorizes well for small hidden sizes
+                        for j in 0..hs {
+                            let r = 1.0 / (1.0 + (-(ih_t[j] + bih[j] + hh_buf[j] + bhh[j])).exp());
+                            let z = 1.0 / (1.0 + (-(ih_t[hs+j] + bih[hs+j] + hh_buf[hs+j] + bhh[hs+j])).exp());
+                            let n = (ih_t[2*hs+j] + bih[2*hs+j] + r * (hh_buf[2*hs+j] + bhh[2*hs+j])).tanh();
+                            h_data[j] = (1.0 - z) * n + z * h_data[j];
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    for j in 0..hs {
+                        let r = 1.0 / (1.0 + (-(ih_t[j] + bih[j] + hh_buf[j] + bhh[j])).exp());
+                        let z = 1.0 / (1.0 + (-(ih_t[hs+j] + bih[hs+j] + hh_buf[hs+j] + bhh[hs+j])).exp());
+                        let n = (ih_t[2*hs+j] + bih[2*hs+j] + r * (hh_buf[2*hs+j] + bhh[2*hs+j])).tanh();
+                        h_data[j] = (1.0 - z) * n + z * h_data[j];
+                    }
                 }
                 output_data[t * hs..(t + 1) * hs].copy_from_slice(&h_data[..hs]);
             }

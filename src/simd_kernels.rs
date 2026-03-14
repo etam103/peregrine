@@ -426,57 +426,66 @@ pub fn vec_tanh_f32(a: &[f32], out: &mut [f32]) {
 pub fn vec_gelu_f32(a: &[f32], out: &mut [f32]) {
     let len = a.len();
     debug_assert_eq!(len, out.len());
-    let chunks8 = len / 8;
+    // Fused erf-based GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+    // Single-pass: inline erf polynomial to avoid temp buffer and extra memory passes.
+
+    // Chebyshev minimax coefficients for erf(x)/x as polynomial in t = x²
+    const C0: f32 =  1.128129804161227e+00;
+    const C1: f32 = -3.741529327142981e-01;
+    const C2: f32 =  1.089389590735535e-01;
+    const C3: f32 = -2.349168416541460e-02;
+    const C4: f32 =  3.621226487425877e-03;
+    const C5: f32 = -3.816719758455685e-04;
+    const C6: f32 =  2.579243632792871e-05;
+    const C7: f32 = -9.984449093863159e-07;
+    const C8: f32 =  1.674376841361261e-08;
+
+    let chunks = len / 4;
     unsafe {
+        let vinv = vdupq_n_f32(std::f32::consts::FRAC_1_SQRT_2);
         let half = vdupq_n_f32(0.5);
         let one = vdupq_n_f32(1.0);
-        let two = vdupq_n_f32(2.0);
-        let va = vdupq_n_f32(0.7978845608_f32);  // sqrt(2/pi)
-        let vb = vdupq_n_f32(0.0356774222_f32);  // sqrt(2/pi) * 0.044715
-        let ap = a.as_ptr();
-        let op = out.as_mut_ptr();
-        for i in 0..chunks8 {
-            let off = i * 8;
-            let vx0 = vld1q_f32(ap.add(off));
-            let vx1 = vld1q_f32(ap.add(off + 4));
-            let x2_0 = vmulq_f32(vx0, vx0);
-            let x2_1 = vmulq_f32(vx1, vx1);
-            let inner0 = vmulq_f32(vx0, vmlaq_f32(va, vb, x2_0));
-            let inner1 = vmulq_f32(vx1, vmlaq_f32(va, vb, x2_1));
-            // tanh via 2*sigmoid(2x)-1
-            let two_inner0 = vmulq_f32(two, inner0);
-            let two_inner1 = vmulq_f32(two, inner1);
-            let exp0 = fast_exp_f32x4(vnegq_f32(two_inner0));
-            let exp1 = fast_exp_f32x4(vnegq_f32(two_inner1));
-            let sig0 = vdivq_f32(one, vaddq_f32(one, exp0));
-            let sig1 = vdivq_f32(one, vaddq_f32(one, exp1));
-            let tanh0 = vsubq_f32(vmulq_f32(two, sig0), one);
-            let tanh1 = vsubq_f32(vmulq_f32(two, sig1), one);
-            let r0 = vmulq_f32(half, vmulq_f32(vx0, vaddq_f32(one, tanh0)));
-            let r1 = vmulq_f32(half, vmulq_f32(vx1, vaddq_f32(one, tanh1)));
-            vst1q_f32(op.add(off), r0);
-            vst1q_f32(op.add(off + 4), r1);
-        }
-        // Handle remaining chunk of 4
-        if chunks8 * 8 + 4 <= len {
-            let off = chunks8 * 8;
-            let vx = vld1q_f32(ap.add(off));
-            let x2 = vmulq_f32(vx, vx);
-            let inner = vmulq_f32(vx, vmlaq_f32(va, vb, x2));
-            let two_inner = vmulq_f32(two, inner);
-            let exp_neg = fast_exp_f32x4(vnegq_f32(two_inner));
-            let sig = vdivq_f32(one, vaddq_f32(one, exp_neg));
-            let tanh_val = vsubq_f32(vmulq_f32(two, sig), one);
-            let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_val)));
-            vst1q_f32(op.add(off), result);
+        let neg_one = vdupq_n_f32(-1.0);
+        let vc0 = vdupq_n_f32(C0);
+        let vc1 = vdupq_n_f32(C1);
+        let vc2 = vdupq_n_f32(C2);
+        let vc3 = vdupq_n_f32(C3);
+        let vc4 = vdupq_n_f32(C4);
+        let vc5 = vdupq_n_f32(C5);
+        let vc6 = vdupq_n_f32(C6);
+        let vc7 = vdupq_n_f32(C7);
+        let vc8 = vdupq_n_f32(C8);
+
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            // s = x / sqrt(2)
+            let vs = vmulq_f32(vx, vinv);
+            // erf(s) via polynomial: erf(s) = s * P(s²), clamped to [-1,1]
+            let s2 = vmulq_f32(vs, vs);
+            let p = vmlaq_f32(vc7, vc8, s2);
+            let p = vmlaq_f32(vc6, p, s2);
+            let p = vmlaq_f32(vc5, p, s2);
+            let p = vmlaq_f32(vc4, p, s2);
+            let p = vmlaq_f32(vc3, p, s2);
+            let p = vmlaq_f32(vc2, p, s2);
+            let p = vmlaq_f32(vc1, p, s2);
+            let p = vmlaq_f32(vc0, p, s2);
+            let erf_val = vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vs, p)));
+            // gelu = 0.5 * x * (1 + erf)
+            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, erf_val))));
         }
     }
-    let tail_start = (len / 4) * 4;
-    for i in tail_start..len {
+    // Scalar tail
+    let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+    for i in (chunks * 4)..len {
         let x = a[i];
-        let x2 = x * x;
-        let inner_val = x * (0.7978845608 + 0.0356774222 * x2);
-        out[i] = 0.5 * x * (1.0 + inner_val.tanh());
+        let s = x * inv_sqrt2;
+        let s2 = s * s;
+        let p = C0 + s2 * (C1 + s2 * (C2 + s2 * (C3 + s2 * (C4 + s2 * (C5
+            + s2 * (C6 + s2 * (C7 + s2 * C8)))))));
+        let erf_val = (s * p).clamp(-1.0, 1.0);
+        out[i] = 0.5 * x * (1.0 + erf_val);
     }
 }
 
@@ -2356,10 +2365,14 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     fn test_vec_gelu() {
         let a: Vec<f32> = (0..TEST_LEN).map(|i| (i as f32 - 33.0) * 0.1).collect();
-        let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
-        let expected: Vec<f32> = a.iter().map(|&x| {
-            let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-            0.5 * x * (1.0 + inner.tanh())
+        // Erf-based GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
+        // Compute reference via vec_erf_f32 (self-consistency test)
+        let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+        let scaled: Vec<f32> = a.iter().map(|&x| x * inv_sqrt2).collect();
+        let mut erf_ref = vec![0.0f32; TEST_LEN];
+        vec_erf_f32(&scaled, &mut erf_ref);
+        let expected: Vec<f32> = a.iter().zip(&erf_ref).map(|(&x, &e)| {
+            0.5 * x * (1.0 + e)
         }).collect();
         let mut out = vec![0.0; TEST_LEN];
         vec_gelu_f32(&a, &mut out);
