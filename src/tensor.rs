@@ -5452,7 +5452,12 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::HardTanh { input: self.clone(), min_val, max_val })
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].max(min_val).min(max_val); }
+            #[cfg(target_arch = "aarch64")]
+            {
+                simd_kernels::vec_clip_f32(&inner.data, min_val, max_val, &mut data);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            { for i in 0..len { data[i] = inner.data[i].max(min_val).min(max_val); } }
             Tensor::from_op(data, inner.shape.clone(), Op::HardTanh { input: self.clone(), min_val, max_val })
         }
     }
@@ -5517,12 +5522,38 @@ impl Tensor {
 
     /// Softplus: log(1 + exp(beta * x)) / beta.
     pub fn softplus(&self, beta: f32) -> Tensor {
+        if beta == 1.0 {
+            #[cfg(feature = "metal")]
+            self.sync_gpu_to_cpu();
+            let inner = self.0.borrow();
+            let len = inner.data.len();
+            let mut data = pool_get(len);
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_softplus_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
+            for i in 0..len {
+                let x = inner.data[i];
+                data[i] = if x > 20.0 { x } else if x < -20.0 { 0.0 } else { (1.0 + x.exp()).ln() };
+            }
+            return Tensor::from_op(data, inner.shape.clone(), Op::None);
+        }
         let bx = self.scale(beta);
         bx.exp().add(&Tensor::ones(&self.shape(), false)).log().scale(1.0 / beta)
     }
 
     /// Mish: x * tanh(softplus(x)).
     pub fn mish(&self) -> Tensor {
+        #[cfg(target_arch = "aarch64")]
+        {
+            #[cfg(feature = "metal")]
+            self.sync_gpu_to_cpu();
+            let inner = self.0.borrow();
+            let len = inner.data.len();
+            let mut data = pool_get(len);
+            simd_kernels::vec_mish_f32(&inner.data, &mut data);
+            return Tensor::from_op(data, inner.shape.clone(), Op::None);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         self.mul(&self.softplus(1.0).tanh())
     }
 
@@ -5548,6 +5579,17 @@ impl Tensor {
 
     /// Hard swish: x * relu6(x + 3) / 6.
     pub fn hardswish(&self) -> Tensor {
+        #[cfg(target_arch = "aarch64")]
+        {
+            #[cfg(feature = "metal")]
+            self.sync_gpu_to_cpu();
+            let inner = self.0.borrow();
+            let len = inner.data.len();
+            let mut data = pool_get(len);
+            simd_kernels::vec_hardswish_f32(&inner.data, &mut data);
+            return Tensor::from_op(data, inner.shape.clone(), Op::None);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         self.mul(
             &self.add(&Tensor::full(&self.shape(), 3.0, false))
                 .relu6()
@@ -5567,9 +5609,22 @@ impl Tensor {
 
     /// SELU: scale * (max(0,x) + min(0, alpha*(exp(x)-1))) with fixed constants.
     pub fn selu(&self) -> Tensor {
-        let alpha: f32 = 1.6732632;
-        let scale: f32 = 1.0507010;
-        self.elu(alpha).scale(scale)
+        #[cfg(target_arch = "aarch64")]
+        {
+            #[cfg(feature = "metal")]
+            self.sync_gpu_to_cpu();
+            let inner = self.0.borrow();
+            let len = inner.data.len();
+            let mut data = pool_get(len);
+            simd_kernels::vec_selu_f32(&inner.data, &mut data);
+            return Tensor::from_op(data, inner.shape.clone(), Op::None);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let alpha: f32 = 1.6732632;
+            let scale: f32 = 1.0507010;
+            self.elu(alpha).scale(scale)
+        }
     }
 
     /// Step function: 1.0 if x > threshold, 0.0 otherwise. Not differentiable (no grad).

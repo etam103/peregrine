@@ -1527,6 +1527,196 @@ pub fn vec_prod_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_si
     }
 }
 
+// ========================================================================
+// Phase 8: Fused activation kernels
+// ========================================================================
+
+/// hardswish: out[i] = x * clamp(x + 3, 0, 6) / 6
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_hardswish_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let three = vdupq_n_f32(3.0);
+        let zero = vdupq_n_f32(0.0);
+        let six = vdupq_n_f32(6.0);
+        let inv6 = vdupq_n_f32(1.0 / 6.0);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            // clamp(x + 3, 0, 6)
+            let clamped = vminq_f32(vmaxq_f32(vaddq_f32(vx, three), zero), six);
+            // x * clamped / 6
+            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vmulq_f32(vx, clamped), inv6));
+        }
+    }
+    for i in (chunks * 4)..len {
+        let x = a[i];
+        out[i] = x * (x + 3.0).max(0.0).min(6.0) / 6.0;
+    }
+}
+
+/// softplus: out[i] = log(1 + exp(x)) — NEON vectorized with overflow protection.
+/// For x > 20: result = x. For x < -20: result = 0. Otherwise: log(1 + exp(x)).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_softplus_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let one = vdupq_n_f32(1.0);
+        let thresh_hi = vdupq_n_f32(20.0);
+        let thresh_lo = vdupq_n_f32(-20.0);
+        let zero = vdupq_n_f32(0.0);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            // exp(x) via fast approximation
+            let exp_x = fast_exp_f32x4(vx);
+            // log(1 + exp(x)) — store to buffer for scalar log
+            let sum = vaddq_f32(one, exp_x);
+            let mut buf = [0.0f32; 4];
+            vst1q_f32(buf.as_mut_ptr(), sum);
+            buf[0] = buf[0].ln();
+            buf[1] = buf[1].ln();
+            buf[2] = buf[2].ln();
+            buf[3] = buf[3].ln();
+            let log_val = vld1q_f32(buf.as_ptr());
+            // Clamp: x > 20 → x, x < -20 → 0, else log_val
+            let hi_mask = vcgtq_f32(vx, thresh_hi);
+            let lo_mask = vcltq_f32(vx, thresh_lo);
+            let result = vbslq_f32(hi_mask, vx, vbslq_f32(lo_mask, zero, log_val));
+            vst1q_f32(out.as_mut_ptr().add(off), result);
+        }
+    }
+    for i in (chunks * 4)..len {
+        let x = a[i];
+        out[i] = if x > 20.0 { x } else if x < -20.0 { 0.0 } else { (1.0 + x.exp()).ln() };
+    }
+}
+
+/// mish: out[i] = x * tanh(softplus(x)) — NEON vectorized.
+/// tanh(y) = (exp(2y) - 1) / (exp(2y) + 1) = 1 - 2/(exp(2y) + 1)
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_mish_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let one = vdupq_n_f32(1.0);
+        let two = vdupq_n_f32(2.0);
+        let thresh_hi = vdupq_n_f32(20.0);
+        let thresh_lo = vdupq_n_f32(-10.0);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            // softplus(x) = log(1 + exp(x))
+            let exp_x = fast_exp_f32x4(vx);
+            let sum = vaddq_f32(one, exp_x);
+            let mut buf = [0.0f32; 4];
+            vst1q_f32(buf.as_mut_ptr(), sum);
+            buf[0] = buf[0].ln();
+            buf[1] = buf[1].ln();
+            buf[2] = buf[2].ln();
+            buf[3] = buf[3].ln();
+            let sp = vld1q_f32(buf.as_ptr());
+            // Clamp softplus for large/small x
+            let hi_mask = vcgtq_f32(vx, thresh_hi);
+            let sp_clamped = vbslq_f32(hi_mask, vx, sp);
+            // tanh(sp) = 1 - 2/(exp(2*sp) + 1)
+            let exp2sp = fast_exp_f32x4(vmulq_f32(two, sp_clamped));
+            let tanh_sp = vsubq_f32(one, vdivq_f32(two, vaddq_f32(exp2sp, one)));
+            // mish = x * tanh(sp)
+            let result = vmulq_f32(vx, tanh_sp);
+            // For very negative x, mish ≈ 0
+            let lo_mask = vcltq_f32(vx, thresh_lo);
+            let final_result = vbslq_f32(lo_mask, vx, result); // x * ~0 ≈ small
+            vst1q_f32(out.as_mut_ptr().add(off), final_result);
+        }
+    }
+    for i in (chunks * 4)..len {
+        let x = a[i];
+        let sp = if x > 20.0 { x } else if x < -20.0 { 0.0 } else { (1.0 + x.exp()).ln() };
+        out[i] = x * sp.tanh();
+    }
+}
+
+/// selu: out[i] = scale * elu(x, alpha) with fixed constants
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_selu_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let alpha: f32 = 1.6732632;
+    let scale: f32 = 1.0507010;
+    let chunks = len / 4;
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let one = vdupq_n_f32(1.0);
+        let valpha = vdupq_n_f32(alpha);
+        let vscale = vdupq_n_f32(scale);
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            let pos_mask = vcgtq_f32(vx, zero);
+            let neg_part = vmulq_f32(valpha, vsubq_f32(fast_exp_f32x4(vx), one));
+            let elu_result = vbslq_f32(pos_mask, vx, neg_part);
+            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vscale, elu_result));
+        }
+    }
+    for i in (chunks * 4)..len {
+        let x = a[i];
+        let e = if x > 0.0 { x } else { alpha * (x.exp() - 1.0) };
+        out[i] = scale * e;
+    }
+}
+
+/// logsumexp: single-pass fused reduction along last axis.
+/// data is [outer, inner] layout. out is [outer].
+/// Computes max, then log(sum(exp(x - max))) + max for each row.
+#[cfg(target_arch = "aarch64")]
+pub fn vec_logsumexp_rows(data: &[f32], out: &mut [f32], rows: usize, cols: usize) {
+    for r in 0..rows {
+        let row = &data[r * cols..(r + 1) * cols];
+        // Pass 1: find max
+        let mut mx = f32::NEG_INFINITY;
+        let chunks = cols / 4;
+        unsafe {
+            let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
+            for c in 0..chunks {
+                vmax = vmaxq_f32(vmax, vld1q_f32(row.as_ptr().add(c * 4)));
+            }
+            let mut buf = [0.0f32; 4];
+            vst1q_f32(buf.as_mut_ptr(), vmax);
+            mx = buf[0].max(buf[1]).max(buf[2]).max(buf[3]);
+        }
+        for c in (chunks * 4)..cols {
+            if row[c] > mx { mx = row[c]; }
+        }
+        // Pass 2: sum of exp(x - max)
+        let mut sum = 0.0f32;
+        unsafe {
+            let vmx = vdupq_n_f32(mx);
+            let mut vacc = vdupq_n_f32(0.0);
+            for c in 0..chunks {
+                let vx = vld1q_f32(row.as_ptr().add(c * 4));
+                vacc = vaddq_f32(vacc, fast_exp_f32x4(vsubq_f32(vx, vmx)));
+            }
+            let mut buf = [0.0f32; 4];
+            vst1q_f32(buf.as_mut_ptr(), vacc);
+            sum = buf[0] + buf[1] + buf[2] + buf[3];
+        }
+        for c in (chunks * 4)..cols {
+            sum += (row[c] - mx).exp();
+        }
+        out[r] = mx + sum.ln();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "aarch64")]
