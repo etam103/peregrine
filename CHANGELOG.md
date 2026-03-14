@@ -9,7 +9,7 @@ Benchmark numbers included for performance-related changes.
 
 ## [0.32.0] - 2026-03-14
 
-### Added — NEON + Accelerate performance blitz: 67→88 wins, 0.65x vs PyTorch
+### Added — NEON + Accelerate performance blitz: 67→100 wins, 0.54x vs PyTorch
 
 Comprehensive op-level optimization pass adding 12 NEON SIMD kernels, 5 NEON reduction kernels, 10 Apple Accelerate vForce integrations, fused activation pipelines, and threshold tuning. Peregrine went from effectively tied with PyTorch (0.98x) to **35% faster** (0.65x).
 
@@ -42,11 +42,11 @@ Comprehensive op-level optimization pass adding 12 NEON SIMD kernels, 5 NEON red
 
 | Metric | Before | After |
 |--------|--------|-------|
-| Wins | 67/141 | **88/141** |
-| vs PyTorch | 0.98x (tied) | **0.65x** (35% faster) |
-| vs MLX | 0.75x | **0.47x** (53% faster) |
-| vs TensorFlow | 0.52x | **0.36x** (64% faster) |
-| vs JAX | 0.66x | **0.44x** (56% faster) |
+| Wins | 67/141 | **100/141** |
+| vs PyTorch | 0.98x (tied) | **0.54x** (46% faster) |
+| vs MLX | 0.75x | **0.40x** (60% faster) |
+| vs TensorFlow | 0.52x | **0.29x** (71% faster) |
+| vs JAX | 0.66x | **0.37x** (63% faster) |
 
 Key individual improvements:
 - floor/ceil/round: 46→8.8µs (5.3x), sign: 54→8.8µs (6.2x)
@@ -56,6 +56,23 @@ Key individual improvements:
 - hard_tanh: 51→8.1µs (6.3x), hardswish: 85→10µs (8.5x)
 - rand_normal: 772→241µs (3.2x via vectorized Box-Muller)
 - add_500k: 100→48µs (2.1x via 8-wide NEON)
+- tril/triu: 42→7.8µs (5.5x via bulk row fill)
+- cosine_sim: 13.5→1.8µs (7.5x via fused NEON dot+norms)
+- rmsnorm: 57→19µs (3x via fused NEON inference path)
+- groupnorm: 72→22µs (3.3x via fused NEON inference path)
+- det: 23→19µs (skip-transpose for symmetric LAPACK ops)
+- pad: 17→2.5µs (6.8x via bulk copy_from_slice)
+- repeat: 124→6µs (20.8x via dimension-by-dimension tiling)
+
+**Additional optimizations:**
+- Skip unnecessary input transposes for symmetric LAPACK ops (det, eigh, cholesky)
+- Fused add_layer_norm with 3-pass NEON (add+mean, variance, normalize+scale)
+- Fast-path stack axis=0 with direct copy_from_slice
+- Parallel NEON exp for 400K+ elements (50K chunks per core)
+- 2x uniform RNG throughput (2 floats per u64)
+- NEON vectorized rand_bernoulli (vcltq_f32)
+- Accelerate vvexpf+vvlog1pf fused pipeline for logaddexp/softplus/mish
+- PAR_THRESHOLD_EXPENSIVE raised to 2M (NEON beats rayon+scalar)
 
 ---
 

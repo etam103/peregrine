@@ -231,7 +231,7 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 | matmul+bias+gelu 196x768x3072 | 1059.8 | **852.6** | — | 2356.8 | 1231.9 | 2115.6 |
 | add+layernorm 196x768 | 107.6 | **102.0** | — | 1212.0 | 1138.7 | 231.6 |
 
-Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.65x** (35% faster), **MLX 0.47x**, TensorFlow 0.36x, tinygrad 0.06x, JAX 0.44x. Peregrine wins 88 of 141 ops.
+Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.54x** (46% faster), **MLX 0.40x**, TensorFlow 0.29x, tinygrad 0.05x, JAX 0.37x. Peregrine wins 100 of 141 ops.
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
