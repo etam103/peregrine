@@ -302,26 +302,33 @@ pub fn nll_loss(log_probs: &Tensor, targets: &[usize]) -> Tensor {
 /// where x = pred - target. Uses tensor ops for autograd.
 pub fn smooth_l1_loss(pred: &Tensor, target: &Tensor, beta: f32) -> Tensor {
     assert!(beta > 0.0, "beta must be positive");
+
+    // Fused single-pass for non-grad tensors
+    if !pred.requires_grad() && !target.requires_grad() {
+        let p = pred.data();
+        let t = target.data();
+        let n = p.len();
+        let half_beta = 0.5 * beta;
+        let inv_beta = 0.5 / beta;
+        let mut sum = 0.0f64;
+        for i in 0..n {
+            let d = (p[i] - t[i]).abs();
+            sum += if d < beta { (d * d) as f64 * inv_beta as f64 } else { (d - half_beta) as f64 };
+        }
+        return Tensor::new(vec![(sum / n as f64) as f32], vec![1], false);
+    }
+
     let diff = pred.sub(target);
     let abs_diff = diff.abs();
-    // We compose using: if |d| < beta then 0.5*d^2/beta else |d| - 0.5*beta
-    // Build mask on CPU, apply via tensor ops
     let abs_data = abs_diff.data();
     let shape = abs_diff.shape();
-
-    // Quadratic region: 0.5 * diff^2 / beta
     let quadratic = diff.pow(2.0).scale(0.5 / beta);
-    // Linear region: |diff| - 0.5 * beta
-    let half_beta = Tensor::full(&shape, 0.5 * beta, false);
-    let linear = abs_diff.sub(&half_beta);
-
-    // Build mask tensor: 1.0 where |diff| < beta, 0.0 otherwise
+    let half_beta_t = Tensor::full(&shape, 0.5 * beta, false);
+    let linear = abs_diff.sub(&half_beta_t);
     let mask_data: Vec<f32> = abs_data.iter().map(|&v| if v < beta { 1.0 } else { 0.0 }).collect();
     let mask = Tensor::new(mask_data, shape.clone(), false);
     let inv_mask_data: Vec<f32> = abs_data.iter().map(|&v| if v < beta { 0.0 } else { 1.0 }).collect();
     let inv_mask = Tensor::new(inv_mask_data, shape, false);
-
-    // result = mask * quadratic + inv_mask * linear
     let result = quadratic.mul(&mask).add(&linear.mul(&inv_mask));
     result.mean()
 }
