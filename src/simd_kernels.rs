@@ -16,16 +16,22 @@ pub fn vec_add_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
     let len = a.len();
     debug_assert_eq!(len, b.len());
     debug_assert_eq!(len, out.len());
-    let chunks = len / 4;
+    let chunks8 = len / 8;
     unsafe {
-        for i in 0..chunks {
-            let off = i * 4;
-            let va = vld1q_f32(a.as_ptr().add(off));
-            let vb = vld1q_f32(b.as_ptr().add(off));
-            vst1q_f32(out.as_mut_ptr().add(off), vaddq_f32(va, vb));
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        let op = out.as_mut_ptr();
+        for i in 0..chunks8 {
+            let off = i * 8;
+            let va0 = vld1q_f32(ap.add(off));
+            let va1 = vld1q_f32(ap.add(off + 4));
+            let vb0 = vld1q_f32(bp.add(off));
+            let vb1 = vld1q_f32(bp.add(off + 4));
+            vst1q_f32(op.add(off), vaddq_f32(va0, vb0));
+            vst1q_f32(op.add(off + 4), vaddq_f32(va1, vb1));
         }
     }
-    for i in (chunks * 4)..len {
+    for i in (chunks8 * 8)..len {
         out[i] = a[i] + b[i];
     }
 }
@@ -56,16 +62,22 @@ pub fn vec_mul_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
     let len = a.len();
     debug_assert_eq!(len, b.len());
     debug_assert_eq!(len, out.len());
-    let chunks = len / 4;
+    let chunks8 = len / 8;
     unsafe {
-        for i in 0..chunks {
-            let off = i * 4;
-            let va = vld1q_f32(a.as_ptr().add(off));
-            let vb = vld1q_f32(b.as_ptr().add(off));
-            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(va, vb));
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        let op = out.as_mut_ptr();
+        for i in 0..chunks8 {
+            let off = i * 8;
+            let va0 = vld1q_f32(ap.add(off));
+            let va1 = vld1q_f32(ap.add(off + 4));
+            let vb0 = vld1q_f32(bp.add(off));
+            let vb1 = vld1q_f32(bp.add(off + 4));
+            vst1q_f32(op.add(off), vmulq_f32(va0, vb0));
+            vst1q_f32(op.add(off + 4), vmulq_f32(va1, vb1));
         }
     }
-    for i in (chunks * 4)..len {
+    for i in (chunks8 * 8)..len {
         out[i] = a[i] * b[i];
     }
 }

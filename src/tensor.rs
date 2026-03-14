@@ -3151,21 +3151,19 @@ impl Tensor {
             let mut data = pool_get(len);
             #[cfg(target_os = "macos")]
             {
-                // max(a,b) + log1p(exp(-|a-b|))
-                // Step 1: compute -|a-b| and max(a,b)
-                let mut neg_abs_diff = pool_get(len);
-                for i in 0..len {
-                    data[i] = a.data[i].max(b.data[i]); // store max in data
-                    neg_abs_diff[i] = -(a.data[i] - b.data[i]).abs();
-                }
-                // Step 2: exp(-|a-b|) via Accelerate
+                // logaddexp(a,b) = max(a,b) + log1p(exp(-|a-b|))
+                // Fused: compute -|a-b| in data, vvexpf in-place, vvlog1pf in-place, add max
                 let n = len as i32;
-                unsafe { vvexpf(neg_abs_diff.as_mut_ptr(), neg_abs_diff.as_ptr(), &n); }
-                // Step 3: log1p(exp_result) via Accelerate
-                unsafe { vvlog1pf(neg_abs_diff.as_mut_ptr(), neg_abs_diff.as_ptr(), &n); }
-                // Step 4: max + log1p_result
-                for i in 0..len { data[i] += neg_abs_diff[i]; }
-                pool_recycle(neg_abs_diff);
+                for i in 0..len {
+                    data[i] = -(a.data[i] - b.data[i]).abs();
+                }
+                unsafe {
+                    vvexpf(data.as_mut_ptr(), data.as_ptr(), &n);
+                    vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n);
+                }
+                for i in 0..len {
+                    data[i] += a.data[i].max(b.data[i]);
+                }
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -4334,11 +4332,9 @@ impl Tensor {
         } else {
             let mut data = pool_get(len);
             #[cfg(target_arch = "aarch64")]
-            {
-                crate::simd_kernels::vec_erf_f32(&inner.data, &mut data);
-            }
+            crate::simd_kernels::vec_erf_f32(&inner.data, &mut data);
             #[cfg(not(target_arch = "aarch64"))]
-            { for i in 0..len { data[i] = erf_approx(inner.data[i]); } }
+            for i in 0..len { data[i] = erf_approx(inner.data[i]); }
             Tensor::from_op(data, inner.shape.clone(), Op::Erf(self.clone()))
         }
     }
