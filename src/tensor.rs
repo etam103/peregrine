@@ -1690,41 +1690,58 @@ impl Tensor {
             );
         }
 
-        // Step 3: in-place gelu over entire buffer linearly (cache-friendly)
+        // Step 3: in-place gelu using Accelerate vvtanhf for optimal cache behavior
         let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
         let total = m * n;
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             use std::arch::aarch64::*;
+
+            // Back up x values — out_data will be overwritten by inner then tanh
+            let mut x_backup = pool_get(total);
+            x_backup[..total].copy_from_slice(&out_data[..total]);
+
+            // Pass 1: compute inner = sqrt(2/pi) * (x + 0.044715 * x³) into out_data
             unsafe {
-                let half = vdupq_n_f32(0.5);
-                let one = vdupq_n_f32(1.0);
-                let two = vdupq_n_f32(2.0);
-                let coeff = vdupq_n_f32(0.044715);
                 let s2p = vdupq_n_f32(sqrt_2_over_pi);
+                let coeff = vdupq_n_f32(0.044715);
                 let chunks = total / 4;
                 for c in 0..chunks {
                     let off = c * 4;
-                    let ptr = out_data.as_mut_ptr().add(off);
-                    let vx = vld1q_f32(ptr);
+                    let vx = vld1q_f32(x_backup.as_ptr().add(off));
                     let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
                     let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
-                    let two_inner = vmulq_f32(two, inner);
-                    let neg_2inner = vnegq_f32(two_inner);
-                    let exp_neg = simd_kernels::fast_exp_f32x4(neg_2inner);
-                    let sig = vdivq_f32(one, vaddq_f32(one, exp_neg));
-                    let tanh_val = vsubq_f32(vmulq_f32(two, sig), one);
-                    let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_val)));
-                    vst1q_f32(ptr, result);
+                    vst1q_f32(out_data.as_mut_ptr().add(off), inner);
                 }
                 for i in (chunks * 4)..total {
-                    let x = out_data[i];
-                    let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
-                    out_data[i] = 0.5 * x * (1.0 + inner.tanh());
+                    let x = x_backup[i];
+                    out_data[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
                 }
             }
+
+            // Pass 2: tanh via Accelerate vvtanhf (one optimized call)
+            let n_i32 = total as i32;
+            unsafe { vvtanhf(out_data.as_mut_ptr(), out_data.as_ptr(), &n_i32); }
+
+            // Pass 3: result = 0.5 * x * (1 + tanh_val)
+            unsafe {
+                let half = vdupq_n_f32(0.5);
+                let one = vdupq_n_f32(1.0);
+                let chunks = total / 4;
+                for c in 0..chunks {
+                    let off = c * 4;
+                    let vx = vld1q_f32(x_backup.as_ptr().add(off));
+                    let tanh_v = vld1q_f32(out_data.as_ptr().add(off));
+                    let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_v)));
+                    vst1q_f32(out_data.as_mut_ptr().add(off), result);
+                }
+                for i in (chunks * 4)..total {
+                    out_data[i] = 0.5 * x_backup[i] * (1.0 + out_data[i]);
+                }
+            }
+            pool_recycle(x_backup);
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
             for i in 0..total {
                 let x = out_data[i];
