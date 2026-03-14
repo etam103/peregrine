@@ -1521,8 +1521,31 @@ impl Tensor {
             }
         }
 
-        // CPU fallback: unfused
-        self.matmul(weight).add_bias(bias).relu()
+        // CPU fused: matmul + bias + relu in one pass over output
+        let a = self.0.borrow();
+        let w = weight.0.borrow();
+        let b = bias.0.borrow();
+        let (m, k) = (a.shape[0], a.shape[1]);
+        let n = w.shape[1];
+        let mut data = pool_get(m * n);
+        #[cfg(target_os = "macos")]
+        sgemm(false, false, m, n, k, 1.0, &a.data, k, &w.data, n, 0.0, &mut data, n);
+        #[cfg(not(target_os = "macos"))]
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k { sum += a.data[i * k + p] * w.data[p * n + j]; }
+                data[i * n + j] = sum;
+            }
+        }
+        // Fused bias + relu
+        for i in 0..m {
+            for j in 0..n {
+                let idx = i * n + j;
+                data[idx] = (data[idx] + b.data[j]).max(0.0);
+            }
+        }
+        Tensor::from_op(data, vec![m, n], Op::None)
     }
 
     /// Fused matmul + bias + gelu: self=[M,K] x weight=[K,N] + bias=[1,N] -> gelu -> [M,N].
