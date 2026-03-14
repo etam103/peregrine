@@ -1352,9 +1352,9 @@ pub fn vec_sign_f32(a: &[f32], out: &mut [f32]) {
 
 /// erf: out[i] = erf(a[i]) — exp-free Chebyshev polynomial approximation via NEON
 ///
-/// Uses erf(x) = clamp(x * P(x²), -1, 1) where P is a degree-9 Chebyshev
-/// polynomial in x² (degree-19 in x). No exp, no division.
-/// Fitted on [0, 3.5] via Chebyshev interpolation; max error < 1.4e-4.
+/// Uses erf(x) = clamp(x * P(x²), -1, 1) where P is a degree-8 Chebyshev
+/// polynomial in x² (degree-17 in x). No exp, no division.
+/// Fitted on [0, 3.5] via Chebyshev interpolation; max error < 2.1e-4.
 /// For |x| >= 3.5, erf(x) is within 1e-6 of +-1, handled by clamping.
 #[cfg(target_arch = "aarch64")]
 #[inline]
@@ -1364,18 +1364,17 @@ pub fn vec_erf_f32(a: &[f32], out: &mut [f32]) {
     let chunks = len / 4;
 
     // Chebyshev minimax coefficients for erf(x)/x as polynomial in t = x²
-    // Fitted on t in [0, 12.25] (x in [0, 3.5]), max error < 1.4e-4.
-    // At typical values (|x| < 3): error < 2.5e-5.
-    const C0: f32 =  1.128315693228495e+00_f32;
-    const C1: f32 = -3.755201521514494e-01_f32;
-    const C2: f32 =  1.113952330035950e-01_f32;
-    const C3: f32 = -2.536343500326186e-02_f32;
-    const C4: f32 =  4.366172075209025e-03_f32;
-    const C5: f32 = -5.519537629049239e-04_f32;
-    const C6: f32 =  4.896068801240769e-05_f32;
-    const C7: f32 = -2.851161197497255e-06_f32;
-    const C8: f32 =  9.709166036567753e-08_f32;
-    const C9: f32 = -1.457558130649152e-09_f32;
+    // Fitted on t in [0, 12.25] (x in [0, 3.5]), max error < 2.1e-4.
+    // At typical values (|x| < 3): error < 5e-5.
+    const C0: f32 =  1.128129804161227e+00_f32;
+    const C1: f32 = -3.741529327142981e-01_f32;
+    const C2: f32 =  1.089389590735535e-01_f32;
+    const C3: f32 = -2.349168416541460e-02_f32;
+    const C4: f32 =  3.621226487425877e-03_f32;
+    const C5: f32 = -3.816719758455685e-04_f32;
+    const C6: f32 =  2.579243632792871e-05_f32;
+    const C7: f32 = -9.984449093863159e-07_f32;
+    const C8: f32 =  1.674376841361261e-08_f32;
 
     unsafe {
         let one = vdupq_n_f32(1.0);
@@ -1389,16 +1388,14 @@ pub fn vec_erf_f32(a: &[f32], out: &mut [f32]) {
         let vc6 = vdupq_n_f32(C6);
         let vc7 = vdupq_n_f32(C7);
         let vc8 = vdupq_n_f32(C8);
-        let vc9 = vdupq_n_f32(C9);
 
         for i in 0..chunks {
             let off = i * 4;
             let vx = vld1q_f32(a.as_ptr().add(off));
             let x2 = vmulq_f32(vx, vx);
 
-            // Horner: P(x²) = c0 + x²*(c1 + x²*(c2 + ... + x²*(c8 + x²*c9)...))
-            let p = vmlaq_f32(vc8, vc9, x2);
-            let p = vmlaq_f32(vc7, p, x2);
+            // Horner: P(x²) = c0 + x²*(c1 + x²*(c2 + ... + x²*(c7 + x²*c8)...))
+            let p = vmlaq_f32(vc7, vc8, x2);
             let p = vmlaq_f32(vc6, p, x2);
             let p = vmlaq_f32(vc5, p, x2);
             let p = vmlaq_f32(vc4, p, x2);
@@ -1419,7 +1416,7 @@ pub fn vec_erf_f32(a: &[f32], out: &mut [f32]) {
         let x = a[i];
         let x2 = x * x;
         let p = C0 + x2 * (C1 + x2 * (C2 + x2 * (C3 + x2 * (C4 + x2 * (C5
-            + x2 * (C6 + x2 * (C7 + x2 * (C8 + x2 * C9))))))));
+            + x2 * (C6 + x2 * (C7 + x2 * C8)))))));
         out[i] = (x * p).clamp(-1.0, 1.0);
     }
 }
