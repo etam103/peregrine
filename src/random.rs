@@ -1,4 +1,4 @@
-use crate::cpu_pool::pool_get;
+use crate::cpu_pool::{pool_get, pool_recycle};
 use crate::tensor::Tensor;
 use std::sync::Mutex;
 
@@ -89,21 +89,65 @@ pub fn uniform(shape: &[usize], low: f32, high: f32, requires_grad: bool) -> Ten
 pub fn normal(shape: &[usize], mean: f32, std: f32, requires_grad: bool) -> Tensor {
     let n: usize = shape.iter().product();
     let data = with_rng(|rng| {
-        // Allocate for pairs (round up to even)
         let alloc_n = n + (n & 1);
-        let mut buf = pool_get(alloc_n);
-        let mut i = 0;
-        while i < alloc_n {
-            let u1 = rng.next_f32().max(1e-10);
-            let u2 = rng.next_f32();
-            let r = (-2.0 * u1.ln()).sqrt();
-            let theta = 2.0 * std::f32::consts::PI * u2;
-            buf[i] = mean + std * r * theta.cos();
-            buf[i + 1] = mean + std * r * theta.sin();
-            i += 2;
+        let pairs = alloc_n / 2;
+        let mut u1_buf = pool_get(pairs);
+        let mut u2_buf = pool_get(pairs);
+        // Generate uniform pairs
+        for i in 0..pairs {
+            u1_buf[i] = rng.next_f32().max(1e-10);
+            u2_buf[i] = rng.next_f32();
         }
-        buf.truncate(n);
-        buf
+        #[cfg(target_os = "macos")]
+        {
+            // Vectorized Box-Muller via Accelerate
+            extern "C" {
+                fn vvlogf(r: *mut f32, x: *const f32, n: *const i32);
+                fn vvcosf(r: *mut f32, x: *const f32, n: *const i32);
+                fn vvsinf(r: *mut f32, x: *const f32, n: *const i32);
+            }
+            let np = pairs as i32;
+            // r = sqrt(-2 * ln(u1))
+            unsafe { vvlogf(u1_buf.as_mut_ptr(), u1_buf.as_ptr(), &np); }
+            for i in 0..pairs { u1_buf[i] = (-2.0 * u1_buf[i]).sqrt(); }
+            // theta = 2*PI*u2
+            let two_pi = 2.0 * std::f32::consts::PI;
+            for i in 0..pairs { u2_buf[i] *= two_pi; }
+            // cos(theta), sin(theta)
+            let mut cos_buf = pool_get(pairs);
+            let mut sin_buf = pool_get(pairs);
+            unsafe {
+                vvcosf(cos_buf.as_mut_ptr(), u2_buf.as_ptr(), &np);
+                vvsinf(sin_buf.as_mut_ptr(), u2_buf.as_ptr(), &np);
+            }
+            // Interleave: buf[2i] = mean + std * r * cos, buf[2i+1] = mean + std * r * sin
+            let mut buf = pool_get(alloc_n);
+            for i in 0..pairs {
+                let r = u1_buf[i];
+                buf[2 * i] = mean + std * r * cos_buf[i];
+                buf[2 * i + 1] = mean + std * r * sin_buf[i];
+            }
+            pool_recycle(cos_buf);
+            pool_recycle(sin_buf);
+            pool_recycle(u1_buf);
+            pool_recycle(u2_buf);
+            buf.truncate(n);
+            buf
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut buf = pool_get(alloc_n);
+            for i in 0..pairs {
+                let r = (-2.0 * u1_buf[i].ln()).sqrt();
+                let theta = 2.0 * std::f32::consts::PI * u2_buf[i];
+                buf[2 * i] = mean + std * r * theta.cos();
+                buf[2 * i + 1] = mean + std * r * theta.sin();
+            }
+            pool_recycle(u1_buf);
+            pool_recycle(u2_buf);
+            buf.truncate(n);
+            buf
+        }
     });
     Tensor::new(data, shape.to_vec(), requires_grad)
 }
