@@ -3856,7 +3856,21 @@ impl Tensor {
         self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
-        {
+        if len >= 400_000 {
+            // Parallel NEON for large sizes
+            use rayon::prelude::*;
+            let mut data = pool_get(len);
+            let chunk = 50_000; // ~200µs per chunk, good for 10 cores
+            inner.data.par_chunks(chunk)
+                .zip(data.par_chunks_mut(chunk))
+                .for_each(|(src, dst)| {
+                    #[cfg(target_arch = "aarch64")]
+                    simd_kernels::vec_exp_f32(src, dst);
+                    #[cfg(not(target_arch = "aarch64"))]
+                    for i in 0..src.len() { dst[i] = src[i].exp(); }
+                });
+            Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
+        } else {
             let mut data = pool_get(len);
             #[cfg(target_arch = "aarch64")]
             simd_kernels::vec_exp_f32(&inner.data, &mut data);

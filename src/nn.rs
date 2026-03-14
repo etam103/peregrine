@@ -510,8 +510,8 @@ impl RMSNorm {
         let last = *shape.last().unwrap();
         assert_eq!(last, self.dim, "RMSNorm: last dim must match");
 
-        // Fast fused path for inference (no autograd needed)
-        if !x.requires_grad() && !self.weight.requires_grad() {
+        // Fast fused path for inference (input doesn't need grad)
+        if !x.requires_grad() {
             let data = x.data();
             let n = data.len();
             let num_vecs = n / self.dim;
@@ -1322,7 +1322,7 @@ impl GroupNorm {
         let cpg = channels / self.num_groups; // channels per group
 
         // Fused inference path: single-pass mean+var with NEON, no autograd overhead
-        if !x.requires_grad() && !self.weight.requires_grad() {
+        if !x.requires_grad() {
             let data = x.data();
             let w = self.weight.data();
             let b = self.bias.data();
