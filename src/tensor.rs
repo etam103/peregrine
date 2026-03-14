@@ -4946,15 +4946,73 @@ impl Tensor {
 
         let data = &self.0.borrow().data;
         let mut out_data = vec![0.0f32; out_len];
+        #[cfg(target_arch = "aarch64")]
+        if inner_size == 1 {
+            // Fused NEON two-pass variance for last-axis reduction
+            use std::arch::aarch64::*;
+            let denom = (reduce_size - ddof) as f32;
+            let chunks = reduce_size / 4;
+            for o in 0..outer_size {
+                let base = o * reduce_size;
+                // Pass 1: sum for mean
+                let mut sum;
+                unsafe {
+                    let mut vacc = vdupq_n_f32(0.0);
+                    for c in 0..chunks {
+                        vacc = vaddq_f32(vacc, vld1q_f32(data.as_ptr().add(base + c * 4)));
+                    }
+                    sum = vaddvq_f32(vacc);
+                }
+                for r in (chunks * 4)..reduce_size { sum += data[base + r]; }
+                let mean = sum / reduce_size as f32;
+                // Pass 2: sum of squared diffs
+                let mut var_sum;
+                unsafe {
+                    let vmean = vdupq_n_f32(mean);
+                    let mut vacc = vdupq_n_f32(0.0);
+                    for c in 0..chunks {
+                        let vx = vld1q_f32(data.as_ptr().add(base + c * 4));
+                        let diff = vsubq_f32(vx, vmean);
+                        vacc = vmlaq_f32(vacc, diff, diff);
+                    }
+                    var_sum = vaddvq_f32(vacc);
+                }
+                for r in (chunks * 4)..reduce_size {
+                    let diff = data[base + r] - mean;
+                    var_sum += diff * diff;
+                }
+                out_data[o] = var_sum / denom;
+            }
+        } else {
+            #[cfg(target_arch = "aarch64")]
+            let _ = (); // fallthrough to scalar below
+        }
+        #[cfg(target_arch = "aarch64")]
+        if inner_size != 1 {
+            for o in 0..outer_size {
+                for i in 0..inner_size {
+                    let mut sum = 0.0f32;
+                    for r in 0..reduce_size {
+                        sum += data[o * reduce_size * inner_size + r * inner_size + i];
+                    }
+                    let mean = sum / reduce_size as f32;
+                    let mut var_acc = 0.0f32;
+                    for r in 0..reduce_size {
+                        let diff = data[o * reduce_size * inner_size + r * inner_size + i] - mean;
+                        var_acc += diff * diff;
+                    }
+                    out_data[o * inner_size + i] = var_acc / (reduce_size - ddof) as f32;
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         for o in 0..outer_size {
             for i in 0..inner_size {
-                // Compute mean
                 let mut sum = 0.0f32;
                 for r in 0..reduce_size {
                     sum += data[o * reduce_size * inner_size + r * inner_size + i];
                 }
                 let mean = sum / reduce_size as f32;
-                // Compute variance
                 let mut var_acc = 0.0f32;
                 for r in 0..reduce_size {
                     let diff = data[o * reduce_size * inner_size + r * inner_size + i] - mean;
@@ -5052,9 +5110,33 @@ impl Tensor {
 
         let data = &self.0.borrow().data;
         let mut out_data = vec![0.0f32; out_len];
+        #[cfg(target_arch = "aarch64")]
+        if inner_size == 1 {
+            simd_kernels::vec_logsumexp_rows(data, &mut out_data, outer_size, reduce_size);
+        } else {
+            #[cfg(target_arch = "aarch64")]
+            let _ = ();
+        }
+        #[cfg(target_arch = "aarch64")]
+        if inner_size != 1 {
+            for o in 0..outer_size {
+                for i in 0..inner_size {
+                    let mut mx = f32::NEG_INFINITY;
+                    for r in 0..reduce_size {
+                        let val = data[o * reduce_size * inner_size + r * inner_size + i];
+                        if val > mx { mx = val; }
+                    }
+                    let mut acc = 0.0f32;
+                    for r in 0..reduce_size {
+                        acc += (data[o * reduce_size * inner_size + r * inner_size + i] - mx).exp();
+                    }
+                    out_data[o * inner_size + i] = mx + acc.ln();
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         for o in 0..outer_size {
             for i in 0..inner_size {
-                // Find max for numerical stability
                 let mut mx = f32::NEG_INFINITY;
                 for r in 0..reduce_size {
                     let val = data[o * reduce_size * inner_size + r * inner_size + i];
