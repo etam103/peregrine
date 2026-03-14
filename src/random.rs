@@ -77,8 +77,16 @@ pub fn uniform(shape: &[usize], low: f32, high: f32, requires_grad: bool) -> Ten
     let data = with_rng(|rng| {
         let mut buf = pool_get(n);
         let range = high - low;
-        for i in 0..n {
-            buf[i] = low + range * rng.next_f32();
+        let scale = 1.0 / (1u32 << 24) as f32;
+        // Generate 2 floats per u64 for throughput
+        let pairs = n / 2;
+        for i in 0..pairs {
+            let u = rng.next_u64();
+            buf[2 * i] = low + range * ((u >> 40) as f32 * scale);
+            buf[2 * i + 1] = low + range * (((u >> 16) & 0xFFFFFF) as f32 * scale);
+        }
+        if n & 1 != 0 {
+            buf[n - 1] = low + range * rng.next_f32();
         }
         buf
     });

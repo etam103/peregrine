@@ -818,7 +818,7 @@ pub fn bench_pipeline_ops(quick: bool) -> Vec<BenchResult> {
         let w = Tensor::randn(&[*k, *n], false);
         let b = Tensor::randn(&[1, *n], false);
         let times = bench(|| {
-            let h = x.matmul(&w).add_bias(&b).gelu();
+            let h = x.matmul_bias_gelu(&w, &b);
             black_box(h);
         }, iters_s);
         results.push(make_result(&format!("matmul_bias_gelu_{label}"), "pipeline", times));
@@ -839,7 +839,7 @@ pub fn bench_pipeline_ops(quick: bool) -> Vec<BenchResult> {
         let g = Tensor::randn(&[*dim], false);
         let b = Tensor::randn(&[*dim], false);
         let times = bench(|| {
-            let out = x.add(&r).layer_norm(&g, &b, *dim);
+            let out = x.add_layer_norm(&r, &g, &b, *dim);
             black_box(out);
         }, iters_f);
         results.push(make_result(&format!("add_layernorm_{label}"), "pipeline", times));
