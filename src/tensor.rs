@@ -3063,9 +3063,22 @@ impl Tensor {
                 src_chunks.into_par_iter().zip(out_chunks).for_each(|(s, d)| {
                     let clen = s.len();
                     let mut tmp = vec![0.0f32; clen];
-                    for i in 0..clen {
-                        let x = s[i];
-                        tmp[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                    unsafe {
+                        use std::arch::aarch64::*;
+                        let s2p = vdupq_n_f32(sqrt_2_over_pi);
+                        let coeff = vdupq_n_f32(0.044715);
+                        let simd_n = clen / 4;
+                        for c in 0..simd_n {
+                            let off = c * 4;
+                            let vx = vld1q_f32(s.as_ptr().add(off));
+                            let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
+                            let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
+                            vst1q_f32(tmp.as_mut_ptr().add(off), inner);
+                        }
+                        for i in (simd_n * 4)..clen {
+                            let x = s[i];
+                            tmp[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                        }
                     }
                     let n = clen as i32;
                     unsafe { vvtanhf(d.as_mut_ptr(), tmp.as_ptr(), &n); }
@@ -3088,9 +3101,22 @@ impl Tensor {
                 });
             } else {
                 // 2-pass (no temp buffer): compute inner into data, vvtanhf in-place, NEON combine
-                for i in 0..len {
-                    let x = src[i];
-                    data[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let s2p = vdupq_n_f32(sqrt_2_over_pi);
+                    let coeff = vdupq_n_f32(0.044715);
+                    let chunks = len / 4;
+                    for c in 0..chunks {
+                        let off = c * 4;
+                        let vx = vld1q_f32(src.as_ptr().add(off));
+                        let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
+                        let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
+                        vst1q_f32(data.as_mut_ptr().add(off), inner);
+                    }
+                    for i in (chunks * 4)..len {
+                        let x = src[i];
+                        data[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                    }
                 }
                 let n = len as i32;
                 unsafe { vvtanhf(data.as_mut_ptr(), data.as_ptr(), &n); }
@@ -3387,12 +3413,9 @@ impl Tensor {
         if a.shape == b.shape {
             let len = a.data.len();
             let mut data = pool_get(len);
-            #[cfg(target_os = "macos")]
-            {
-                let n = len as i32;
-                unsafe { vvatan2f(data.as_mut_ptr(), a.data.as_ptr(), b.data.as_ptr(), &n); }
-            }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_arctan2_f32(&a.data, &b.data, &mut data); }
+            #[cfg(not(target_arch = "aarch64"))]
             { for i in 0..len { data[i] = a.data[i].atan2(b.data[i]); } }
             Tensor::from_op(data, a.shape.clone(), Op::Arctan2(self.clone(), other.clone()))
         } else {
@@ -3436,10 +3459,52 @@ impl Tensor {
         if a.shape == b.shape {
             let len = a.data.len();
             let mut data = pool_get(len);
-            #[cfg(target_arch = "aarch64")]
-            simd_kernels::vec_logaddexp_f32(&a.data, &b.data, &mut data);
-            #[cfg(not(target_arch = "aarch64"))]
-            for i in 0..len { data[i] = logaddexp_fn(a.data[i], b.data[i]); }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                use std::arch::aarch64::*;
+                let n_i32 = len as i32;
+                unsafe {
+                    // Pass 1: NEON compute max and exp(-|a-b|)
+                    let chunks = len / 4;
+                    let mut max_buf = pool_get(len);
+                    for c in 0..chunks {
+                        let off = c * 4;
+                        let va = vld1q_f32(a.data.as_ptr().add(off));
+                        let vb = vld1q_f32(b.data.as_ptr().add(off));
+                        let vmax = vmaxq_f32(va, vb);
+                        let neg_abs_diff = vnegq_f32(vabsq_f32(vsubq_f32(va, vb)));
+                        let exp_val = simd_kernels::fast_exp_f32x4(neg_abs_diff);
+                        vst1q_f32(max_buf.as_mut_ptr().add(off), vmax);
+                        vst1q_f32(data.as_mut_ptr().add(off), exp_val);
+                    }
+                    for i in (chunks * 4)..len {
+                        max_buf[i] = a.data[i].max(b.data[i]);
+                        data[i] = (-(a.data[i] - b.data[i]).abs()).exp();
+                    }
+                    // Pass 2: vvlog1pf (Apple optimized)
+                    vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n_i32);
+                    // Pass 3: add max
+                    for c in 0..chunks {
+                        let off = c * 4;
+                        let result = vaddq_f32(
+                            vld1q_f32(data.as_ptr().add(off)),
+                            vld1q_f32(max_buf.as_ptr().add(off))
+                        );
+                        vst1q_f32(data.as_mut_ptr().add(off), result);
+                    }
+                    for i in (chunks * 4)..len {
+                        data[i] += max_buf[i];
+                    }
+                    pool_recycle(max_buf);
+                }
+            }
+            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+            {
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_logaddexp_f32(&a.data, &b.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
+                for i in 0..len { data[i] = logaddexp_fn(a.data[i], b.data[i]); }
+            }
             Tensor::from_op(data, a.shape.clone(), Op::Logaddexp(self.clone(), other.clone()))
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, logaddexp_fn);
@@ -4793,9 +4858,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Arccos(self.clone()))
         } else {
             let mut data = pool_get(len);
-            #[cfg(target_os = "macos")]
-            { let n = len as i32; unsafe { vvacosf(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_arccos_f32(&inner.data, &mut data); }
+            #[cfg(not(target_arch = "aarch64"))]
             { for i in 0..len { data[i] = inner.data[i].acos(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Arccos(self.clone()))
         }
@@ -4866,9 +4931,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Arcsinh(self.clone()))
         } else {
             let mut data = pool_get(len);
-            #[cfg(target_os = "macos")]
-            { let n = len as i32; unsafe { vvasinhf(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_arch = "aarch64")]
+            { simd_kernels::vec_arcsinh_f32(&inner.data, &mut data); }
+            #[cfg(not(target_arch = "aarch64"))]
             { for i in 0..len { data[i] = inner.data[i].asinh(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Arcsinh(self.clone()))
         }

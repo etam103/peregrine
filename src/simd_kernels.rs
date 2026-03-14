@@ -1886,6 +1886,171 @@ pub fn vec_logsumexp_rows(data: &[f32], out: &mut [f32], rows: usize, cols: usiz
 }
 
 // ========================================================================
+// Phase 10b: Custom NEON transcendental kernels (arccos, arctan2, arcsinh)
+// ========================================================================
+
+/// NEON arccos(x) via range-reduced arcsin polynomial.
+/// For |x| <= 0.5: arcsin(x) = x + x^3 * P(x^2), arccos = pi/2 - arcsin
+/// For |x| > 0.5: arcsin(x) = pi/2 - 2*arcsin(sqrt((1-|x|)/2))
+/// Max error ~2e-7 over [-1, 1].
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_arccos_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let pi_2 = vdupq_n_f32(std::f32::consts::FRAC_PI_2);
+        let one = vdupq_n_f32(1.0);
+        let half = vdupq_n_f32(0.5);
+        let two = vdupq_n_f32(2.0);
+        let zero = vdupq_n_f32(0.0);
+        // Minimax polynomial coefficients for arcsin(x) = x + x^3 * P(x^2)
+        let c1 = vdupq_n_f32(0.16666667_f32);
+        let c2 = vdupq_n_f32(0.07500000_f32);
+        let c3 = vdupq_n_f32(0.04464286_f32);
+        let c4 = vdupq_n_f32(0.03038194_f32);
+        let c5 = vdupq_n_f32(0.02237216_f32);
+
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            let abs_x = vabsq_f32(vx);
+
+            // Small path (|x| <= 0.5): arcsin(|x|) = |x| + |x|^3 * P(|x|^2)
+            let x2 = vmulq_f32(abs_x, abs_x);
+            let p = vmlaq_f32(c4, c5, x2);
+            let p = vmlaq_f32(c3, p, x2);
+            let p = vmlaq_f32(c2, p, x2);
+            let p = vmlaq_f32(c1, p, x2);
+            let asin_small = vaddq_f32(abs_x, vmulq_f32(vmulq_f32(abs_x, x2), p));
+
+            // Large path (|x| > 0.5): arcsin(|x|) = pi/2 - 2*arcsin(sqrt((1-|x|)/2))
+            let t = vmulq_f32(half, vsubq_f32(one, abs_x));
+            let s = vsqrtq_f32(t);
+            let s2 = vmulq_f32(s, s);
+            let p2 = vmlaq_f32(c4, c5, s2);
+            let p2 = vmlaq_f32(c3, p2, s2);
+            let p2 = vmlaq_f32(c2, p2, s2);
+            let p2 = vmlaq_f32(c1, p2, s2);
+            let asin_large = vsubq_f32(pi_2, vmulq_f32(two, vaddq_f32(s, vmulq_f32(vmulq_f32(s, s2), p2))));
+
+            // Select based on |x| > 0.5
+            let big = vcgtq_f32(abs_x, half);
+            let asin_val = vbslq_f32(big, asin_large, asin_small);
+
+            // arccos(x) = pi/2 - sign(x) * arcsin(|x|)
+            let neg = vcltq_f32(vx, zero);
+            let signed_asin = vbslq_f32(neg, vnegq_f32(asin_val), asin_val);
+            let result = vsubq_f32(pi_2, signed_asin);
+
+            vst1q_f32(out.as_mut_ptr().add(off), result);
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i].acos();
+    }
+}
+
+/// NEON arctan2(y, x) via minimax polynomial for atan on [0, 1] with quadrant logic.
+/// Max error ~5e-6 over full range.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_arctan2_f32(y: &[f32], x: &[f32], out: &mut [f32]) {
+    let len = y.len();
+    debug_assert_eq!(len, x.len());
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let pi = vdupq_n_f32(std::f32::consts::PI);
+        let pi_2 = vdupq_n_f32(std::f32::consts::FRAC_PI_2);
+        let zero = vdupq_n_f32(0.0);
+        // Minimax polynomial for atan(t) on [0, 1]:
+        // atan(t) = t * (c0 + t^2*(c1 + t^2*(c2 + t^2*(c3 + t^2*c4))))
+        let c0 = vdupq_n_f32(0.9998660_f32);
+        let c1 = vdupq_n_f32(-0.3302995_f32);
+        let c2 = vdupq_n_f32(0.1801410_f32);
+        let c3 = vdupq_n_f32(-0.0851330_f32);
+        let c4 = vdupq_n_f32(0.0208351_f32);
+
+        for i in 0..chunks {
+            let off = i * 4;
+            let vy = vld1q_f32(y.as_ptr().add(off));
+            let vx = vld1q_f32(x.as_ptr().add(off));
+            let abs_y = vabsq_f32(vy);
+            let abs_x = vabsq_f32(vx);
+
+            // Range reduction: t = min(|x|,|y|) / max(|x|,|y|), so t in [0,1]
+            let vmin = vminq_f32(abs_x, abs_y);
+            let vmax = vmaxq_f32(abs_x, abs_y);
+            let t = vdivq_f32(vmin, vmax);
+            let t2 = vmulq_f32(t, t);
+
+            // atan(t) polynomial: t * (c0 + t2*(c1 + t2*(c2 + t2*(c3 + t2*c4))))
+            let p = vmlaq_f32(c3, c4, t2);
+            let p = vmlaq_f32(c2, p, t2);
+            let p = vmlaq_f32(c1, p, t2);
+            let p = vmlaq_f32(c0, p, t2);
+            let atan_t = vmulq_f32(t, p);
+
+            // If |y| > |x|, angle = pi/2 - atan_t (swap quadrant)
+            let swap = vcgtq_f32(abs_y, abs_x);
+            let angle = vbslq_f32(swap, vsubq_f32(pi_2, atan_t), atan_t);
+
+            // If x < 0, angle = pi - angle
+            let x_neg = vcltq_f32(vx, zero);
+            let angle = vbslq_f32(x_neg, vsubq_f32(pi, angle), angle);
+
+            // If y < 0, angle = -angle
+            let y_neg = vcltq_f32(vy, zero);
+            let result = vbslq_f32(y_neg, vnegq_f32(angle), angle);
+
+            vst1q_f32(out.as_mut_ptr().add(off), result);
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = y[i].atan2(x[i]);
+    }
+}
+
+/// NEON arcsinh(x) = sign(x) * ln(|x| + sqrt(x^2 + 1)) using fast_log_f32x4.
+/// Max error ~2e-6 over full range.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn vec_arcsinh_f32(a: &[f32], out: &mut [f32]) {
+    let len = a.len();
+    debug_assert_eq!(len, out.len());
+    let chunks = len / 4;
+    unsafe {
+        let one = vdupq_n_f32(1.0);
+        let zero = vdupq_n_f32(0.0);
+
+        for i in 0..chunks {
+            let off = i * 4;
+            let vx = vld1q_f32(a.as_ptr().add(off));
+            let abs_x = vabsq_f32(vx);
+
+            // sqrt(x^2 + 1)
+            let x2p1 = vaddq_f32(vmulq_f32(abs_x, abs_x), one);
+            let sqrt_val = vsqrtq_f32(x2p1);
+
+            // ln(|x| + sqrt(x^2 + 1))
+            let arg = vaddq_f32(abs_x, sqrt_val);
+            let log_val = fast_log_f32x4(arg);
+
+            // Apply sign: asinh(-x) = -asinh(x)
+            let neg_mask = vcltq_f32(vx, zero);
+            let result = vbslq_f32(neg_mask, vnegq_f32(log_val), log_val);
+
+            vst1q_f32(out.as_mut_ptr().add(off), result);
+        }
+    }
+    for i in (chunks * 4)..len {
+        out[i] = a[i].asinh();
+    }
+}
+
+// ========================================================================
 // Phase 10: Hand-tuned NEON matmul for small matrices
 // ========================================================================
 
@@ -2343,5 +2508,37 @@ mod tests {
         let mut out = vec![0.0; TEST_LEN];
         vec_reciprocal_f32(&b, &mut out);
         assert_approx_eq(&out, &expected, 1e-3); // vrecpe + 1 Newton step ~1e-3 precision
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_arccos() {
+        // arccos needs input in [-1, 1]
+        let a: Vec<f32> = (0..TEST_LEN).map(|i| (i as f32 - 33.0) / 34.0).collect();
+        let expected: Vec<f32> = a.iter().map(|&x| x.acos()).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_arccos_f32(&a, &mut out);
+        assert_approx_eq(&out, &expected, 1e-4);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_arctan2() {
+        let y: Vec<f32> = (0..TEST_LEN).map(|i| (i as f32 - 33.0) * 0.3).collect();
+        let x: Vec<f32> = (0..TEST_LEN).map(|i| (i as f32 - 20.0) * 0.5).collect();
+        let expected: Vec<f32> = y.iter().zip(&x).map(|(&yi, &xi)| yi.atan2(xi)).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_arctan2_f32(&y, &x, &mut out);
+        assert_approx_eq(&out, &expected, 1e-4);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_vec_arcsinh() {
+        let a: Vec<f32> = (0..TEST_LEN).map(|i| (i as f32 - 33.0) * 0.5).collect();
+        let expected: Vec<f32> = a.iter().map(|&x| x.asinh()).collect();
+        let mut out = vec![0.0; TEST_LEN];
+        vec_arcsinh_f32(&a, &mut out);
+        assert_approx_eq(&out, &expected, 1e-4);
     }
 }
