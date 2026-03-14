@@ -5310,7 +5310,7 @@ impl Tensor {
 
         let data = &self.0.borrow().data;
         let total = data.len();
-        let mut out_data = vec![0.0f32; total];
+        let mut out_data = pool_get(total);
         if inner_size == 1 {
             // Optimized prefix sum for last-axis: sequential with unsafe to elide bounds checks
             for o in 0..outer_size {
@@ -6631,22 +6631,19 @@ impl Tensor {
         let rows = inner.shape[0];
         let cols = inner.shape[1];
 
-        let mut diag_data = Vec::new();
-        if offset >= 0 {
-            let start_col = offset as usize;
-            let len = rows.min(cols.saturating_sub(start_col));
-            for i in 0..len {
-                diag_data.push(inner.data[i * cols + (i + start_col)]);
-            }
+        let (start_row, start_col, len) = if offset >= 0 {
+            let sc = offset as usize;
+            (0, sc, rows.min(cols.saturating_sub(sc)))
         } else {
-            let start_row = (-offset) as usize;
-            let len = cols.min(rows.saturating_sub(start_row));
-            for i in 0..len {
-                diag_data.push(inner.data[(i + start_row) * cols + i]);
-            }
+            let sr = (-offset) as usize;
+            (sr, 0, cols.min(rows.saturating_sub(sr)))
+        };
+        let mut diag_data = pool_get(len);
+        for i in 0..len {
+            diag_data[i] = inner.data[(i + start_row) * cols + (i + start_col)];
         }
 
-        let n = diag_data.len();
+        let n = len;
         Tensor::from_op(diag_data, vec![n],
             Op::Diagonal { input: self.clone(), offset })
     }
