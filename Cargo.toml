@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "peregrine-py"]
+
 [package]
 name = "peregrine"
 version = "0.10.0"

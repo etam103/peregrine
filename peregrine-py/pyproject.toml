@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.0"]
+build-backend = "maturin"
+
+[project]
+name = "peregrine-ml"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "A from-scratch deep learning inference engine in Rust for Apple Silicon"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.maturin]
+python-source = "python"
+features = ["pyo3/extension-module"]

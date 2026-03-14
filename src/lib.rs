@@ -25,6 +25,7 @@ pub mod attention;
 pub mod speculative;
 pub mod thermal;
 pub mod sched;
+pub mod models;
 
 #[cfg(feature = "metal")]
 pub mod metal;
