@@ -1003,14 +1003,25 @@ impl GRU {
             let bhh = self.bias_hh.data();
             let mut h_data = h0.data();
             let mut output_data = pool_get(seq_len * hs);
-            let mut ih_buf = vec![0.0f32; 3 * hs];
             let mut hh_buf = vec![0.0f32; 3 * hs];
 
+            // Batch input projection: x[seq,is] @ W_ih[is,3hs] = ih_all[seq,3hs]
+            let mut ih_all = vec![0.0f32; seq_len * 3 * hs];
+            #[cfg(target_os = "macos")]
+            crate::tensor::sgemm(false, false, seq_len, 3*hs, is, 1.0, &x_data, is, &wih, 3*hs, 0.0, &mut ih_all, 3*hs);
+            #[cfg(not(target_os = "macos"))]
             for t in 0..seq_len {
-                let x_t = &x_data[t * is..(t + 1) * is];
+                for j in 0..3*hs {
+                    let mut v = 0.0f32;
+                    for p in 0..is { v += x_data[t * is + p] * wih[p * 3 * hs + j]; }
+                    ih_all[t * 3 * hs + j] = v;
+                }
+            }
+
+            for t in 0..seq_len {
+                let ih_t = &ih_all[t * 3 * hs..(t + 1) * 3 * hs];
                 #[cfg(target_os = "macos")]
                 {
-                    crate::tensor::sgemm(false, false, 1, 3*hs, is, 1.0, x_t, is, &wih, 3*hs, 0.0, &mut ih_buf, 3*hs);
                     crate::tensor::sgemm(false, false, 1, 3*hs, hs, 1.0, &h_data, hs, &whh, 3*hs, 0.0, &mut hh_buf, 3*hs);
                 }
                 #[cfg(not(target_os = "macos"))]
@@ -1022,9 +1033,9 @@ impl GRU {
                     }
                 }
                 for j in 0..hs {
-                    let r = 1.0 / (1.0 + (-(ih_buf[j] + bih[j] + hh_buf[j] + bhh[j])).exp());
-                    let z = 1.0 / (1.0 + (-(ih_buf[hs+j] + bih[hs+j] + hh_buf[hs+j] + bhh[hs+j])).exp());
-                    let n = (ih_buf[2*hs+j] + bih[2*hs+j] + r * (hh_buf[2*hs+j] + bhh[2*hs+j])).tanh();
+                    let r = 1.0 / (1.0 + (-(ih_t[j] + bih[j] + hh_buf[j] + bhh[j])).exp());
+                    let z = 1.0 / (1.0 + (-(ih_t[hs+j] + bih[hs+j] + hh_buf[hs+j] + bhh[hs+j])).exp());
+                    let n = (ih_t[2*hs+j] + bih[2*hs+j] + r * (hh_buf[2*hs+j] + bhh[2*hs+j])).tanh();
                     h_data[j] = (1.0 - z) * n + z * h_data[j];
                 }
                 output_data[t * hs..(t + 1) * hs].copy_from_slice(&h_data[..hs]);
