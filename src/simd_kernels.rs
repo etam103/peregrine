@@ -272,6 +272,84 @@ pub unsafe fn fast_exp_f32x4(x: float32x4_t) -> float32x4_t {
     vmulq_f32(y, pow2n)
 }
 
+/// Fast NEON reciprocal via Newton-Raphson (2 iterations).
+/// Avoids the slow 6-cycle ARM divider; ~23-bit accuracy.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn fast_recip_f32x4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let est = vrecpeq_f32(x);
+    let est = vmulq_f32(vrecpsq_f32(x, est), est);  // 1st Newton-Raphson
+    vmulq_f32(vrecpsq_f32(x, est), est)              // 2nd Newton-Raphson
+}
+
+/// Fast vectorized log using Cephes-style polynomial approximation.
+/// Relative error ~2e-7 over the positive float32 range.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn fast_log_f32x4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    // Cephes-style: extract exponent, normalize mantissa to [0.5, 1.0), polynomial
+    let one = vdupq_n_f32(1.0);
+    let half = vdupq_n_f32(0.5);
+    let ln2 = vdupq_n_f32(std::f32::consts::LN_2);
+
+    // Reinterpret as integer to extract exponent
+    let xi = vreinterpretq_u32_f32(x);
+    // Extract exponent: ((xi >> 23) & 0xFF) - 127
+    let exp_bits = vandq_u32(vshrq_n_u32(xi, 23), vdupq_n_u32(0xFF));
+    let exponent = vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(exp_bits), vdupq_n_s32(127)));
+
+    // Normalize mantissa to [1.0, 2.0) by clearing exponent and setting to 127
+    let mantissa_bits = vorrq_u32(
+        vandq_u32(xi, vdupq_n_u32(0x007FFFFF)),
+        vdupq_n_u32(0x3F800000),  // exponent = 127 -> value in [1.0, 2.0)
+    );
+    let m = vreinterpretq_f32_u32(mantissa_bits);
+
+    // Adjust: if mantissa > sqrt(2), multiply by 0.5 and add 1 to exponent
+    let sqrt2 = vdupq_n_f32(std::f32::consts::SQRT_2);
+    let mask = vcgtq_f32(m, sqrt2);
+    let m = vbslq_f32(mask, vmulq_f32(m, half), m);
+    let exponent = vaddq_f32(exponent, vreinterpretq_f32_u32(vandq_u32(
+        vreinterpretq_u32_f32(one), mask)));
+
+    // f = m - 1.0
+    let f = vsubq_f32(m, one);
+
+    // Minimax polynomial for log(1+f) on [0, sqrt(2)-1]
+    // Coefficients from Cephes logf
+    let c0 = vdupq_n_f32(3.3333331174E-1);
+    let c1 = vdupq_n_f32(-2.4999993993E-1);
+    let c2 = vdupq_n_f32(2.0000714765E-1);
+    let c3 = vdupq_n_f32(-1.6668057665E-1);
+    let c4 = vdupq_n_f32(1.4249322787E-1);
+    let c5 = vdupq_n_f32(-1.2420140846E-1);
+    let c6 = vdupq_n_f32(1.1676998740E-1);
+    let c7 = vdupq_n_f32(-1.1514610310E-1);
+    let c8 = vdupq_n_f32(7.0376836292E-2);
+
+    let f2 = vmulq_f32(f, f);
+    // Horner evaluation: p = f2 * (c0 + f*(c1 + f*(c2 + f*(c3 + f*(c4 + f*(c5 + f*(c6 + f*(c7 + f*c8))))))))
+    let p = vmlaq_f32(c7, c8, f);
+    let p = vmlaq_f32(c6, p, f);
+    let p = vmlaq_f32(c5, p, f);
+    let p = vmlaq_f32(c4, p, f);
+    let p = vmlaq_f32(c3, p, f);
+    let p = vmlaq_f32(c2, p, f);
+    let p = vmlaq_f32(c1, p, f);
+    let p = vmlaq_f32(c0, p, f);
+    let p = vmulq_f32(p, vmulq_f32(f2, f));
+
+    // result = f - 0.5*f^2 + p + exponent * ln2
+    let result = vaddq_f32(
+        vsubq_f32(f, vmulq_f32(half, f2)),
+        vaddq_f32(p, vmulq_f32(exponent, ln2))
+    );
+
+    result
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn vec_exp_f32(a: &[f32], out: &mut [f32]) {
@@ -307,7 +385,7 @@ pub fn vec_sigmoid_f32(a: &[f32], out: &mut [f32]) {
             let neg_x = vnegq_f32(vx);
             let exp_neg_x = fast_exp_f32x4(neg_x);
             let denom = vaddq_f32(one, exp_neg_x);
-            vst1q_f32(out.as_mut_ptr().add(off), vdivq_f32(one, denom));
+            vst1q_f32(out.as_mut_ptr().add(off), fast_recip_f32x4(denom));
         }
     }
     for i in (chunks * 4)..len {
@@ -365,7 +443,7 @@ pub fn vec_gelu_f32(a: &[f32], out: &mut [f32]) {
             let two_inner = vmulq_f32(two, inner);
             let neg_2inner = vnegq_f32(two_inner);
             let exp_neg = fast_exp_f32x4(neg_2inner);
-            let sig = vdivq_f32(one, vaddq_f32(one, exp_neg));
+            let sig = fast_recip_f32x4(vaddq_f32(one, exp_neg));
             let tanh_val = vsubq_f32(vmulq_f32(two, sig), one);
             let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_val)));
             vst1q_f32(out.as_mut_ptr().add(off), result);
@@ -680,7 +758,7 @@ pub fn vec_silu_f32(a: &[f32], out: &mut [f32]) {
             let vx = vld1q_f32(a.as_ptr().add(off));
             let neg_x = vnegq_f32(vx);
             let exp_neg_x = fast_exp_f32x4(neg_x);
-            let sigmoid = vdivq_f32(one, vaddq_f32(one, exp_neg_x));
+            let sigmoid = fast_recip_f32x4(vaddq_f32(one, exp_neg_x));
             vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vx, sigmoid));
         }
     }
@@ -806,28 +884,20 @@ pub fn vec_logaddexp_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
     debug_assert_eq!(len, out.len());
     let chunks = len / 4;
     unsafe {
+        let one = vdupq_n_f32(1.0);
         for i in 0..chunks {
             let off = i * 4;
             let va = vld1q_f32(a.as_ptr().add(off));
             let vb = vld1q_f32(b.as_ptr().add(off));
-            // max(a, b)
             let vmax = vmaxq_f32(va, vb);
-            // -|a - b|
             let neg_abs_diff = vnegq_f32(vabsq_f32(vsubq_f32(va, vb)));
-            // exp(-|a - b|)
             let exp_neg = fast_exp_f32x4(neg_abs_diff);
-            // Store exp values temporarily, then apply scalar log1p
-            let mut exp_buf = [0.0f32; 4];
-            let mut max_buf = [0.0f32; 4];
-            vst1q_f32(exp_buf.as_mut_ptr(), exp_neg);
-            vst1q_f32(max_buf.as_mut_ptr(), vmax);
-            // log1p has no fast NEON version; use scalar for precision
-            for j in 0..4 {
-                out[off + j] = max_buf[j] + exp_buf[j].ln_1p();
-            }
+            // log(1 + exp(-|a-b|)) = log1p(exp(-|a-b|)) via log(1 + x)
+            let sum = vaddq_f32(one, exp_neg);
+            let log_sum = fast_log_f32x4(sum);
+            vst1q_f32(out.as_mut_ptr().add(off), vaddq_f32(vmax, log_sum));
         }
     }
-    // Scalar tail
     for i in (chunks * 4)..len {
         let m = a[i].max(b[i]);
         let d = (a[i] - b[i]).abs();
@@ -1302,7 +1372,7 @@ pub fn vec_erf_f32(a: &[f32], out: &mut [f32]) {
             let vx = vld1q_f32(a.as_ptr().add(off));
             let abs_x = vabsq_f32(vx);
             // t = 1 / (1 + p * |x|)
-            let t = vdivq_f32(one, vmlaq_f32(one, p, abs_x));
+            let t = fast_recip_f32x4(vmlaq_f32(one, p, abs_x));
             // Horner: ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t
             let poly = vmulq_f32(
                 vmlaq_f32(a1,
@@ -1667,13 +1737,7 @@ pub fn vec_softplus_f32(a: &[f32], out: &mut [f32]) {
             let exp_x = fast_exp_f32x4(vx);
             // log(1 + exp(x)) — store to buffer for scalar log
             let sum = vaddq_f32(one, exp_x);
-            let mut buf = [0.0f32; 4];
-            vst1q_f32(buf.as_mut_ptr(), sum);
-            buf[0] = buf[0].ln();
-            buf[1] = buf[1].ln();
-            buf[2] = buf[2].ln();
-            buf[3] = buf[3].ln();
-            let log_val = vld1q_f32(buf.as_ptr());
+            let log_val = fast_log_f32x4(sum);
             // Clamp: x > 20 → x, x < -20 → 0, else log_val
             let hi_mask = vcgtq_f32(vx, thresh_hi);
             let lo_mask = vcltq_f32(vx, thresh_lo);

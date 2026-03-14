@@ -1599,8 +1599,90 @@ impl Tensor {
             }
         }
 
-        // CPU fallback: unfused
-        self.matmul(weight).add_bias(bias).gelu()
+        // CPU fused: matmul then in-place bias+gelu (1 alloc, 2 passes)
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); weight.sync_gpu_to_cpu(); bias.sync_gpu_to_cpu(); }
+        let a_inner = self.0.borrow();
+        let w_inner = weight.0.borrow();
+        let b_inner = bias.0.borrow();
+        let m = a_inner.shape[0];
+        let k = a_inner.shape[1];
+        let n = w_inner.shape[1];
+        let mut out_data = pool_get(m * n);
+
+        // Step 1: matmul via cblas_sgemm
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                m as i32, n as i32, k as i32,
+                1.0,
+                a_inner.data.as_ptr(), k as i32,
+                w_inner.data.as_ptr(), n as i32,
+                0.0,
+                out_data.as_mut_ptr(), n as i32,
+            );
+        }
+
+        // Step 2: in-place bias + gelu
+        let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            unsafe {
+                let half = vdupq_n_f32(0.5);
+                let one = vdupq_n_f32(1.0);
+                let two = vdupq_n_f32(2.0);
+                let coeff = vdupq_n_f32(0.044715);
+                let s2p = vdupq_n_f32(sqrt_2_over_pi);
+                for row in 0..m {
+                    let base = row * n;
+                    let chunks = n / 4;
+                    for c in 0..chunks {
+                        let off = base + c * 4;
+                        let ptr = out_data.as_mut_ptr().add(off);
+                        // Add bias
+                        let vx = vaddq_f32(vld1q_f32(ptr), vld1q_f32(b_inner.data.as_ptr().add(c * 4)));
+                        // GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                        let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
+                        let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
+                        // tanh via 2*sigmoid(2x)-1
+                        let two_inner = vmulq_f32(two, inner);
+                        let neg_2inner = vnegq_f32(two_inner);
+                        let exp_neg = simd_kernels::fast_exp_f32x4(neg_2inner);
+                        let sig = vdivq_f32(one, vaddq_f32(one, exp_neg));
+                        let tanh_val = vsubq_f32(vmulq_f32(two, sig), one);
+                        let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_val)));
+                        vst1q_f32(ptr, result);
+                    }
+                    for i in (chunks * 4)..n {
+                        let x = out_data[base + i] + b_inner.data[i];
+                        let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                        out_data[base + i] = 0.5 * x * (1.0 + inner.tanh());
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for row in 0..m {
+                let base = row * n;
+                for i in 0..n {
+                    let x = out_data[base + i] + b_inner.data[i];
+                    let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                    out_data[base + i] = 0.5 * x * (1.0 + inner.tanh());
+                }
+            }
+        }
+        let shape = vec![m, n];
+        let no_grad = !a_inner.requires_grad && !w_inner.requires_grad;
+        drop(a_inner);
+        drop(w_inner);
+        drop(b_inner);
+        if no_grad {
+            Tensor::from_data(out_data, shape)
+        } else {
+            Tensor::from_op(out_data, shape, Op::MatMulBiasGelu(self.clone(), weight.clone(), bias.clone()))
+        }
     }
 
     /// Fused residual add + layer norm: out = layernorm(x + residual, gamma, beta).
@@ -1657,10 +1739,12 @@ impl Tensor {
             let chunks = dim / 4;
             for row in 0..batch {
                 let base = row * dim;
-                // Pass 1: add + compute mean
+                // Pass 1: add + write to out + accumulate sum AND sum_sq simultaneously
                 let mut sum;
+                let mut sum_sq;
                 unsafe {
-                    let mut vacc = vdupq_n_f32(0.0);
+                    let mut vacc_sum = vdupq_n_f32(0.0);
+                    let mut vacc_sq = vdupq_n_f32(0.0);
                     for c in 0..chunks {
                         let off = base + c * 4;
                         let added = vaddq_f32(
@@ -1668,34 +1752,22 @@ impl Tensor {
                             vld1q_f32(r.data.as_ptr().add(off)),
                         );
                         vst1q_f32(out.as_mut_ptr().add(off), added);
-                        vacc = vaddq_f32(vacc, added);
+                        vacc_sum = vaddq_f32(vacc_sum, added);
+                        vacc_sq = vfmaq_f32(vacc_sq, added, added);
                     }
-                    sum = vaddvq_f32(vacc);
+                    sum = vaddvq_f32(vacc_sum);
+                    sum_sq = vaddvq_f32(vacc_sq);
                 }
                 for i in (chunks * 4)..dim {
                     let v = x.data[base + i] + r.data[base + i];
                     out[base + i] = v;
                     sum += v;
+                    sum_sq += v * v;
                 }
                 let mean = sum / dim as f32;
-                // Pass 2: variance
-                let mut var_sum;
-                unsafe {
-                    let vmean = vdupq_n_f32(mean);
-                    let mut vacc = vdupq_n_f32(0.0);
-                    for c in 0..chunks {
-                        let off = base + c * 4;
-                        let diff = vsubq_f32(vld1q_f32(out.as_ptr().add(off)), vmean);
-                        vacc = vfmaq_f32(vacc, diff, diff);
-                    }
-                    var_sum = vaddvq_f32(vacc);
-                }
-                for i in (chunks * 4)..dim {
-                    let diff = out[base + i] - mean;
-                    var_sum += diff * diff;
-                }
-                let inv_std = 1.0 / (var_sum / dim as f32 + eps).sqrt();
-                // Pass 3: normalize + scale + shift
+                let var = sum_sq / dim as f32 - mean * mean;
+                let inv_std = 1.0 / (var + eps).sqrt();
+                // Pass 2: normalize + scale + shift
                 unsafe {
                     let vmean = vdupq_n_f32(mean);
                     let vinv = vdupq_n_f32(inv_std);
@@ -5350,29 +5422,55 @@ impl Tensor {
         let total = data.len();
         let mut out_data = pool_get(total);
         if inner_size == 1 {
-            // Optimized prefix sum for last-axis: sequential with unsafe to elide bounds checks
+            // Optimized prefix sum for last-axis using NEON prefix scan
             for o in 0..outer_size {
                 let base = o * reduce_size;
-                let mut acc = 0.0f32;
-                // Unroll by 8 for better ILP on wide pipelines
-                let chunks8 = reduce_size / 8;
-                unsafe {
-                    let sp = data.as_ptr().add(base);
-                    let dp = out_data.as_mut_ptr().add(base);
-                    for c in 0..chunks8 {
-                        let off = c * 8;
-                        acc += *sp.add(off);     *dp.add(off) = acc;
-                        acc += *sp.add(off + 1); *dp.add(off + 1) = acc;
-                        acc += *sp.add(off + 2); *dp.add(off + 2) = acc;
-                        acc += *sp.add(off + 3); *dp.add(off + 3) = acc;
-                        acc += *sp.add(off + 4); *dp.add(off + 4) = acc;
-                        acc += *sp.add(off + 5); *dp.add(off + 5) = acc;
-                        acc += *sp.add(off + 6); *dp.add(off + 6) = acc;
-                        acc += *sp.add(off + 7); *dp.add(off + 7) = acc;
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    let chunks4 = reduce_size / 4;
+                    unsafe {
+                        let sp = data.as_ptr().add(base);
+                        let dp = out_data.as_mut_ptr().add(base);
+                        let mut acc = 0.0f32;
+                        for c in 0..chunks4 {
+                            let off = c * 4;
+                            let v = vld1q_f32(sp.add(off));
+                            // Prefix scan: [a, a+b, a+b+c, a+b+c+d]
+                            let s1 = vaddq_f32(v, vextq_f32(vdupq_n_f32(0.0), v, 3));
+                            let s2 = vaddq_f32(s1, vextq_f32(vdupq_n_f32(0.0), s1, 2));
+                            let result = vaddq_f32(s2, vdupq_n_f32(acc));
+                            vst1q_f32(dp.add(off), result);
+                            acc = vgetq_lane_f32(result, 3);
+                        }
+                        for i in (chunks4 * 4)..reduce_size {
+                            acc += *sp.add(i);
+                            *dp.add(i) = acc;
+                        }
                     }
-                    for r in (chunks8 * 8)..reduce_size {
-                        acc += *sp.add(r);
-                        *dp.add(r) = acc;
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    let mut acc = 0.0f32;
+                    let chunks8 = reduce_size / 8;
+                    unsafe {
+                        let sp = data.as_ptr().add(base);
+                        let dp = out_data.as_mut_ptr().add(base);
+                        for c in 0..chunks8 {
+                            let off = c * 8;
+                            acc += *sp.add(off);     *dp.add(off) = acc;
+                            acc += *sp.add(off + 1); *dp.add(off + 1) = acc;
+                            acc += *sp.add(off + 2); *dp.add(off + 2) = acc;
+                            acc += *sp.add(off + 3); *dp.add(off + 3) = acc;
+                            acc += *sp.add(off + 4); *dp.add(off + 4) = acc;
+                            acc += *sp.add(off + 5); *dp.add(off + 5) = acc;
+                            acc += *sp.add(off + 6); *dp.add(off + 6) = acc;
+                            acc += *sp.add(off + 7); *dp.add(off + 7) = acc;
+                        }
+                        for r in (chunks8 * 8)..reduce_size {
+                            acc += *sp.add(r);
+                            *dp.add(r) = acc;
+                        }
                     }
                 }
             }
