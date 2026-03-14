@@ -4858,10 +4858,15 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Arccos(self.clone()))
         } else {
             let mut data = pool_get(len);
-            #[cfg(target_arch = "aarch64")]
-            { simd_kernels::vec_arccos_f32(&inner.data, &mut data); }
-            #[cfg(not(target_arch = "aarch64"))]
-            { for i in 0..len { data[i] = inner.data[i].acos(); } }
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvacosf(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
+            {
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_arccos_f32(&inner.data, &mut data);
+                #[cfg(not(target_arch = "aarch64"))]
+                { for i in 0..len { data[i] = inner.data[i].acos(); } }
+            }
             Tensor::from_op(data, inner.shape.clone(), Op::Arccos(self.clone()))
         }
     }
@@ -6104,6 +6109,28 @@ impl Tensor {
                     vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n);
                     vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n);
                 }
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let thresh_hi = vdupq_n_f32(20.0);
+                    let thresh_lo = vdupq_n_f32(-20.0);
+                    let zero = vdupq_n_f32(0.0);
+                    let chunks = len / 4;
+                    for c in 0..chunks {
+                        let off = c * 4;
+                        let vx = vld1q_f32(inner.data.as_ptr().add(off));
+                        let log_val = vld1q_f32(data.as_ptr().add(off));
+                        let hi_mask = vcgtq_f32(vx, thresh_hi);
+                        let lo_mask = vcltq_f32(vx, thresh_lo);
+                        let result = vbslq_f32(hi_mask, vx, vbslq_f32(lo_mask, zero, log_val));
+                        vst1q_f32(data.as_mut_ptr().add(off), result);
+                    }
+                    for i in (chunks * 4)..len {
+                        if inner.data[i] > 20.0 { data[i] = inner.data[i]; }
+                        else if inner.data[i] < -20.0 { data[i] = 0.0; }
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..len {
                     if inner.data[i] > 20.0 { data[i] = inner.data[i]; }
                     else if inner.data[i] < -20.0 { data[i] = 0.0; }
