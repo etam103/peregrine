@@ -3978,18 +3978,36 @@ impl Tensor {
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= 400_000 {
-            // Parallel NEON for large sizes
+            // Parallel for large sizes — use vvexpf per chunk on macOS
             use rayon::prelude::*;
             let mut data = pool_get(len);
-            let chunk = 50_000; // ~200µs per chunk, good for 10 cores
+            let chunk = 50_000;
             inner.data.par_chunks(chunk)
                 .zip(data.par_chunks_mut(chunk))
                 .for_each(|(src, dst)| {
-                    #[cfg(target_arch = "aarch64")]
+                    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                    {
+                        let n = src.len() as i32;
+                        unsafe { vvexpf(dst.as_mut_ptr(), src.as_ptr(), &n); }
+                    }
+                    #[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
                     simd_kernels::vec_exp_f32(src, dst);
                     #[cfg(not(target_arch = "aarch64"))]
                     for i in 0..src.len() { dst[i] = src[i].exp(); }
                 });
+            Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
+        } else if len >= 100_000 {
+            // Medium arrays: single-threaded vvexpf on macOS (better cache behavior)
+            let mut data = pool_get(len);
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            {
+                let n = len as i32;
+                unsafe { vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n); }
+            }
+            #[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
+            simd_kernels::vec_exp_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
+            for i in 0..len { data[i] = inner.data[i].exp(); }
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         } else {
             let mut data = pool_get(len);
