@@ -1596,8 +1596,106 @@ impl Tensor {
             }
         }
 
-        // CPU fallback: unfused
-        self.add(residual).layer_norm(gamma, beta, normalized_shape)
+        // CPU: fused add + layer_norm in single pass
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); residual.sync_gpu_to_cpu(); gamma.sync_gpu_to_cpu(); beta.sync_gpu_to_cpu(); }
+        let x = self.0.borrow();
+        let r = residual.0.borrow();
+        let g = gamma.0.borrow();
+        let b = beta.0.borrow();
+        let total = x.data.len();
+        let dim = normalized_shape;
+        let batch = total / dim;
+        let eps = 1e-5f32;
+        let mut out = pool_get(total);
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            let chunks = dim / 4;
+            for row in 0..batch {
+                let base = row * dim;
+                // Pass 1: add + compute mean
+                let mut sum;
+                unsafe {
+                    let mut vacc = vdupq_n_f32(0.0);
+                    for c in 0..chunks {
+                        let off = base + c * 4;
+                        let added = vaddq_f32(
+                            vld1q_f32(x.data.as_ptr().add(off)),
+                            vld1q_f32(r.data.as_ptr().add(off)),
+                        );
+                        vst1q_f32(out.as_mut_ptr().add(off), added);
+                        vacc = vaddq_f32(vacc, added);
+                    }
+                    sum = vaddvq_f32(vacc);
+                }
+                for i in (chunks * 4)..dim {
+                    let v = x.data[base + i] + r.data[base + i];
+                    out[base + i] = v;
+                    sum += v;
+                }
+                let mean = sum / dim as f32;
+                // Pass 2: variance
+                let mut var_sum;
+                unsafe {
+                    let vmean = vdupq_n_f32(mean);
+                    let mut vacc = vdupq_n_f32(0.0);
+                    for c in 0..chunks {
+                        let off = base + c * 4;
+                        let diff = vsubq_f32(vld1q_f32(out.as_ptr().add(off)), vmean);
+                        vacc = vfmaq_f32(vacc, diff, diff);
+                    }
+                    var_sum = vaddvq_f32(vacc);
+                }
+                for i in (chunks * 4)..dim {
+                    let diff = out[base + i] - mean;
+                    var_sum += diff * diff;
+                }
+                let inv_std = 1.0 / (var_sum / dim as f32 + eps).sqrt();
+                // Pass 3: normalize + scale + shift
+                unsafe {
+                    let vmean = vdupq_n_f32(mean);
+                    let vinv = vdupq_n_f32(inv_std);
+                    for c in 0..chunks {
+                        let off = base + c * 4;
+                        let normed = vmulq_f32(vsubq_f32(vld1q_f32(out.as_ptr().add(off)), vmean), vinv);
+                        let scaled = vaddq_f32(
+                            vmulq_f32(normed, vld1q_f32(g.data.as_ptr().add(c * 4))),
+                            vld1q_f32(b.data.as_ptr().add(c * 4)),
+                        );
+                        vst1q_f32(out.as_mut_ptr().add(off), scaled);
+                    }
+                }
+                for i in (chunks * 4)..dim {
+                    out[base + i] = (out[base + i] - mean) * inv_std * g.data[i] + b.data[i];
+                }
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            // Scalar fallback
+            for row in 0..batch {
+                let base = row * dim;
+                let mut sum = 0.0f32;
+                for i in 0..dim {
+                    let v = x.data[base + i] + r.data[base + i];
+                    out[base + i] = v;
+                    sum += v;
+                }
+                let mean = sum / dim as f32;
+                let mut var_sum = 0.0f32;
+                for i in 0..dim {
+                    let diff = out[base + i] - mean;
+                    var_sum += diff * diff;
+                }
+                let inv_std = 1.0 / (var_sum / dim as f32 + eps).sqrt();
+                for i in 0..dim {
+                    out[base + i] = (out[base + i] - mean) * inv_std * g.data[i] + b.data[i];
+                }
+            }
+        }
+        Tensor::new(out, x.shape.clone(), false)
     }
 
     /// 2D convolution with same-padding: self=[N,Ci,H,W], kernel=[Co,Ci,kH,kW], bias=[Co].
