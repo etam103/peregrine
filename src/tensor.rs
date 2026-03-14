@@ -3744,18 +3744,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         } else {
             let mut data = pool_get(len);
-            #[cfg(target_os = "macos")]
-            {
-                let n = len as i32;
-                unsafe { vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n); }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                #[cfg(target_arch = "aarch64")]
-                simd_kernels::vec_exp_f32(&inner.data, &mut data);
-                #[cfg(not(target_arch = "aarch64"))]
-                for i in 0..len { data[i] = inner.data[i].exp(); }
-            }
+            #[cfg(target_arch = "aarch64")]
+            simd_kernels::vec_exp_f32(&inner.data, &mut data);
+            #[cfg(not(target_arch = "aarch64"))]
+            for i in 0..len { data[i] = inner.data[i].exp(); }
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         }
     }
