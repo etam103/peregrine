@@ -3251,7 +3251,7 @@ impl Tensor {
             let mut data = pool_get(len);
             #[cfg(target_os = "macos")]
             {
-                // 3-pass Accelerate: faster than scalar ln_1p per element
+                // logaddexp(a,b) = max(a,b) + log1p(exp(-|a-b|))
                 let n = len as i32;
                 for i in 0..len {
                     data[i] = -(a.data[i] - b.data[i]).abs();
@@ -5839,19 +5839,12 @@ impl Tensor {
             let mut data = pool_get(len);
             #[cfg(target_os = "macos")]
             {
-                // softplus(x) = ln(1 + exp(x))
-                // Accelerate: vvexpf, then add 1, then vvlogf — 3 calls but
-                // vvlogf is faster than vvlog1pf for this use case
+                // softplus(x) = log1p(exp(x)) via Accelerate
                 let n = len as i32;
                 unsafe {
                     vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n);
+                    vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n);
                 }
-                // data[i] = ln(1 + exp(x)) = ln(1 + data[i])
-                for i in 0..len { data[i] += 1.0; }
-                unsafe {
-                    vvlogf(data.as_mut_ptr(), data.as_ptr(), &n);
-                }
-                // Clamp for numerical stability
                 for i in 0..len {
                     if inner.data[i] > 20.0 { data[i] = inner.data[i]; }
                     else if inner.data[i] < -20.0 { data[i] = 0.0; }
