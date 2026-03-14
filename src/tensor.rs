@@ -6517,8 +6517,27 @@ impl Tensor {
     /// Each tensor is unsqueezed at `axis`, then concatenated.
     pub fn stack(tensors: &[Tensor], axis: i32) -> Tensor {
         assert!(!tensors.is_empty(), "stack requires at least one tensor");
-        let ndim = tensors[0].shape().len();
+        let first_shape = tensors[0].shape();
+        let ndim = first_shape.len();
         let axis = if axis < 0 { (ndim as i32 + 1 + axis) as usize } else { axis as usize };
+
+        // Fast path: stack along axis=0 when no grad needed
+        if axis == 0 && !tensors.iter().any(|t| t.requires_grad()) {
+            let elem_per = first_shape.iter().product::<usize>();
+            let total = elem_per * tensors.len();
+            let mut data = pool_get(total);
+            let mut offset = 0;
+            for t in tensors {
+                let inner = t.0.borrow();
+                data[offset..offset + elem_per].copy_from_slice(&inner.data[..elem_per]);
+                offset += elem_per;
+            }
+            let mut out_shape = vec![tensors.len()];
+            out_shape.extend_from_slice(&first_shape);
+            return Tensor::new(data, out_shape, false);
+        }
+
+        // General path: unsqueeze + concat
         let expanded: Vec<Tensor> = tensors.iter().map(|t| t.unsqueeze(axis)).collect();
         let refs: Vec<&Tensor> = expanded.iter().collect();
         Tensor::concat(&refs, axis)
