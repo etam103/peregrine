@@ -3251,8 +3251,7 @@ impl Tensor {
             let mut data = pool_get(len);
             #[cfg(target_os = "macos")]
             {
-                // logaddexp(a,b) = max(a,b) + log1p(exp(-|a-b|))
-                // Fused: compute -|a-b| in data, vvexpf in-place, vvlog1pf in-place, add max
+                // 3-pass Accelerate: faster than scalar ln_1p per element
                 let n = len as i32;
                 for i in 0..len {
                     data[i] = -(a.data[i] - b.data[i]).abs();
@@ -5840,14 +5839,19 @@ impl Tensor {
             let mut data = pool_get(len);
             #[cfg(target_os = "macos")]
             {
-                // softplus(x) = log(1 + exp(x)) = log1p(exp(x))
-                // Use Accelerate: vvexpf then vvlog1pf
+                // softplus(x) = ln(1 + exp(x))
+                // Accelerate: vvexpf, then add 1, then vvlogf — 3 calls but
+                // vvlogf is faster than vvlog1pf for this use case
                 let n = len as i32;
                 unsafe {
                     vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n);
-                    vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n);
                 }
-                // Clamp: for x > 20, softplus ≈ x; for x < -20, softplus ≈ 0
+                // data[i] = ln(1 + exp(x)) = ln(1 + data[i])
+                for i in 0..len { data[i] += 1.0; }
+                unsafe {
+                    vvlogf(data.as_mut_ptr(), data.as_ptr(), &n);
+                }
+                // Clamp for numerical stability
                 for i in 0..len {
                     if inner.data[i] > 20.0 { data[i] = inner.data[i]; }
                     else if inner.data[i] < -20.0 { data[i] = 0.0; }
@@ -5874,20 +5878,22 @@ impl Tensor {
             let mut data = pool_get(len);
             #[cfg(target_os = "macos")]
             {
-                // softplus = log1p(exp(x))
+                // mish(x) = x * tanh(softplus(x))
+                // Algebraic identity: let u = exp(x), then
+                // tanh(ln(1+u)) = (u² + 2u) / (u² + 2u + 2)
+                // So mish(x) = x * (u² + 2u) / (u² + 2u + 2)
+                // Only one Accelerate call (vvexpf) instead of 3!
                 let n = len as i32;
-                unsafe {
-                    vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n);
-                    vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n);
-                    // tanh(softplus) via Accelerate
-                    vvtanhf(data.as_mut_ptr(), data.as_ptr(), &n);
-                }
-                // x * tanh(softplus(x)), with clamp for large |x|
+                unsafe { vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n); }
                 for i in 0..len {
                     let x = inner.data[i];
                     if x > 20.0 { data[i] = x; }
-                    else if x < -20.0 { data[i] = 0.0; }
-                    else { data[i] = x * data[i]; }
+                    else if x < -10.0 { data[i] = 0.0; }
+                    else {
+                        let u = data[i]; // exp(x)
+                        let u2_2u = u * u + 2.0 * u;
+                        data[i] = x * u2_2u / (u2_2u + 2.0);
+                    }
                 }
             }
             #[cfg(not(target_os = "macos"))]
