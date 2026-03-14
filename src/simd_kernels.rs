@@ -426,32 +426,56 @@ pub fn vec_tanh_f32(a: &[f32], out: &mut [f32]) {
 pub fn vec_gelu_f32(a: &[f32], out: &mut [f32]) {
     let len = a.len();
     debug_assert_eq!(len, out.len());
-    let chunks = len / 4;
-    let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+    let chunks8 = len / 8;
     unsafe {
         let half = vdupq_n_f32(0.5);
         let one = vdupq_n_f32(1.0);
         let two = vdupq_n_f32(2.0);
-        let coeff = vdupq_n_f32(0.044715);
-        let s2p = vdupq_n_f32(sqrt_2_over_pi);
-        for i in 0..chunks {
-            let off = i * 4;
-            let vx = vld1q_f32(a.as_ptr().add(off));
-            let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
-            let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
+        let va = vdupq_n_f32(0.7978845608_f32);  // sqrt(2/pi)
+        let vb = vdupq_n_f32(0.0356774222_f32);  // sqrt(2/pi) * 0.044715
+        let ap = a.as_ptr();
+        let op = out.as_mut_ptr();
+        for i in 0..chunks8 {
+            let off = i * 8;
+            let vx0 = vld1q_f32(ap.add(off));
+            let vx1 = vld1q_f32(ap.add(off + 4));
+            let x2_0 = vmulq_f32(vx0, vx0);
+            let x2_1 = vmulq_f32(vx1, vx1);
+            let inner0 = vmulq_f32(vx0, vmlaq_f32(va, vb, x2_0));
+            let inner1 = vmulq_f32(vx1, vmlaq_f32(va, vb, x2_1));
             // tanh via 2*sigmoid(2x)-1
+            let two_inner0 = vmulq_f32(two, inner0);
+            let two_inner1 = vmulq_f32(two, inner1);
+            let exp0 = fast_exp_f32x4(vnegq_f32(two_inner0));
+            let exp1 = fast_exp_f32x4(vnegq_f32(two_inner1));
+            let sig0 = vdivq_f32(one, vaddq_f32(one, exp0));
+            let sig1 = vdivq_f32(one, vaddq_f32(one, exp1));
+            let tanh0 = vsubq_f32(vmulq_f32(two, sig0), one);
+            let tanh1 = vsubq_f32(vmulq_f32(two, sig1), one);
+            let r0 = vmulq_f32(half, vmulq_f32(vx0, vaddq_f32(one, tanh0)));
+            let r1 = vmulq_f32(half, vmulq_f32(vx1, vaddq_f32(one, tanh1)));
+            vst1q_f32(op.add(off), r0);
+            vst1q_f32(op.add(off + 4), r1);
+        }
+        // Handle remaining chunk of 4
+        if chunks8 * 8 + 4 <= len {
+            let off = chunks8 * 8;
+            let vx = vld1q_f32(ap.add(off));
+            let x2 = vmulq_f32(vx, vx);
+            let inner = vmulq_f32(vx, vmlaq_f32(va, vb, x2));
             let two_inner = vmulq_f32(two, inner);
-            let neg_2inner = vnegq_f32(two_inner);
-            let exp_neg = fast_exp_f32x4(neg_2inner);
+            let exp_neg = fast_exp_f32x4(vnegq_f32(two_inner));
             let sig = vdivq_f32(one, vaddq_f32(one, exp_neg));
             let tanh_val = vsubq_f32(vmulq_f32(two, sig), one);
             let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, tanh_val)));
-            vst1q_f32(out.as_mut_ptr().add(off), result);
+            vst1q_f32(op.add(off), result);
         }
     }
-    for i in (chunks * 4)..len {
+    let tail_start = (len / 4) * 4;
+    for i in tail_start..len {
         let x = a[i];
-        let inner_val = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+        let x2 = x * x;
+        let inner_val = x * (0.7978845608 + 0.0356774222 * x2);
         out[i] = 0.5 * x * (1.0 + inner_val.tanh());
     }
 }
@@ -750,19 +774,36 @@ pub fn vec_elu_backward_f32(input: &[f32], grad: &[f32], alpha: f32, out: &mut [
 pub fn vec_silu_f32(a: &[f32], out: &mut [f32]) {
     let len = a.len();
     debug_assert_eq!(len, out.len());
-    let chunks = len / 4;
+    let chunks8 = len / 8;
     unsafe {
         let one = vdupq_n_f32(1.0);
-        for i in 0..chunks {
-            let off = i * 4;
-            let vx = vld1q_f32(a.as_ptr().add(off));
+        let ap = a.as_ptr();
+        let op = out.as_mut_ptr();
+        for i in 0..chunks8 {
+            let off = i * 8;
+            let vx0 = vld1q_f32(ap.add(off));
+            let vx1 = vld1q_f32(ap.add(off + 4));
+            let neg0 = vnegq_f32(vx0);
+            let neg1 = vnegq_f32(vx1);
+            let exp0 = fast_exp_f32x4(neg0);
+            let exp1 = fast_exp_f32x4(neg1);
+            let sig0 = vdivq_f32(one, vaddq_f32(one, exp0));
+            let sig1 = vdivq_f32(one, vaddq_f32(one, exp1));
+            vst1q_f32(op.add(off), vmulq_f32(vx0, sig0));
+            vst1q_f32(op.add(off + 4), vmulq_f32(vx1, sig1));
+        }
+        // Handle remaining chunk of 4 if len % 8 >= 4
+        if chunks8 * 8 + 4 <= len {
+            let off = chunks8 * 8;
+            let vx = vld1q_f32(ap.add(off));
             let neg_x = vnegq_f32(vx);
             let exp_neg_x = fast_exp_f32x4(neg_x);
             let sigmoid = vdivq_f32(one, vaddq_f32(one, exp_neg_x));
-            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vx, sigmoid));
+            vst1q_f32(op.add(off), vmulq_f32(vx, sigmoid));
         }
     }
-    for i in (chunks * 4)..len {
+    let tail_start = (len / 4) * 4;
+    for i in tail_start..len {
         let x = a[i];
         let sig = 1.0 / (1.0 + (-x).exp());
         out[i] = x * sig;

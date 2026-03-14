@@ -3065,19 +3065,24 @@ impl Tensor {
                     let mut tmp = vec![0.0f32; clen];
                     unsafe {
                         use std::arch::aarch64::*;
-                        let s2p = vdupq_n_f32(sqrt_2_over_pi);
-                        let coeff = vdupq_n_f32(0.044715);
-                        let simd_n = clen / 4;
+                        let va = vdupq_n_f32(0.7978845608_f32);  // sqrt(2/pi)
+                        let vb = vdupq_n_f32(0.0356774222_f32);  // sqrt(2/pi) * 0.044715
+                        let simd_n = clen / 8;
                         for c in 0..simd_n {
-                            let off = c * 4;
-                            let vx = vld1q_f32(s.as_ptr().add(off));
-                            let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
-                            let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
-                            vst1q_f32(tmp.as_mut_ptr().add(off), inner);
+                            let off = c * 8;
+                            let vx0 = vld1q_f32(s.as_ptr().add(off));
+                            let vx1 = vld1q_f32(s.as_ptr().add(off + 4));
+                            let x2_0 = vmulq_f32(vx0, vx0);
+                            let x2_1 = vmulq_f32(vx1, vx1);
+                            let inner0 = vmulq_f32(vx0, vmlaq_f32(va, vb, x2_0));
+                            let inner1 = vmulq_f32(vx1, vmlaq_f32(va, vb, x2_1));
+                            vst1q_f32(tmp.as_mut_ptr().add(off), inner0);
+                            vst1q_f32(tmp.as_mut_ptr().add(off + 4), inner1);
                         }
-                        for i in (simd_n * 4)..clen {
+                        for i in (simd_n * 8)..clen {
                             let x = s[i];
-                            tmp[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                            let x2 = x * x;
+                            tmp[i] = x * (0.7978845608 + 0.0356774222 * x2);
                         }
                     }
                     let n = clen as i32;
@@ -3086,15 +3091,19 @@ impl Tensor {
                         use std::arch::aarch64::*;
                         let half = vdupq_n_f32(0.5);
                         let one = vdupq_n_f32(1.0);
-                        let simd_chunks = clen / 4;
-                        for i in 0..simd_chunks {
-                            let off = i * 4;
-                            let vx = vld1q_f32(s.as_ptr().add(off));
-                            let vt = vld1q_f32(d.as_ptr().add(off));
-                            let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, vt)));
-                            vst1q_f32(d.as_mut_ptr().add(off), result);
+                        let simd_chunks8 = clen / 8;
+                        for i in 0..simd_chunks8 {
+                            let off = i * 8;
+                            let vx0 = vld1q_f32(s.as_ptr().add(off));
+                            let vx1 = vld1q_f32(s.as_ptr().add(off + 4));
+                            let vt0 = vld1q_f32(d.as_ptr().add(off));
+                            let vt1 = vld1q_f32(d.as_ptr().add(off + 4));
+                            let r0 = vmulq_f32(half, vmulq_f32(vx0, vaddq_f32(one, vt0)));
+                            let r1 = vmulq_f32(half, vmulq_f32(vx1, vaddq_f32(one, vt1)));
+                            vst1q_f32(d.as_mut_ptr().add(off), r0);
+                            vst1q_f32(d.as_mut_ptr().add(off + 4), r1);
                         }
-                        for i in (simd_chunks * 4)..clen {
+                        for i in (simd_chunks8 * 8)..clen {
                             d[i] = 0.5 * s[i] * (1.0 + d[i]);
                         }
                     }
@@ -3103,19 +3112,24 @@ impl Tensor {
                 // 2-pass (no temp buffer): compute inner into data, vvtanhf in-place, NEON combine
                 unsafe {
                     use std::arch::aarch64::*;
-                    let s2p = vdupq_n_f32(sqrt_2_over_pi);
-                    let coeff = vdupq_n_f32(0.044715);
-                    let chunks = len / 4;
+                    let va = vdupq_n_f32(0.7978845608_f32);  // sqrt(2/pi)
+                    let vb = vdupq_n_f32(0.0356774222_f32);  // sqrt(2/pi) * 0.044715
+                    let chunks = len / 8;
                     for c in 0..chunks {
-                        let off = c * 4;
-                        let vx = vld1q_f32(src.as_ptr().add(off));
-                        let x3 = vmulq_f32(vmulq_f32(vx, vx), vx);
-                        let inner = vmulq_f32(s2p, vaddq_f32(vx, vmulq_f32(coeff, x3)));
-                        vst1q_f32(data.as_mut_ptr().add(off), inner);
+                        let off = c * 8;
+                        let vx0 = vld1q_f32(src.as_ptr().add(off));
+                        let vx1 = vld1q_f32(src.as_ptr().add(off + 4));
+                        let x2_0 = vmulq_f32(vx0, vx0);
+                        let x2_1 = vmulq_f32(vx1, vx1);
+                        let inner0 = vmulq_f32(vx0, vmlaq_f32(va, vb, x2_0));
+                        let inner1 = vmulq_f32(vx1, vmlaq_f32(va, vb, x2_1));
+                        vst1q_f32(data.as_mut_ptr().add(off), inner0);
+                        vst1q_f32(data.as_mut_ptr().add(off + 4), inner1);
                     }
-                    for i in (chunks * 4)..len {
+                    for i in (chunks * 8)..len {
                         let x = src[i];
-                        data[i] = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+                        let x2 = x * x;
+                        data[i] = x * (0.7978845608 + 0.0356774222 * x2);
                     }
                 }
                 let n = len as i32;
@@ -3124,15 +3138,19 @@ impl Tensor {
                     use std::arch::aarch64::*;
                     let half = vdupq_n_f32(0.5);
                     let one = vdupq_n_f32(1.0);
-                    let chunks = len / 4;
-                    for i in 0..chunks {
-                        let off = i * 4;
-                        let vx = vld1q_f32(src.as_ptr().add(off));
-                        let vt = vld1q_f32(data.as_ptr().add(off));
-                        let result = vmulq_f32(half, vmulq_f32(vx, vaddq_f32(one, vt)));
-                        vst1q_f32(data.as_mut_ptr().add(off), result);
+                    let chunks8 = len / 8;
+                    for i in 0..chunks8 {
+                        let off = i * 8;
+                        let vx0 = vld1q_f32(src.as_ptr().add(off));
+                        let vx1 = vld1q_f32(src.as_ptr().add(off + 4));
+                        let vt0 = vld1q_f32(data.as_ptr().add(off));
+                        let vt1 = vld1q_f32(data.as_ptr().add(off + 4));
+                        let r0 = vmulq_f32(half, vmulq_f32(vx0, vaddq_f32(one, vt0)));
+                        let r1 = vmulq_f32(half, vmulq_f32(vx1, vaddq_f32(one, vt1)));
+                        vst1q_f32(data.as_mut_ptr().add(off), r0);
+                        vst1q_f32(data.as_mut_ptr().add(off + 4), r1);
                     }
-                    for i in (chunks * 4)..len {
+                    for i in (chunks8 * 8)..len {
                         data[i] = 0.5 * src[i] * (1.0 + data[i]);
                     }
                 }
