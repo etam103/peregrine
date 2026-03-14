@@ -3758,7 +3758,7 @@ impl Tensor {
         self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
-        if len >= PAR_THRESHOLD_EXPENSIVE {
+        if len >= PAR_THRESHOLD_CHEAP {
             let data: Vec<f32> = inner.data.par_iter().map(|&x| x.exp()).collect();
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
         } else {
@@ -6033,25 +6033,43 @@ impl Tensor {
         let total: usize = out_shape.iter().product();
         let mut data = vec![0.0f32; total];
 
-        // Compute strides for input and output
-        let mut in_strides = vec![1usize; ndim];
-        for i in (0..ndim.saturating_sub(1)).rev() {
-            in_strides[i] = in_strides[i + 1] * shape[i + 1];
-        }
-        let mut out_strides = vec![1usize; ndim];
-        for i in (0..ndim.saturating_sub(1)).rev() {
-            out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
-        }
+        // Fast path: bulk copy using dimension-by-dimension tiling.
+        // Start by copying the source data, then tile along each dimension
+        // from innermost to outermost.
+        data[..inner.data.len()].copy_from_slice(&inner.data);
+        // current_shape tracks what we've built so far
+        let mut current_size = inner.data.len();
 
-        for flat in 0..total {
-            let mut in_idx = 0;
-            let mut rem = flat;
-            for d in 0..ndim {
-                let coord = rem / out_strides[d];
-                rem %= out_strides[d];
-                in_idx += (coord % shape[d]) * in_strides[d];
+        // Process dimensions from innermost to outermost
+        for d in (0..ndim).rev() {
+            let rep = repeats[d];
+            if rep == 1 { continue; }
+
+            // Size of one "block" along this dimension = product of dims d..ndim
+            // in the partially-tiled tensor
+            let block_in: usize = shape[d] * shape[d+1..].iter()
+                .zip(repeats[d+1..].iter())
+                .map(|(&s, &r)| s * r)
+                .product::<usize>().max(1);
+            let block_out = block_in * rep;
+            let num_blocks = current_size / block_in;
+
+            // Tile each block in-place from back to front to avoid overwrites
+            for b in (0..num_blocks).rev() {
+                let src_start = b * block_in;
+                let dst_base = b * block_out;
+                // Copy the source block to repeated positions
+                // First, move src to its new location if needed
+                if dst_base != src_start {
+                    data.copy_within(src_start..src_start + block_in, dst_base);
+                }
+                // Then duplicate the block (rep - 1) more times
+                for r in 1..rep {
+                    let dst = dst_base + r * block_in;
+                    data.copy_within(dst_base..dst_base + block_in, dst);
+                }
             }
-            data[flat] = inner.data[in_idx];
+            current_size = num_blocks * block_out;
         }
 
         Tensor::from_op(data, out_shape, Op::Repeat { input: self.clone(), repeats: repeats.to_vec() })
@@ -6102,26 +6120,46 @@ impl Tensor {
         let total: usize = out_shape.iter().product();
         let mut data = vec![value; total];
 
-        // Compute strides
-        let mut in_strides = vec![1usize; ndim];
-        for i in (0..ndim.saturating_sub(1)).rev() {
-            in_strides[i] = in_strides[i + 1] * shape[i + 1];
-        }
-        let mut out_strides = vec![1usize; ndim];
-        for i in (0..ndim.saturating_sub(1)).rev() {
-            out_strides[i] = out_strides[i + 1] * out_shape[i + 1];
-        }
+        // Fast path: bulk copy rows for contiguous last dimension
+        if ndim >= 2 {
+            let inner_dim = shape[ndim - 1];
+            let out_inner = out_shape[ndim - 1];
+            let pad_left = widths[ndim - 1].0;
 
-        let in_total: usize = shape.iter().product();
-        for flat in 0..in_total {
-            let mut out_flat = 0;
-            let mut rem = flat;
-            for d in 0..ndim {
-                let coord = rem / in_strides[d];
-                rem %= in_strides[d];
-                out_flat += (coord + widths[d].0) * out_strides[d];
+            // Number of rows = product of all dims except last
+            let num_rows: usize = shape[..ndim - 1].iter().product();
+
+            // Compute strides for outer dimensions only
+            let outer_shape = &shape[..ndim - 1];
+            let outer_out_shape = &out_shape[..ndim - 1];
+            let outer_ndim = ndim - 1;
+            let mut in_outer_strides = vec![1usize; outer_ndim];
+            for i in (0..outer_ndim.saturating_sub(1)).rev() {
+                in_outer_strides[i] = in_outer_strides[i + 1] * outer_shape[i + 1];
             }
-            data[out_flat] = inner.data[flat];
+            let mut out_outer_strides = vec![1usize; outer_ndim];
+            for i in (0..outer_ndim.saturating_sub(1)).rev() {
+                out_outer_strides[i] = out_outer_strides[i + 1] * outer_out_shape[i + 1];
+            }
+
+            for row in 0..num_rows {
+                // Map row index to output offset (accounting for padding in outer dims)
+                let mut out_offset = 0;
+                let mut rem = row;
+                for d in 0..outer_ndim {
+                    let coord = rem / in_outer_strides[d];
+                    rem %= in_outer_strides[d];
+                    out_offset += (coord + widths[d].0) * out_outer_strides[d];
+                }
+                let in_start = row * inner_dim;
+                let out_start = out_offset * out_inner + pad_left;
+                data[out_start..out_start + inner_dim]
+                    .copy_from_slice(&inner.data[in_start..in_start + inner_dim]);
+            }
+        } else if ndim == 1 {
+            let pad_left = widths[0].0;
+            data[pad_left..pad_left + shape[0]]
+                .copy_from_slice(&inner.data[..shape[0]]);
         }
 
         Tensor::from_op(data, out_shape,

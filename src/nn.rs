@@ -462,6 +462,79 @@ impl RMSNorm {
         let last = *shape.last().unwrap();
         assert_eq!(last, self.dim, "RMSNorm: last dim must match");
 
+        // Fast fused path for inference (no autograd needed)
+        if !x.requires_grad() && !self.weight.requires_grad() {
+            let data = x.data();
+            let n = data.len();
+            let num_vecs = n / self.dim;
+            let w = self.weight.data();
+            let mut out = vec![0.0f32; n];
+            let dim = self.dim;
+            let eps = self.eps;
+            let inv_dim = 1.0 / dim as f32;
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                use std::arch::aarch64::*;
+                let chunks4 = dim / 4;
+                let rem_start = chunks4 * 4;
+                for v in 0..num_vecs {
+                    let base = v * dim;
+                    let xp = data[base..].as_ptr();
+                    let wp = w.as_ptr();
+                    let op = out[base..].as_mut_ptr();
+
+                    // Pass 1: compute sum of squares with NEON
+                    let mut sum_sq = unsafe { vdupq_n_f32(0.0) };
+                    for i in 0..chunks4 {
+                        let off = i * 4;
+                        unsafe {
+                            let vx = vld1q_f32(xp.add(off));
+                            sum_sq = vfmaq_f32(sum_sq, vx, vx);
+                        }
+                    }
+                    let mut ss: f32 = unsafe {
+                        vaddvq_f32(sum_sq)
+                    };
+                    for i in rem_start..dim {
+                        let val = data[base + i];
+                        ss += val * val;
+                    }
+                    let inv_rms = 1.0 / (ss * inv_dim + eps).sqrt();
+                    let v_scale = unsafe { vdupq_n_f32(inv_rms) };
+
+                    // Pass 2: x * inv_rms * weight with NEON
+                    for i in 0..chunks4 {
+                        let off = i * 4;
+                        unsafe {
+                            let vx = vld1q_f32(xp.add(off));
+                            let vw = vld1q_f32(wp.add(off));
+                            let scaled = vmulq_f32(vx, v_scale);
+                            vst1q_f32(op.add(off), vmulq_f32(scaled, vw));
+                        }
+                    }
+                    for i in rem_start..dim {
+                        out[base + i] = data[base + i] * inv_rms * w[i];
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                for v in 0..num_vecs {
+                    let base = v * dim;
+                    let slice = &data[base..base + dim];
+                    let ss: f32 = slice.iter().map(|&val| val * val).sum::<f32>();
+                    let inv_rms = 1.0 / (ss * inv_dim + eps).sqrt();
+                    for i in 0..dim {
+                        out[base + i] = data[base + i] * inv_rms * w[i];
+                    }
+                }
+            }
+
+            return Tensor::new(out, shape, false);
+        }
+
+        // Autograd path: compose from tensor ops for gradient tracking
         let data = x.data();
         let n = data.len();
         let num_vecs = n / self.dim;
