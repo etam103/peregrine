@@ -26,6 +26,8 @@ pub mod speculative;
 pub mod thermal;
 pub mod sched;
 pub mod models;
+#[cfg(target_arch = "aarch64")]
+pub mod amx;
 
 #[cfg(feature = "metal")]
 pub mod metal;
