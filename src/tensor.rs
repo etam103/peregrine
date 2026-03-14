@@ -1254,7 +1254,6 @@ impl Tensor {
         let (k2, n) = (b.shape[0], b.shape[1]);
         assert_eq!(k1, k2, "inner dimensions must match for matmul");
         let mut data = pool_get(m * n);
-        // Zero the buffer (sgemm with beta=0 will overwrite, but pool_get may have stale data)
         #[cfg(target_os = "macos")]
         {
             sgemm(false, false, m, n, k1, 1.0, &a.data, k1, &b.data, n, 0.0, &mut data, n);

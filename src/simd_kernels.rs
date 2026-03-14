@@ -1806,6 +1806,95 @@ pub fn vec_logsumexp_rows(data: &[f32], out: &mut [f32], rows: usize, cols: usiz
     }
 }
 
+// ========================================================================
+// Phase 10: Hand-tuned NEON matmul for small matrices
+// ========================================================================
+
+/// NEON matmul for small matrices: C[M,N] = A[M,K] * B[K,N]
+/// Uses 4x4 register blocking with NEON FMA.
+/// Faster than cblas_sgemm for M,N,K ≤ 128 due to zero dispatch overhead.
+#[cfg(target_arch = "aarch64")]
+pub fn neon_sgemm(
+    a: &[f32], b: &[f32], c: &mut [f32],
+    m: usize, n: usize, k: usize,
+) {
+    // Zero output
+    for v in c.iter_mut() { *v = 0.0; }
+
+    // 4x4 register-blocked matmul
+    let m4 = m / 4 * 4;
+    let n4 = n / 4 * 4;
+
+    unsafe {
+        // Main 4x4 block loop
+        for i in (0..m4).step_by(4) {
+            for j in (0..n4).step_by(4) {
+                // Accumulate 4x4 block of C
+                let mut c00 = vdupq_n_f32(0.0);
+                let mut c01 = vdupq_n_f32(0.0);
+                let mut c02 = vdupq_n_f32(0.0);
+                let mut c03 = vdupq_n_f32(0.0);
+                let mut c10 = vdupq_n_f32(0.0);
+                let mut c11 = vdupq_n_f32(0.0);
+                let mut c12 = vdupq_n_f32(0.0);
+                let mut c13 = vdupq_n_f32(0.0);
+                let mut c20 = vdupq_n_f32(0.0);
+                let mut c21 = vdupq_n_f32(0.0);
+                let mut c22 = vdupq_n_f32(0.0);
+                let mut c23 = vdupq_n_f32(0.0);
+                let mut c30 = vdupq_n_f32(0.0);
+                let mut c31 = vdupq_n_f32(0.0);
+                let mut c32 = vdupq_n_f32(0.0);
+                let mut c33 = vdupq_n_f32(0.0);
+
+                for p in 0..k {
+                    let a0 = vdupq_n_f32(*a.get_unchecked((i) * k + p));
+                    let a1 = vdupq_n_f32(*a.get_unchecked((i+1) * k + p));
+                    let a2 = vdupq_n_f32(*a.get_unchecked((i+2) * k + p));
+                    let a3 = vdupq_n_f32(*a.get_unchecked((i+3) * k + p));
+
+                    let b_row = b.as_ptr().add(p * n + j);
+                    let bv = vld1q_f32(b_row);
+
+                    c00 = vfmaq_f32(c00, a0, bv);
+                    c10 = vfmaq_f32(c10, a1, bv);
+                    c20 = vfmaq_f32(c20, a2, bv);
+                    c30 = vfmaq_f32(c30, a3, bv);
+                }
+
+                // Store 4x4 block
+                let cp = c.as_mut_ptr();
+                vst1q_f32(cp.add((i) * n + j), c00);
+                vst1q_f32(cp.add((i+1) * n + j), c10);
+                vst1q_f32(cp.add((i+2) * n + j), c20);
+                vst1q_f32(cp.add((i+3) * n + j), c30);
+            }
+        }
+
+        // Handle remaining columns (n not divisible by 4)
+        for i in 0..m {
+            for j in n4..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += *a.get_unchecked(i * k + p) * *b.get_unchecked(p * n + j);
+                }
+                *c.get_unchecked_mut(i * n + j) = sum;
+            }
+        }
+
+        // Handle remaining rows (m not divisible by 4)
+        for i in m4..m {
+            for j in 0..n4 {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += *a.get_unchecked(i * k + p) * *b.get_unchecked(p * n + j);
+                }
+                *c.get_unchecked_mut(i * n + j) = sum;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_arch = "aarch64")]
