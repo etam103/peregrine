@@ -224,8 +224,8 @@ pub fn bench_mlp_forward(quick: bool) -> Vec<BenchResult> {
         let x = Tensor::randn(&[64, 784], false);
 
         let times = bench(|| {
-            let h1 = x.matmul_bias_relu(&w1, &b1);
-            let h2 = h1.matmul_bias_relu(&w2, &b2);
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
             let out = h2.matmul(&w3).add_bias(&b3);
             black_box(out);
         }, iters);
@@ -243,8 +243,8 @@ pub fn bench_mlp_forward(quick: bool) -> Vec<BenchResult> {
         let x = Tensor::randn(&[256, 784], false);
 
         let times = bench(|| {
-            let h1 = x.matmul_bias_relu(&w1, &b1);
-            let h2 = h1.matmul_bias_relu(&w2, &b2);
+            let h1 = x.matmul(&w1).add_bias(&b1).relu();
+            let h2 = h1.matmul(&w2).add_bias(&b2).relu();
             let out = h2.matmul(&w3).add_bias(&b3);
             black_box(out);
         }, ITERS_SLOW);
