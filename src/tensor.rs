@@ -11,7 +11,7 @@ use crate::simd_kernels;
 
 /// Rayon threshold for cheap ops (add, mul, sub, div, relu, neg, abs, scale, add_bias).
 /// At sizes below this, single-threaded SIMD + warm cache is faster than Rayon spawn overhead.
-const PAR_THRESHOLD_CHEAP: usize = 500_000;
+const PAR_THRESHOLD_CHEAP: usize = 200_000;
 /// Rayon threshold for expensive ops (exp, log, sqrt, sigmoid, gelu, tanh, sin, cos, pow).
 const PAR_THRESHOLD_EXPENSIVE: usize = 100_000;
 
@@ -49,6 +49,15 @@ extern "C" {
     fn vvasinf(result: *mut f32, input: *const f32, count: *const i32);
     fn vvatanf(result: *mut f32, input: *const f32, count: *const i32);
     fn vvatan2f(result: *mut f32, y: *const f32, x: *const f32, count: *const i32);
+    fn vvlog1pf(result: *mut f32, input: *const f32, count: *const i32);
+    fn vvexpm1f(result: *mut f32, input: *const f32, count: *const i32);
+    fn vvacosf(result: *mut f32, input: *const f32, count: *const i32);
+    fn vvlogf(result: *mut f32, input: *const f32, count: *const i32);
+    fn vvlog2f(result: *mut f32, input: *const f32, count: *const i32);
+    fn vvlog10f(result: *mut f32, input: *const f32, count: *const i32);
+    fn vvpowf(result: *mut f32, base: *const f32, exp: *const f32, count: *const i32);
+    fn vvrsqrtf(result: *mut f32, input: *const f32, count: *const i32);
+    fn vvasinhf(result: *mut f32, input: *const f32, count: *const i32);
 }
 
 /// Safe wrapper around cblas_sgemm. Computes C = alpha * op(A) * op(B) + beta * C.
@@ -3049,7 +3058,10 @@ impl Tensor {
         if a.shape == b.shape {
             let len = a.data.len();
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = a.data[i].powf(b.data[i]); }
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvpowf(data.as_mut_ptr(), b.data.as_ptr(), a.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
+            { for i in 0..len { data[i] = a.data[i].powf(b.data[i]); } }
             Tensor::from_op(data, a.shape.clone(), Op::Power(self.clone(), other.clone()))
         } else {
             let (data, out_shape) = broadcast_binary_op(&a.data, &a.shape, &b.data, &b.shape, |x, y| x.powf(y));
@@ -3765,7 +3777,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Log(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].ln(); }
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvlogf(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
+            { for i in 0..len { data[i] = inner.data[i].ln(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Log(self.clone()))
         }
     }
@@ -3997,9 +4012,9 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Rsqrt(self.clone()))
         } else {
             let mut data = pool_get(len);
-            #[cfg(target_arch = "aarch64")]
-            { simd_kernels::vec_rsqrt_f32(&inner.data[..len], &mut data[..len]); }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvrsqrtf(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
             { for i in 0..len { data[i] = 1.0 / inner.data[i].sqrt(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Rsqrt(self.clone()))
         }
@@ -4165,7 +4180,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Expm1(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].exp_m1(); }
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvexpm1f(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
+            { for i in 0..len { data[i] = inner.data[i].exp_m1(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Expm1(self.clone()))
         }
     }
@@ -4195,7 +4213,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Log2(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].log2(); }
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvlog2f(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
+            { for i in 0..len { data[i] = inner.data[i].log2(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Log2(self.clone()))
         }
     }
@@ -4225,7 +4246,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Log10(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].log10(); }
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvlog10f(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
+            { for i in 0..len { data[i] = inner.data[i].log10(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Log10(self.clone()))
         }
     }
@@ -4255,7 +4279,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Log1p(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].ln_1p(); }
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvlog1pf(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
+            { for i in 0..len { data[i] = inner.data[i].ln_1p(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Log1p(self.clone()))
         }
     }
@@ -4470,7 +4497,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Arccos(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].acos(); }
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvacosf(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
+            { for i in 0..len { data[i] = inner.data[i].acos(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Arccos(self.clone()))
         }
     }
@@ -4540,7 +4570,10 @@ impl Tensor {
             Tensor::from_op(data, inner.shape.clone(), Op::Arcsinh(self.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = inner.data[i].asinh(); }
+            #[cfg(target_os = "macos")]
+            { let n = len as i32; unsafe { vvasinhf(data.as_mut_ptr(), inner.data.as_ptr(), &n); } }
+            #[cfg(not(target_os = "macos"))]
+            { for i in 0..len { data[i] = inner.data[i].asinh(); } }
             Tensor::from_op(data, inner.shape.clone(), Op::Arcsinh(self.clone()))
         }
     }
@@ -5522,7 +5555,7 @@ impl Tensor {
 
     /// Softplus: log(1 + exp(beta * x)) / beta.
     pub fn softplus(&self, beta: f32) -> Tensor {
-        if beta == 1.0 {
+        if beta == 1.0 && !self.requires_grad() {
             #[cfg(feature = "metal")]
             self.sync_gpu_to_cpu();
             let inner = self.0.borrow();
@@ -5544,7 +5577,7 @@ impl Tensor {
     /// Mish: x * tanh(softplus(x)).
     pub fn mish(&self) -> Tensor {
         #[cfg(target_arch = "aarch64")]
-        {
+        if !self.requires_grad() {
             #[cfg(feature = "metal")]
             self.sync_gpu_to_cpu();
             let inner = self.0.borrow();
@@ -5553,7 +5586,6 @@ impl Tensor {
             simd_kernels::vec_mish_f32(&inner.data, &mut data);
             return Tensor::from_op(data, inner.shape.clone(), Op::None);
         }
-        #[cfg(not(target_arch = "aarch64"))]
         self.mul(&self.softplus(1.0).tanh())
     }
 
@@ -5580,7 +5612,7 @@ impl Tensor {
     /// Hard swish: x * relu6(x + 3) / 6.
     pub fn hardswish(&self) -> Tensor {
         #[cfg(target_arch = "aarch64")]
-        {
+        if !self.requires_grad() {
             #[cfg(feature = "metal")]
             self.sync_gpu_to_cpu();
             let inner = self.0.borrow();
@@ -5589,7 +5621,6 @@ impl Tensor {
             simd_kernels::vec_hardswish_f32(&inner.data, &mut data);
             return Tensor::from_op(data, inner.shape.clone(), Op::None);
         }
-        #[cfg(not(target_arch = "aarch64"))]
         self.mul(
             &self.add(&Tensor::full(&self.shape(), 3.0, false))
                 .relu6()
@@ -5610,7 +5641,7 @@ impl Tensor {
     /// SELU: scale * (max(0,x) + min(0, alpha*(exp(x)-1))) with fixed constants.
     pub fn selu(&self) -> Tensor {
         #[cfg(target_arch = "aarch64")]
-        {
+        if !self.requires_grad() {
             #[cfg(feature = "metal")]
             self.sync_gpu_to_cpu();
             let inner = self.0.borrow();
@@ -5619,12 +5650,9 @@ impl Tensor {
             simd_kernels::vec_selu_f32(&inner.data, &mut data);
             return Tensor::from_op(data, inner.shape.clone(), Op::None);
         }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let alpha: f32 = 1.6732632;
-            let scale: f32 = 1.0507010;
-            self.elu(alpha).scale(scale)
-        }
+        let alpha: f32 = 1.6732632;
+        let scale: f32 = 1.0507010;
+        self.elu(alpha).scale(scale)
     }
 
     /// Step function: 1.0 if x > threshold, 0.0 otherwise. Not differentiable (no grad).
