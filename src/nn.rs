@@ -1095,8 +1095,8 @@ impl GRU {
                 }
                 #[cfg(target_arch = "aarch64")]
                 {
-                    if hs >= 512 {
-                        // NEON vectorized path for large hidden sizes
+                    if hs >= 16 {
+                        // NEON vectorized path
                         use std::arch::aarch64::*;
                         let chunks = hs / 4;
                         unsafe {
