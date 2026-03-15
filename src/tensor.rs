@@ -7417,6 +7417,25 @@ impl Tensor {
                 let (m, k) = (a_inner.shape[0], a_inner.shape[1]);
                 let n = w_inner.shape[1];
                 let mut grad_bias = vec![0.0f32; n];
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    let chunks = n / 4;
+                    for r in 0..m {
+                        unsafe {
+                            for c in 0..chunks {
+                                let off = c * 4;
+                                let acc = vld1q_f32(grad_bias.as_ptr().add(off));
+                                let val = vld1q_f32(relu_grad.as_ptr().add(r * n + off));
+                                vst1q_f32(grad_bias.as_mut_ptr().add(off), vaddq_f32(acc, val));
+                            }
+                        }
+                        for c in (chunks * 4)..n {
+                            grad_bias[c] += relu_grad[r * n + c];
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
                 for r in 0..m {
                     for c in 0..n {
                         grad_bias[c] += relu_grad[r * n + c];
