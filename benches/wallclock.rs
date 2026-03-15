@@ -231,8 +231,7 @@ fn bench_training_step() -> Vec<serde_json::Value> {
             let logits = h2.matmul(&w3).add_bias(&b3);
             let loss = nn::cross_entropy_loss(&logits, &targets);
             loss.backward();
-            opt.step();
-            opt.zero_grad();
+            opt.step_and_zero_grad();
             black_box(loss);
         }, ITERS_SLOW);
         results.push(make_result("train_step_64", times));

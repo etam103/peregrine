@@ -463,6 +463,66 @@ pub enum Op {
     UpsampleBilinear { input: Tensor, out_h: usize, out_w: usize },
 }
 
+impl Op {
+    /// Visit all input tensors by reference without cloning the Op.
+    /// This avoids cloning Vec<f32> fields (output_data, indices, etc.) during topo sort.
+    #[inline]
+    fn visit_inputs<F: FnMut(&Tensor)>(&self, mut f: F) {
+        match self {
+            Op::None => {}
+            Op::Add(a, b) | Op::Mul(a, b) | Op::MatMul(a, b)
+            | Op::AddBias(a, b) | Op::Sub(a, b) | Op::Div(a, b)
+            | Op::Maximum(a, b) | Op::Minimum(a, b) | Op::Power(a, b)
+            | Op::Arctan2(a, b) | Op::Logaddexp(a, b) => { f(a); f(b); }
+            Op::Relu(a) | Op::Sigmoid(a) | Op::Sum(a)
+            | Op::Scale(a, _) | Op::Select(a, _) | Op::BceLoss(a, _)
+            | Op::Neg(a) | Op::Exp(a) | Op::Log(a) | Op::Sqrt(a)
+            | Op::Abs(a) | Op::Pow(a, _) | Op::Sin(a) | Op::Cos(a)
+            | Op::Tanh(a) | Op::Mean(a)
+            | Op::Reciprocal(a) | Op::Square(a) | Op::Rsqrt(a)
+            | Op::Expm1(a) | Op::Log2(a) | Op::Log10(a) | Op::Log1p(a)
+            | Op::Erf(a) | Op::ErfInv(a)
+            | Op::Sinh(a) | Op::Cosh(a)
+            | Op::Arcsin(a) | Op::Arccos(a) | Op::Arctan(a)
+            | Op::Arcsinh(a) | Op::Arccosh(a) | Op::Arctanh(a)
+            | Op::Gelu(a) | Op::Silu(a) => { f(a); }
+            Op::Clip { input, .. }
+            | Op::LeakyRelu { input, .. } | Op::Elu { input, .. }
+            | Op::HardTanh { input, .. }
+            | Op::HardShrink { input, .. }
+            | Op::SoftShrink { input, .. } => { f(input); }
+            Op::Conv2d(a, b, c) | Op::Conv2dStrided { input: a, kernel: b, bias: c, .. }
+            | Op::ConvTranspose2d { input: a, kernel: b, bias: c, .. }
+            | Op::ConvTranspose1d { input: a, kernel: b, bias: c, .. }
+            | Op::MatMulBiasRelu(a, b, c)
+            | Op::MatMulBiasGelu(a, b, c) => { f(a); f(b); f(c); }
+            Op::Where { cond, x, y } => { f(cond); f(x); f(y); }
+            Op::AddLayerNorm { x, residual, gamma, beta, .. } => { f(x); f(residual); f(gamma); f(beta); }
+            Op::Conv2dReluPool { input, kernel, bias, .. } => { f(input); f(kernel); f(bias); }
+            Op::MaxPool2d { input, .. } | Op::MaxPool2dExt { input, .. } | Op::Flatten { input, .. }
+            | Op::Squeeze { input, .. } | Op::Unsqueeze { input, .. }
+            | Op::Reshape { input, .. } | Op::Transpose { input, .. } => { f(input); }
+            Op::Softmax { input, .. } | Op::LogSoftmax { input, .. } => { f(input); }
+            Op::LayerNorm { input, gamma, beta, .. }
+            | Op::BatchNorm { input, gamma, beta, .. } => { f(input); f(gamma); f(beta); }
+            Op::Concat { inputs, .. } => { for t in inputs { f(t); } }
+            Op::Tril { input, .. } | Op::Triu { input, .. }
+            | Op::Repeat { input, .. } | Op::Pad { input, .. }
+            | Op::Roll { input, .. } | Op::Take { input, .. }
+            | Op::Diagonal { input, .. }
+            | Op::BroadcastTo { input, .. }
+            | Op::IndexSelect { input, .. }
+            | Op::UpsampleNearest { input, .. }
+            | Op::UpsampleBilinear { input, .. } => { f(input); }
+            Op::SumAxis { input, .. } | Op::MeanAxis { input, .. }
+            | Op::MaxAxis { input, .. } | Op::MinAxis { input, .. }
+            | Op::Var { input, .. } | Op::ProdAxis { input, .. }
+            | Op::Logsumexp { input, .. }
+            | Op::Cumsum { input, .. } | Op::Cumprod { input, .. } => { f(input); }
+        }
+    }
+}
+
 /// Compute flat index for a 4D tensor with shape [N, C, H, W].
 fn idx4(n: usize, c: usize, h: usize, w: usize, shape: &[usize]) -> usize {
     n * shape[1] * shape[2] * shape[3]
@@ -1522,101 +1582,23 @@ impl Tensor {
             Tensor::from_op(data, a.shape.clone(), Op::AddBias(self.clone(), bias.clone()))
         } else {
             let mut data = pool_get(len);
-            for i in 0..len { data[i] = a.data[i] + b.data[i % cols]; }
+            let rows = a.shape[0];
+            // Row-based loop avoids modulo; NEON vectorized per row
+            #[cfg(target_arch = "aarch64")]
+            {
+                for r in 0..rows {
+                    let row_off = r * cols;
+                    simd_kernels::vec_add_f32(&a.data[row_off..row_off+cols], &b.data[..cols], &mut data[row_off..row_off+cols]);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            for r in 0..rows {
+                let row_off = r * cols;
+                for c in 0..cols {
+                    data[row_off + c] = a.data[row_off + c] + b.data[c];
+                }
+            }
             Tensor::from_op(data, a.shape.clone(), Op::AddBias(self.clone(), bias.clone()))
-        }
-    }
-
-    /// Fused matmul + bias: self=[M,K] x weight=[K,N] + bias=[1,N] -> [M,N].
-    /// Saves one allocation vs separate matmul().add_bias() by pre-filling bias
-    /// and using cblas_sgemm with beta=1.0.
-    pub fn matmul_bias(&self, weight: &Tensor, bias: &Tensor) -> Tensor {
-        #[cfg(feature = "metal")]
-        {
-            let all_gpu = {
-                let a = self.0.borrow();
-                let w = weight.0.borrow();
-                let b = bias.0.borrow();
-                a.gpu_data.is_some() && w.gpu_data.is_some() && b.gpu_data.is_some()
-            };
-            if all_gpu {
-                if let Some(result) = crate::metal::with_gpu(|gpu| {
-                    let a = self.0.borrow();
-                    let w = weight.0.borrow();
-                    let b = bias.0.borrow();
-                    let (m, k) = (a.shape[0], a.shape[1]);
-                    let n = w.shape[1];
-                    let a_buf = a.gpu_data.as_ref().unwrap();
-                    let w_buf = w.gpu_data.as_ref().unwrap();
-                    let b_buf = b.gpu_data.as_ref().unwrap();
-                    let out = gpu.alloc(m * n);
-                    gpu.dispatch_matmul(a_buf, w_buf, &out, Some(b_buf),
-                        m as u32, n as u32, k as u32, false, false, false);
-                    (out, vec![m, n])
-                }) {
-                    return Tensor::from_gpu_op(result.0, result.1,
-                        Op::AddBias(
-                            Tensor::from_op(vec![], vec![0], Op::MatMul(self.clone(), weight.clone())),
-                            bias.clone(),
-                        ));
-                }
-            }
-        }
-
-        // CPU fused: pre-fill bias + sgemm(beta=1) — saves 1 alloc vs matmul().add_bias()
-        #[cfg(feature = "metal")]
-        { self.sync_gpu_to_cpu(); weight.sync_gpu_to_cpu(); bias.sync_gpu_to_cpu(); }
-        let a_inner = self.0.borrow();
-        let w_inner = weight.0.borrow();
-        let b_inner = bias.0.borrow();
-        let m = a_inner.shape[0];
-        let k = a_inner.shape[1];
-        let n = w_inner.shape[1];
-        let mut out_data = pool_get(m * n);
-
-        // Pre-fill output with bias (replicated across M rows)
-        for row in 0..m {
-            out_data[row * n..(row + 1) * n].copy_from_slice(&b_inner.data[..n]);
-        }
-
-        // matmul via cblas_sgemm with beta=1.0 (accumulate onto pre-filled bias)
-        #[cfg(target_os = "macos")]
-        unsafe {
-            cblas_sgemm(
-                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
-                m as i32, n as i32, k as i32,
-                1.0,
-                a_inner.data.as_ptr(), k as i32,
-                w_inner.data.as_ptr(), n as i32,
-                1.0,
-                out_data.as_mut_ptr(), n as i32,
-            );
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            for i in 0..m {
-                for j in 0..n {
-                    let mut sum = 0.0f32;
-                    for p in 0..k {
-                        sum += a_inner.data[i * k + p] * w_inner.data[p * n + j];
-                    }
-                    out_data[i * n + j] += sum;
-                }
-            }
-        }
-
-        let shape = vec![m, n];
-        let no_grad = !a_inner.requires_grad && !w_inner.requires_grad;
-        drop(a_inner);
-        drop(w_inner);
-        drop(b_inner);
-        if no_grad {
-            Tensor::from_data(out_data, shape)
-        } else {
-            Tensor::from_op(out_data, shape, Op::AddBias(
-                Tensor::from_op(vec![], vec![0], Op::MatMul(self.clone(), weight.clone())),
-                bias.clone(),
-            ))
         }
     }
 
@@ -2877,7 +2859,7 @@ impl Tensor {
         let dim_size = inner.shape[dim];
         let inner_size: usize = inner.shape[dim + 1..].iter().product();
 
-        let mut data = vec![0.0f32; inner.data.len()];
+        let mut data = pool_get(inner.data.len());
 
         for o in 0..outer {
             for i in 0..inner_size {
@@ -2905,7 +2887,8 @@ impl Tensor {
             }
         }
 
-        let output_data = data.clone();
+        // Don't clone output data — backward will read from self.data() instead
+        let output_data = Vec::new();
         Tensor::from_op(
             data,
             inner.shape.clone(),
@@ -7116,6 +7099,7 @@ impl Tensor {
     }
 
     /// Build topological order via post-order DFS.
+    /// Uses op_visit_inputs to avoid cloning the Op (which may contain large Vec<f32>).
     fn build_topo(
         &self,
         order: &mut Vec<Tensor>,
@@ -7125,60 +7109,12 @@ impl Tensor {
         if !visited.insert(id) {
             return;
         }
+        // Collect input tensors by borrowing the Op without cloning it.
         let inputs = {
-            let op = self.0.borrow().op.clone();
-            match op {
-                Op::None => vec![],
-                Op::Add(a, b) | Op::Mul(a, b) | Op::MatMul(a, b)
-                | Op::AddBias(a, b) | Op::Sub(a, b) | Op::Div(a, b)
-                | Op::Maximum(a, b) | Op::Minimum(a, b) | Op::Power(a, b)
-                | Op::Arctan2(a, b) | Op::Logaddexp(a, b) => vec![a, b],
-                Op::Relu(a) | Op::Sigmoid(a) | Op::Sum(a)
-                | Op::Scale(a, _) | Op::Select(a, _) | Op::BceLoss(a, _)
-                | Op::Neg(a) | Op::Exp(a) | Op::Log(a) | Op::Sqrt(a)
-                | Op::Abs(a) | Op::Pow(a, _) | Op::Sin(a) | Op::Cos(a)
-                | Op::Tanh(a) | Op::Mean(a)
-                | Op::Reciprocal(a) | Op::Square(a) | Op::Rsqrt(a)
-                | Op::Expm1(a) | Op::Log2(a) | Op::Log10(a) | Op::Log1p(a)
-                | Op::Erf(a) | Op::ErfInv(a)
-                | Op::Sinh(a) | Op::Cosh(a)
-                | Op::Arcsin(a) | Op::Arccos(a) | Op::Arctan(a)
-                | Op::Arcsinh(a) | Op::Arccosh(a) | Op::Arctanh(a) => vec![a],
-                Op::Clip { input, .. } => vec![input],
-                Op::LeakyRelu { input: a, .. } | Op::Elu { input: a, .. }
-                | Op::HardTanh { input: a, .. }
-                | Op::HardShrink { input: a, .. }
-                | Op::SoftShrink { input: a, .. } => vec![a],
-                Op::Conv2d(a, b, c) | Op::Conv2dStrided { input: a, kernel: b, bias: c, .. }
-                | Op::ConvTranspose2d { input: a, kernel: b, bias: c, .. }
-                | Op::ConvTranspose1d { input: a, kernel: b, bias: c, .. }
-                | Op::MatMulBiasRelu(a, b, c)
-                | Op::MatMulBiasGelu(a, b, c) => vec![a, b, c],
-                Op::Where { cond, x, y } => vec![cond, x, y],
-                Op::AddLayerNorm { x, residual, gamma, beta, .. } => vec![x, residual, gamma, beta],
-                Op::Conv2dReluPool { input, kernel, bias, .. } => vec![input, kernel, bias],
-                Op::MaxPool2d { input, .. } | Op::MaxPool2dExt { input, .. } | Op::Flatten { input, .. }
-                | Op::Squeeze { input, .. } | Op::Unsqueeze { input, .. }
-                | Op::Reshape { input, .. } | Op::Transpose { input, .. }
-                | Op::Gelu(input) | Op::Silu(input) => vec![input],
-                Op::Softmax { input, .. } | Op::LogSoftmax { input, .. } => vec![input],
-                Op::LayerNorm { input, gamma, beta, .. }
-                | Op::BatchNorm { input, gamma, beta, .. } => vec![input, gamma, beta],
-                Op::Concat { inputs, .. } => inputs,
-                Op::Tril { input, .. } | Op::Triu { input, .. }
-                | Op::Repeat { input, .. } | Op::Pad { input, .. }
-                | Op::Roll { input, .. } | Op::Take { input, .. }
-                | Op::Diagonal { input, .. }
-                | Op::BroadcastTo { input, .. }
-                | Op::IndexSelect { input, .. }
-                | Op::UpsampleNearest { input, .. }
-                | Op::UpsampleBilinear { input, .. } => vec![input],
-                Op::SumAxis { ref input, .. } | Op::MeanAxis { ref input, .. }
-                | Op::MaxAxis { ref input, .. } | Op::MinAxis { ref input, .. }
-                | Op::Var { ref input, .. } | Op::ProdAxis { ref input, .. }
-                | Op::Logsumexp { ref input, .. }
-                | Op::Cumsum { ref input, .. } | Op::Cumprod { ref input, .. } => vec![input.clone()],
-            }
+            let inner = self.0.borrow();
+            let mut inputs = Vec::new();
+            inner.op.visit_inputs(|t| inputs.push(t.clone()));
+            inputs
         };
         for input in &inputs {
             input.build_topo(order, visited);
@@ -7381,9 +7317,10 @@ impl Tensor {
 
                 #[cfg(target_os = "macos")]
                 let (grad_a, grad_b) = {
-                    let mut ga = vec![0.0f32; m * k];
+                    // Use pool_get: sgemm with beta=0.0 overwrites entirely, no need to zero
+                    let mut ga = pool_get(m * k);
                     sgemm(false, true, m, k, n, 1.0, &grad, n, &b_inner.data, n, 0.0, &mut ga, k);
-                    let mut gb = vec![0.0f32; k * n];
+                    let mut gb = pool_get(k * n);
                     sgemm(true, false, k, n, m, 1.0, &a_inner.data, k, &grad, n, 0.0, &mut gb, n);
                     (ga, gb)
                 };
@@ -7415,8 +7352,8 @@ impl Tensor {
 
                 drop(a_inner);
                 drop(b_inner);
-                accumulate_grad(a, &grad_a);
-                accumulate_grad(b, &grad_b);
+                accumulate_grad_owned(a, grad_a);
+                accumulate_grad_owned(b, grad_b);
             }
             Op::Relu(ref input) => {
                 let in_inner = input.0.borrow();
@@ -7437,7 +7374,7 @@ impl Tensor {
                     gi
                 };
                 drop(in_inner);
-                accumulate_grad(input, &grad_input);
+                accumulate_grad_owned(input, grad_input);
             }
             Op::Sigmoid(ref input) => {
                 let self_inner = self.0.borrow();
@@ -7462,7 +7399,7 @@ impl Tensor {
             Op::Sum(ref input) => {
                 let n = input.size();
                 let grad_input = vec![grad[0]; n];
-                accumulate_grad(input, &grad_input);
+                accumulate_grad_owned(input, grad_input);
             }
             Op::Scale(ref input, s) => {
                 let len = grad.len();
@@ -7476,7 +7413,7 @@ impl Tensor {
                     for i in 0..len { gi[i] = grad[i] * s; }
                     gi
                 };
-                accumulate_grad(input, &grad_input);
+                accumulate_grad_owned(input, grad_input);
             }
             Op::AddBias(ref input, ref bias) => {
                 let bias_inner = bias.0.borrow();
@@ -7484,12 +7421,31 @@ impl Tensor {
                 let rows = input.0.borrow().shape[0];
                 drop(bias_inner);
                 let mut grad_bias = vec![0.0f32; cols];
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    let chunks = cols / 4;
+                    for r in 0..rows {
+                        unsafe {
+                            for c in 0..chunks {
+                                let off = c * 4;
+                                let acc = vld1q_f32(grad_bias.as_ptr().add(off));
+                                let val = vld1q_f32(grad.as_ptr().add(r * cols + off));
+                                vst1q_f32(grad_bias.as_mut_ptr().add(off), vaddq_f32(acc, val));
+                            }
+                        }
+                        for c in (chunks * 4)..cols {
+                            grad_bias[c] += grad[r * cols + c];
+                        }
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
                 for r in 0..rows {
                     for c in 0..cols {
                         grad_bias[c] += grad[r * cols + c];
                     }
                 }
-                accumulate_grad(input, &grad);
+                accumulate_grad_owned(input, grad);
                 accumulate_grad(bias, &grad_bias);
             }
             Op::MatMulBiasRelu(ref a_input, ref weight, ref bias) => {
@@ -7547,9 +7503,9 @@ impl Tensor {
                 // Step 3: grad_a = relu_grad @ W^T, grad_w = A^T @ relu_grad
                 #[cfg(target_os = "macos")]
                 let (grad_a, grad_w) = {
-                    let mut ga = vec![0.0f32; m * k];
+                    let mut ga = pool_get(m * k);
                     sgemm(false, true, m, k, n, 1.0, &relu_grad, n, &w_inner.data, n, 0.0, &mut ga, k);
-                    let mut gw = vec![0.0f32; k * n];
+                    let mut gw = pool_get(k * n);
                     sgemm(true, false, k, n, m, 1.0, &a_inner.data, k, &relu_grad, n, 0.0, &mut gw, n);
                     (ga, gw)
                 };
@@ -7581,9 +7537,9 @@ impl Tensor {
 
                 drop(a_inner);
                 drop(w_inner);
-                accumulate_grad(a_input, &grad_a);
-                accumulate_grad(weight, &grad_w);
-                accumulate_grad(bias, &grad_bias);
+                accumulate_grad_owned(a_input, grad_a);
+                accumulate_grad_owned(weight, grad_w);
+                accumulate_grad_owned(bias, grad_bias);
             }
             Op::MatMulBiasGelu(ref a_input, ref weight, ref bias) => {
                 // Backward for y = gelu(A @ W + bias)
@@ -7643,9 +7599,9 @@ impl Tensor {
                 // grad_a = gelu_grad @ W^T, grad_w = A^T @ gelu_grad
                 #[cfg(target_os = "macos")]
                 let (grad_a, grad_w) = {
-                    let mut ga = vec![0.0f32; m * k];
+                    let mut ga = pool_get(m * k);
                     sgemm(false, true, m, k, n, 1.0, &gelu_grad, n, &w_inner.data, n, 0.0, &mut ga, k);
-                    let mut gw = vec![0.0f32; k * n];
+                    let mut gw = pool_get(k * n);
                     sgemm(true, false, k, n, m, 1.0, &a_inner.data, k, &gelu_grad, n, 0.0, &mut gw, n);
                     (ga, gw)
                 };
@@ -7677,9 +7633,9 @@ impl Tensor {
                 drop(a_inner);
                 drop(w_inner);
                 drop(b_inner);
-                accumulate_grad(a_input, &grad_a);
-                accumulate_grad(weight, &grad_w);
-                accumulate_grad(bias, &grad_bias);
+                accumulate_grad_owned(a_input, grad_a);
+                accumulate_grad_owned(weight, grad_w);
+                accumulate_grad_owned(bias, grad_bias);
             }
             Op::AddLayerNorm { .. } => {
                 // AddLayerNorm is inference-only (from_gpu, no backward cache).
@@ -8263,7 +8219,7 @@ impl Tensor {
                 for (out_i, &in_i) in indices.iter().enumerate() {
                     grad_input[in_i] += grad[out_i];
                 }
-                accumulate_grad(input, &grad_input);
+                accumulate_grad_owned(input, grad_input);
             }
             Op::BceLoss(ref logits, ref targets) => {
                 let logit_inner = logits.0.borrow();
@@ -8326,7 +8282,13 @@ impl Tensor {
             }
             Op::Softmax { ref input, ref output_data, dim } => {
                 // If output_data is empty (GPU forward path), recover from self.data()
-                let out_data = if output_data.is_empty() { self.data() } else { output_data.clone() };
+                let fallback;
+                let out_data: &[f32] = if output_data.is_empty() {
+                    fallback = self.data();
+                    &fallback
+                } else {
+                    output_data
+                };
                 let in_shape = input.shape();
                 let outer: usize = in_shape[..dim].iter().product();
                 let dim_size = in_shape[dim];
@@ -8351,33 +8313,101 @@ impl Tensor {
                 accumulate_grad(input, &grad_input);
             }
             Op::LogSoftmax { ref input, ref output_data, dim } => {
-                // If output_data is empty (GPU forward path), recover from self.data()
-                let out_data = if output_data.is_empty() { self.data() } else { output_data.clone() };
-                let in_shape = input.shape();
+                // Use self's data directly (avoiding clone); fall back to stored output_data
+                let self_inner = self.0.borrow();
+                let out_data: &[f32] = if output_data.is_empty() {
+                    &self_inner.data
+                } else {
+                    output_data
+                };
+                // Borrow shape directly to avoid clone from input.shape()
+                let in_inner = input.0.borrow();
+                let in_shape = &in_inner.shape;
                 let outer: usize = in_shape[..dim].iter().product();
                 let dim_size = in_shape[dim];
                 let inner_size: usize = in_shape[dim + 1..].iter().product();
+                drop(in_inner);
 
-                let mut grad_input = vec![0.0f32; grad.len()];
+                let mut grad_input = pool_get(grad.len());
 
                 // d(log_softmax)/dx_i = delta_ij - softmax_j
                 // grad_input[i] = grad[i] - softmax[i] * sum(grad)
-                for o in 0..outer {
-                    for i in 0..inner_size {
-                        let base = o * dim_size * inner_size + i;
+                // Fast path for 2D last-dim (batch x classes), which is the common case
+                if inner_size == 1 {
+                    for o in 0..outer {
+                        let base = o * dim_size;
+                        let grad_row = &grad[base..base + dim_size];
+                        let out_row = &out_data[base..base + dim_size];
+                        let gi_row = &mut grad_input[base..base + dim_size];
+
+                        // Sum grad for this row
                         let mut sum_grad = 0.0f32;
-                        for d in 0..dim_size {
-                            let idx = base + d * inner_size;
-                            sum_grad += grad[idx];
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            use std::arch::aarch64::*;
+                            let chunks4 = dim_size / 4;
+                            unsafe {
+                                let mut vacc = vdupq_n_f32(0.0);
+                                for c in 0..chunks4 {
+                                    vacc = vaddq_f32(vacc, vld1q_f32(grad_row.as_ptr().add(c * 4)));
+                                }
+                                sum_grad = vaddvq_f32(vacc);
+                            }
+                            for d in (chunks4 * 4)..dim_size {
+                                sum_grad += grad_row[d];
+                            }
                         }
+                        #[cfg(not(target_arch = "aarch64"))]
                         for d in 0..dim_size {
-                            let idx = base + d * inner_size;
-                            // softmax = exp(log_softmax)
-                            grad_input[idx] = grad[idx] - out_data[idx].exp() * sum_grad;
+                            sum_grad += grad_row[d];
+                        }
+
+                        // grad_input[i] = grad[i] - exp(log_softmax[i]) * sum_grad
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            use std::arch::aarch64::*;
+                            let chunks4 = dim_size / 4;
+                            let vsum = unsafe { vdupq_n_f32(sum_grad) };
+                            for c in 0..chunks4 {
+                                let off = c * 4;
+                                unsafe {
+                                    let vg = vld1q_f32(grad_row.as_ptr().add(off));
+                                    // exp(log_softmax) = softmax; compute scalar exp
+                                    let mut tmp = [0.0f32; 4];
+                                    for j in 0..4 {
+                                        tmp[j] = out_row[off + j].exp();
+                                    }
+                                    let vexp = vld1q_f32(tmp.as_ptr());
+                                    let result = vsubq_f32(vg, vmulq_f32(vexp, vsum));
+                                    vst1q_f32(gi_row.as_mut_ptr().add(off), result);
+                                }
+                            }
+                            for d in (chunks4 * 4)..dim_size {
+                                gi_row[d] = grad_row[d] - out_row[d].exp() * sum_grad;
+                            }
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        for d in 0..dim_size {
+                            gi_row[d] = grad_row[d] - out_row[d].exp() * sum_grad;
+                        }
+                    }
+                } else {
+                    for o in 0..outer {
+                        for i in 0..inner_size {
+                            let base = o * dim_size * inner_size + i;
+                            let mut sum_grad = 0.0f32;
+                            for d in 0..dim_size {
+                                let idx = base + d * inner_size;
+                                sum_grad += grad[idx];
+                            }
+                            for d in 0..dim_size {
+                                let idx = base + d * inner_size;
+                                grad_input[idx] = grad[idx] - out_data[idx].exp() * sum_grad;
+                            }
                         }
                     }
                 }
-                accumulate_grad(input, &grad_input);
+                accumulate_grad_owned(input, grad_input);
             }
             Op::LayerNorm { ref input, ref gamma, ref beta, ref normalized, ref inv_std } => {
                 let g_inner = gamma.0.borrow();
@@ -8497,7 +8527,7 @@ impl Tensor {
                     for i in 0..len { gi[i] = -grad[i]; }
                     gi
                 };
-                accumulate_grad(input, &grad_input);
+                accumulate_grad_owned(input, grad_input);
             }
             Op::Exp(ref input) => {
                 let self_inner = self.0.borrow();
@@ -8914,7 +8944,7 @@ impl Tensor {
             Op::Mean(ref input) => {
                 let n = input.size();
                 let grad_input = vec![grad[0] / n as f32; n];
-                accumulate_grad(input, &grad_input);
+                accumulate_grad_owned(input, grad_input);
             }
             Op::SumAxis { ref input, axis, keepdim: _ } => {
                 // Backward: broadcast grad back to input shape
@@ -10560,6 +10590,36 @@ fn accumulate_grad(tensor: &Tensor, grad: &[f32]) {
             let mut buf = pool_get(grad.len());
             buf.copy_from_slice(grad);
             inner.grad = Some(buf);
+        }
+    }
+}
+
+/// Like accumulate_grad but takes ownership of the grad Vec, avoiding a copy
+/// when the tensor has no existing gradient.
+fn accumulate_grad_owned(tensor: &Tensor, grad: Vec<f32>) {
+    let mut inner = tensor.0.borrow_mut();
+    if !inner.requires_grad {
+        return;
+    }
+    match inner.grad {
+        Some(ref mut existing) => {
+            let len = existing.len();
+            if len >= PAR_THRESHOLD_CHEAP {
+                let slice: &mut [f32] = existing.as_mut_slice();
+                slice.par_iter_mut().zip(grad.par_iter()).for_each(|(e, g)| {
+                    *e += g;
+                });
+            } else {
+                #[cfg(target_arch = "aarch64")]
+                simd_kernels::vec_add_inplace_f32(existing, &grad);
+                #[cfg(not(target_arch = "aarch64"))]
+                for i in 0..len {
+                    existing[i] += grad[i];
+                }
+            }
+        }
+        None => {
+            inner.grad = Some(grad);
         }
     }
 }

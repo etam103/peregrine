@@ -302,6 +302,104 @@ impl Adam {
             p.zero_grad();
         }
     }
+
+    /// Fused step + zero_grad: applies Adam update and clears gradients in a single pass,
+    /// avoiding the extra loop and borrow overhead of separate step() + zero_grad().
+    pub fn step_and_zero_grad(&mut self) {
+        self.t += 1;
+        let bc1 = 1.0 - self.beta1.powi(self.t as i32);
+        let bc2 = 1.0 - self.beta2.powi(self.t as i32);
+
+        for (i, p) in self.params.iter().enumerate() {
+            // --- GPU path ---
+            #[cfg(feature = "metal")]
+            {
+                let has_gpu = {
+                    let inner = p.0.borrow();
+                    inner.gpu_data.is_some() && inner.gpu_grad.is_some()
+                };
+                if has_gpu {
+                    if self.gpu_m[i].is_none() {
+                        if let Some((m_buf, v_buf)) = crate::metal::with_gpu(|gpu| {
+                            let n = p.size();
+                            let m_buf = gpu.alloc(n);
+                            let v_buf = gpu.alloc(n);
+                            gpu.dispatch_fill(&m_buf, 0.0);
+                            gpu.dispatch_fill(&v_buf, 0.0);
+                            (m_buf, v_buf)
+                        }) {
+                            self.gpu_m[i] = Some(m_buf);
+                            self.gpu_v[i] = Some(v_buf);
+                        }
+                    }
+
+                    if let (Some(ref m_buf), Some(ref v_buf)) = (&self.gpu_m[i], &self.gpu_v[i]) {
+                        let done = crate::metal::with_gpu(|gpu| {
+                            let inner = p.0.borrow();
+                            let data_buf = inner.gpu_data.as_ref().unwrap();
+                            let grad_buf = inner.gpu_grad.as_ref().unwrap();
+                            gpu.dispatch_adam_step(
+                                data_buf, grad_buf, m_buf, v_buf,
+                                self.lr, self.beta1, self.beta2, self.eps,
+                                bc1, bc2,
+                                self.weight_decay, self.decoupled_wd,
+                            );
+                        });
+                        if done.is_some() {
+                            let mut inner = p.0.borrow_mut();
+                            inner.gpu_grad = None;
+                            inner.gpu_dirty = true;
+                            inner.op = crate::tensor::Op::None;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // --- CPU path ---
+            let m = &mut self.m[i];
+            let v = &mut self.v[i];
+            let mut inner = p.0.borrow_mut();
+            let inner_ref = &mut *inner;
+            let grad = match inner_ref.grad.take() {
+                Some(g) => g,
+                None => {
+                    inner_ref.op = crate::tensor::Op::None;
+                    continue;
+                }
+            };
+            let data = &mut inner_ref.data;
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                crate::simd_kernels::adam_step_f32(
+                    data, &grad, m, v,
+                    self.beta1, self.beta2, self.lr, bc1, bc2, self.eps,
+                    self.weight_decay, self.decoupled_wd,
+                );
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
+            for j in 0..data.len() {
+                let mut g = grad[j];
+                if self.weight_decay != 0.0 && !self.decoupled_wd {
+                    g += self.weight_decay * data[j];
+                }
+                m[j] = self.beta1 * m[j] + (1.0 - self.beta1) * g;
+                v[j] = self.beta2 * v[j] + (1.0 - self.beta2) * g * g;
+                let m_hat = m[j] / bc1;
+                let v_hat = v[j] / bc2;
+                if self.decoupled_wd && self.weight_decay != 0.0 {
+                    data[j] -= self.lr * self.weight_decay * data[j];
+                }
+                data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+            }
+
+            // Recycle the grad buffer and clear op in one go
+            pool_recycle(grad);
+            inner_ref.op = crate::tensor::Op::None;
+        }
+    }
 }
 
 // ===========================================================================
