@@ -1461,12 +1461,38 @@ pub fn vec_erf_f32(a: &[f32], out: &mut [f32]) {
         let vc7 = vdupq_n_f32(C7);
         let vc8 = vdupq_n_f32(C8);
 
-        for i in 0..chunks {
-            let off = i * 4;
+        let chunks2 = chunks / 2;
+        for i in 0..chunks2 {
+            let off = i * 8;
+            let vx0 = vld1q_f32(a.as_ptr().add(off));
+            let vx1 = vld1q_f32(a.as_ptr().add(off + 4));
+            let x2_0 = vmulq_f32(vx0, vx0);
+            let x2_1 = vmulq_f32(vx1, vx1);
+            let p0 = vmlaq_f32(vc7, vc8, x2_0);
+            let p1 = vmlaq_f32(vc7, vc8, x2_1);
+            let p0 = vmlaq_f32(vc6, p0, x2_0);
+            let p1 = vmlaq_f32(vc6, p1, x2_1);
+            let p0 = vmlaq_f32(vc5, p0, x2_0);
+            let p1 = vmlaq_f32(vc5, p1, x2_1);
+            let p0 = vmlaq_f32(vc4, p0, x2_0);
+            let p1 = vmlaq_f32(vc4, p1, x2_1);
+            let p0 = vmlaq_f32(vc3, p0, x2_0);
+            let p1 = vmlaq_f32(vc3, p1, x2_1);
+            let p0 = vmlaq_f32(vc2, p0, x2_0);
+            let p1 = vmlaq_f32(vc2, p1, x2_1);
+            let p0 = vmlaq_f32(vc1, p0, x2_0);
+            let p1 = vmlaq_f32(vc1, p1, x2_1);
+            let p0 = vmlaq_f32(vc0, p0, x2_0);
+            let p1 = vmlaq_f32(vc0, p1, x2_1);
+            let y0 = vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vx0, p0)));
+            let y1 = vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vx1, p1)));
+            vst1q_f32(out.as_mut_ptr().add(off), y0);
+            vst1q_f32(out.as_mut_ptr().add(off + 4), y1);
+        }
+        if chunks2 * 2 < chunks {
+            let off = chunks2 * 8;
             let vx = vld1q_f32(a.as_ptr().add(off));
             let x2 = vmulq_f32(vx, vx);
-
-            // Horner: P(x²) = c0 + x²*(c1 + x²*(c2 + ... + x²*(c7 + x²*c8)...))
             let p = vmlaq_f32(vc7, vc8, x2);
             let p = vmlaq_f32(vc6, p, x2);
             let p = vmlaq_f32(vc5, p, x2);
@@ -1475,11 +1501,7 @@ pub fn vec_erf_f32(a: &[f32], out: &mut [f32]) {
             let p = vmlaq_f32(vc2, p, x2);
             let p = vmlaq_f32(vc1, p, x2);
             let p = vmlaq_f32(vc0, p, x2);
-
-            // erf(x) = x * P(x²), clamped to [-1, 1]
-            let y = vmulq_f32(vx, p);
-            let y = vmaxq_f32(neg_one, vminq_f32(one, y));
-
+            let y = vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vx, p)));
             vst1q_f32(out.as_mut_ptr().add(off), y);
         }
     }
