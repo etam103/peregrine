@@ -189,7 +189,7 @@ impl EncoderBlock {
 
         // Fused QKV projection: [batch*seq, embed_dim] * [embed_dim, 3*embed_dim] -> [batch*seq, 3*embed_dim]
         let t0 = Instant::now();
-        let qkv = normed.matmul(&self.qkv_weight).add_bias(&self.qkv_bias);
+        let qkv = normed.matmul_bias(&self.qkv_weight, &self.qkv_bias);
         let dt_qkv = t0.elapsed();
 
         // GPU path: reshape + RoPE + SDPA all on GPU, no CPU round-trip
@@ -256,15 +256,15 @@ impl EncoderBlock {
 
         // Output projection + residual
         let t0 = Instant::now();
-        let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
+        let attn_proj = attn_flat.matmul_bias(&self.proj_weight, &self.proj_bias);
         let x = x.add(&attn_proj);
         let dt_proj = t0.elapsed();
 
         // --- Pre-norm + FFN ---
         let t0 = Instant::now();
         let normed = x.layer_norm(&self.norm2_weight, &self.norm2_bias, self.embed_dim);
-        let h = normed.matmul(&self.mlp_fc1_weight).add_bias(&self.mlp_fc1_bias).gelu();
-        let ffn_out = h.matmul(&self.mlp_fc2_weight).add_bias(&self.mlp_fc2_bias);
+        let h = normed.matmul_bias_gelu(&self.mlp_fc1_weight, &self.mlp_fc1_bias);
+        let ffn_out = h.matmul_bias(&self.mlp_fc2_weight, &self.mlp_fc2_bias);
 
         // Residual connection
         let out = x.add(&ffn_out);

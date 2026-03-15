@@ -147,7 +147,7 @@ impl CachedDecoderBlock {
         let normed = x.layer_norm(&self.norm1_weight, &self.norm1_bias, embed_dim);
 
         // Fused QKV projection: [batch*seq, embed_dim] x [embed_dim, 3*embed_dim]
-        let qkv = normed.matmul(&self.qkv_weight).add_bias(&self.qkv_bias);
+        let qkv = normed.matmul_bias(&self.qkv_weight, &self.qkv_bias);
 
         // GPU path: reshape + RoPE + SDPA all on GPU, no CPU round-trip
         #[cfg(feature = "metal")]
@@ -196,7 +196,7 @@ impl CachedDecoderBlock {
                 }).unwrap()
             });
 
-            let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
+            let attn_proj = attn_flat.matmul_bias(&self.proj_weight, &self.proj_bias);
             return x.add(&attn_proj);
         }
 
@@ -278,7 +278,7 @@ impl CachedDecoderBlock {
         let attn_flat = Tensor::new(attn_flat_data, vec![batch * seq_len, embed_dim], false);
 
         // Output projection
-        let attn_proj = attn_flat.matmul(&self.proj_weight).add_bias(&self.proj_bias);
+        let attn_proj = attn_flat.matmul_bias(&self.proj_weight, &self.proj_bias);
 
         // Suppress unused variable warning when metal feature is off
         let _ = use_gpu;
@@ -314,14 +314,11 @@ impl CachedDecoderBlock {
 
         // Separate Q, K, V projections (no fused QKV for cross-attention)
         let q = x_normed
-            .matmul(&self.cross_projq_weight)
-            .add_bias(&self.cross_projq_bias); // [batch*seq_q, embed_dim]
+            .matmul_bias(&self.cross_projq_weight, &self.cross_projq_bias); // [batch*seq_q, embed_dim]
         let k = memory_normed
-            .matmul(&self.cross_projk_weight)
-            .add_bias(&self.cross_projk_bias); // [batch*seq_kv, embed_dim]
+            .matmul_bias(&self.cross_projk_weight, &self.cross_projk_bias); // [batch*seq_kv, embed_dim]
         let v = memory_normed
-            .matmul(&self.cross_projv_weight)
-            .add_bias(&self.cross_projv_bias); // [batch*seq_kv, embed_dim]
+            .matmul_bias(&self.cross_projv_weight, &self.cross_projv_bias); // [batch*seq_kv, embed_dim]
 
         // GPU path: reshape + SDPA on GPU (no RoPE for cross-attention), no CPU round-trip
         #[cfg(feature = "metal")]
@@ -363,8 +360,7 @@ impl CachedDecoderBlock {
             });
 
             let attn_proj = attn_flat
-                .matmul(&self.cross_proj_weight)
-                .add_bias(&self.cross_proj_bias);
+                .matmul_bias(&self.cross_proj_weight, &self.cross_proj_bias);
             return x.add(&attn_proj);
         }
 
@@ -430,8 +426,7 @@ impl CachedDecoderBlock {
 
         // Output projection
         let attn_proj = attn_flat
-            .matmul(&self.cross_proj_weight)
-            .add_bias(&self.cross_proj_bias);
+            .matmul_bias(&self.cross_proj_weight, &self.cross_proj_bias);
 
         // Suppress unused variable warning when metal feature is off
         let _ = use_gpu;
@@ -453,8 +448,7 @@ impl CachedDecoderBlock {
         // FFN: Linear -> GELU -> Linear (fused on GPU)
         let hidden = normed.matmul_bias_gelu(&self.mlp_fc1_weight, &self.mlp_fc1_bias);
         let output = hidden
-            .matmul(&self.mlp_fc2_weight)
-            .add_bias(&self.mlp_fc2_bias);
+            .matmul_bias(&self.mlp_fc2_weight, &self.mlp_fc2_bias);
 
         // Residual connection
         x.add(&output)
@@ -547,8 +541,8 @@ impl MUSt3RDecoder {
         #[cfg(feature = "metal")]
         if use_gpu {
             // Project each encoder output to decoder dimension (stays on GPU)
-            let mut feat1 = enc_feat1.matmul(&self.feat_embed_weight).add_bias(&self.feat_embed_bias);
-            let mut feat2 = enc_feat2.matmul(&self.feat_embed_weight).add_bias(&self.feat_embed_bias);
+            let mut feat1 = enc_feat1.matmul_bias(&self.feat_embed_weight, &self.feat_embed_bias);
+            let mut feat2 = enc_feat2.matmul_bias(&self.feat_embed_weight, &self.feat_embed_bias);
 
             // Add image2_embed to feat2 via add_bias (image2_embed is [1,1,768] → reshape to [1,768])
             let img2_data = self.image2_embed.data();
@@ -672,7 +666,7 @@ impl MUSt3RDecoder {
         enc_both_data.extend_from_slice(&enc2_data);
         let enc_both = Tensor::new(enc_both_data, vec![2 * total_tokens, enc_dim], false);
 
-        let feat_both = enc_both.matmul(&self.feat_embed_weight).add_bias(&self.feat_embed_bias);
+        let feat_both = enc_both.matmul_bias(&self.feat_embed_weight, &self.feat_embed_bias);
 
         // Split and add image2_embed to feat2
         let feat_data = feat_both.data();

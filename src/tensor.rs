@@ -1527,6 +1527,99 @@ impl Tensor {
         }
     }
 
+    /// Fused matmul + bias: self=[M,K] x weight=[K,N] + bias=[1,N] -> [M,N].
+    /// Saves one allocation vs separate matmul().add_bias() by pre-filling bias
+    /// and using cblas_sgemm with beta=1.0.
+    pub fn matmul_bias(&self, weight: &Tensor, bias: &Tensor) -> Tensor {
+        #[cfg(feature = "metal")]
+        {
+            let all_gpu = {
+                let a = self.0.borrow();
+                let w = weight.0.borrow();
+                let b = bias.0.borrow();
+                a.gpu_data.is_some() && w.gpu_data.is_some() && b.gpu_data.is_some()
+            };
+            if all_gpu {
+                if let Some(result) = crate::metal::with_gpu(|gpu| {
+                    let a = self.0.borrow();
+                    let w = weight.0.borrow();
+                    let b = bias.0.borrow();
+                    let (m, k) = (a.shape[0], a.shape[1]);
+                    let n = w.shape[1];
+                    let a_buf = a.gpu_data.as_ref().unwrap();
+                    let w_buf = w.gpu_data.as_ref().unwrap();
+                    let b_buf = b.gpu_data.as_ref().unwrap();
+                    let out = gpu.alloc(m * n);
+                    gpu.dispatch_matmul(a_buf, w_buf, &out, Some(b_buf),
+                        m as u32, n as u32, k as u32, false, false, false);
+                    (out, vec![m, n])
+                }) {
+                    return Tensor::from_gpu_op(result.0, result.1,
+                        Op::AddBias(
+                            Tensor::from_op(vec![], vec![0], Op::MatMul(self.clone(), weight.clone())),
+                            bias.clone(),
+                        ));
+                }
+            }
+        }
+
+        // CPU fused: pre-fill bias + sgemm(beta=1) — saves 1 alloc vs matmul().add_bias()
+        #[cfg(feature = "metal")]
+        { self.sync_gpu_to_cpu(); weight.sync_gpu_to_cpu(); bias.sync_gpu_to_cpu(); }
+        let a_inner = self.0.borrow();
+        let w_inner = weight.0.borrow();
+        let b_inner = bias.0.borrow();
+        let m = a_inner.shape[0];
+        let k = a_inner.shape[1];
+        let n = w_inner.shape[1];
+        let mut out_data = pool_get(m * n);
+
+        // Pre-fill output with bias (replicated across M rows)
+        for row in 0..m {
+            out_data[row * n..(row + 1) * n].copy_from_slice(&b_inner.data[..n]);
+        }
+
+        // matmul via cblas_sgemm with beta=1.0 (accumulate onto pre-filled bias)
+        #[cfg(target_os = "macos")]
+        unsafe {
+            cblas_sgemm(
+                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS, CBLAS_NO_TRANS,
+                m as i32, n as i32, k as i32,
+                1.0,
+                a_inner.data.as_ptr(), k as i32,
+                w_inner.data.as_ptr(), n as i32,
+                1.0,
+                out_data.as_mut_ptr(), n as i32,
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = 0.0f32;
+                    for p in 0..k {
+                        sum += a_inner.data[i * k + p] * w_inner.data[p * n + j];
+                    }
+                    out_data[i * n + j] += sum;
+                }
+            }
+        }
+
+        let shape = vec![m, n];
+        let no_grad = !a_inner.requires_grad && !w_inner.requires_grad;
+        drop(a_inner);
+        drop(w_inner);
+        drop(b_inner);
+        if no_grad {
+            Tensor::from_data(out_data, shape)
+        } else {
+            Tensor::from_op(out_data, shape, Op::AddBias(
+                Tensor::from_op(vec![], vec![0], Op::MatMul(self.clone(), weight.clone())),
+                bias.clone(),
+            ))
+        }
+    }
+
     /// Fused matmul + bias + relu: self=[M,K] x weight=[K,N] + bias=[1,N] -> relu -> [M,N].
     /// Single GPU dispatch eliminates 2 intermediate buffers and 2 kernel launches.
     pub fn matmul_bias_relu(&self, weight: &Tensor, bias: &Tensor) -> Tensor {
