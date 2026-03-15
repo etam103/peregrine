@@ -1690,14 +1690,23 @@ impl Tensor {
             );
         }
 
-        // Step 3: in-place erf-based gelu — single fused pass, no temp buffer
+        // Step 3: parallel erf-based gelu for large buffers
         let total = m * n;
         #[cfg(target_arch = "aarch64")]
         {
-            // Back up x values — out_data will be overwritten in-place
             let mut x_backup = pool_get(total);
             x_backup[..total].copy_from_slice(&out_data[..total]);
-            simd_kernels::vec_gelu_f32(&x_backup[..total], &mut out_data[..total]);
+            if total >= 100_000 {
+                use rayon::prelude::*;
+                const GELU_CHUNK: usize = 32768;
+                x_backup[..total].par_chunks(GELU_CHUNK)
+                    .zip(out_data[..total].par_chunks_mut(GELU_CHUNK))
+                    .for_each(|(src, dst)| {
+                        simd_kernels::vec_gelu_f32(src, dst);
+                    });
+            } else {
+                simd_kernels::vec_gelu_f32(&x_backup[..total], &mut out_data[..total]);
+            }
             pool_recycle(x_backup);
         }
         #[cfg(not(target_arch = "aarch64"))]
