@@ -880,15 +880,13 @@ impl LSTM {
                 buf
             };
 
-            #[cfg(target_os = "macos")]
-            let mut hh_gates = vec![0.0f32; 4 * hs]; // pre-allocate outside loop
             for t in 0..seq_len {
-                // gates = ih_all[t] + b_ih + h @ W_hh + b_hh
+                // gates = ih_all[t] + b_ih + b_hh + h @ W_hh
+                // Fused: pre-fill gates with ih_t + biases, then sgemm(beta=1) accumulates h@W_hh
                 #[cfg(target_os = "macos")]
                 {
                     let ih_t = &ih_all[t * 4 * hs..(t + 1) * 4 * hs];
-                    // h[1,hs] @ W_hh[hs,4hs]
-                    crate::tensor::sgemm(false, false, 1, 4*hs, hs, 1.0, &h_data, hs, &whh, 4*hs, 0.0, &mut hh_gates, 4*hs);
+                    // Pre-fill gates with ih_t + bih + bhh
                     #[cfg(target_arch = "aarch64")]
                     unsafe {
                         use std::arch::aarch64::*;
@@ -896,19 +894,21 @@ impl LSTM {
                         for c in 0..gate_chunks {
                             let off = c * 4;
                             let v = vaddq_f32(
-                                vaddq_f32(vld1q_f32(ih_t.as_ptr().add(off)), vld1q_f32(hh_gates.as_ptr().add(off))),
+                                vld1q_f32(ih_t.as_ptr().add(off)),
                                 vaddq_f32(vld1q_f32(bih.as_ptr().add(off)), vld1q_f32(bhh.as_ptr().add(off)))
                             );
                             vst1q_f32(gates.as_mut_ptr().add(off), v);
                         }
                         for j in (gate_chunks * 4)..4*hs {
-                            gates[j] = ih_t[j] + bih[j] + bhh[j] + hh_gates[j];
+                            gates[j] = ih_t[j] + bih[j] + bhh[j];
                         }
                     }
                     #[cfg(not(target_arch = "aarch64"))]
                     for j in 0..4*hs {
-                        gates[j] = ih_t[j] + bih[j] + bhh[j] + hh_gates[j];
+                        gates[j] = ih_t[j] + bih[j] + bhh[j];
                     }
+                    // h[1,hs] @ W_hh[hs,4hs] with beta=1 to accumulate onto gates
+                    crate::tensor::sgemm(false, false, 1, 4*hs, hs, 1.0, &h_data, hs, &whh, 4*hs, 1.0, &mut gates, 4*hs);
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
