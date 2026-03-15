@@ -200,6 +200,10 @@ impl Llama {
                 &mut layer.down_proj,
             );
 
+            // Fuse projections for fewer matmul dispatches
+            layer.attention.fuse_qkv();
+            layer.fuse_gate_up();
+
             if i == 0 || (i + 1) % 4 == 0 || i + 1 == config.num_layers {
                 eprintln!("  Loaded layer {}/{}", i + 1, config.num_layers);
             }
@@ -431,6 +435,13 @@ impl Llama {
         }
 
         eprintln!("  Loaded {} tensors from safetensors", loaded_count);
+
+        // Fuse projections for fewer matmul dispatches
+        for layer in &mut model.layers {
+            layer.attention.fuse_qkv();
+            layer.fuse_gate_up();
+        }
+
         model
     }
 }

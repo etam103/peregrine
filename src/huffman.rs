@@ -567,10 +567,10 @@ impl HuffmanKVCache {
         num_heads: usize,
         head_dim: usize,
     ) -> Vec<f32> {
-        let total_len = self.hot.len;
+        let stride = self.hot.head_stride();
         let mut result = Vec::with_capacity(num_heads * num_tokens * head_dim);
         for h in 0..num_heads {
-            let base = h * total_len * head_dim;
+            let base = h * stride;
             for t in 0..num_tokens {
                 let offset = base + t * head_dim;
                 result.extend_from_slice(&data[offset..offset + head_dim]);
@@ -580,25 +580,23 @@ impl HuffmanKVCache {
     }
 
     /// Remove the oldest `count` tokens from the hot cache.
+    /// Shifts remaining tokens to the front within each head's slice.
     fn remove_oldest_tokens(&mut self, count: usize) {
         let old_len = self.hot.len;
         let new_len = old_len - count;
         let num_heads = self.hot.num_kv_heads;
         let head_dim = self.hot.head_dim;
-
-        let mut new_k = Vec::with_capacity(num_heads * new_len * head_dim);
-        let mut new_v = Vec::with_capacity(num_heads * new_len * head_dim);
+        let stride = self.hot.head_stride();
 
         for h in 0..num_heads {
-            let base = h * old_len * head_dim;
-            let start = base + count * head_dim;
-            let end = base + old_len * head_dim;
-            new_k.extend_from_slice(&self.hot.k[start..end]);
-            new_v.extend_from_slice(&self.hot.v[start..end]);
+            let base = h * stride;
+            let src_start = base + count * head_dim;
+            let copy_bytes = new_len * head_dim;
+            // Shift within the same buffer (src and dst don't overlap for count > 0)
+            self.hot.k.copy_within(src_start..src_start + copy_bytes, base);
+            self.hot.v.copy_within(src_start..src_start + copy_bytes, base);
         }
 
-        self.hot.k = new_k;
-        self.hot.v = new_v;
         self.hot.len = new_len;
     }
 

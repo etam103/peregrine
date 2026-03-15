@@ -1283,6 +1283,33 @@ impl RoPE {
 
         Tensor::new(out, shape, false)
     }
+
+    /// Apply RoPE to a single head's data in-place. `src` is [head_dim] at a given position.
+    /// Writes rotated result to `dst` [head_dim].
+    #[inline]
+    pub fn apply_one(&self, src: &[f32], dst: &mut [f32], pos: usize) {
+        let half = self.head_dim / 2;
+        debug_assert!(pos < self.cos_cache.len());
+        let cos = &self.cos_cache[pos];
+        let sin = &self.sin_cache[pos];
+
+        for i in 0..half {
+            let x0 = src[i];
+            let x1 = src[half + i];
+            dst[i] = x0 * cos[i] - x1 * sin[i];
+        }
+        for i in 0..half {
+            let x0 = src[i];
+            let x1 = src[half + i];
+            dst[half + i] = x0 * sin[i] + x1 * cos[i];
+        }
+    }
+
+    /// Get the head_dim this RoPE was created with.
+    #[inline]
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
 }
 
 // ===========================================================================
