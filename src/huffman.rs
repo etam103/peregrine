@@ -382,8 +382,17 @@ impl HuffmanTensor {
 
         assert_eq!(data_i8.len(), total);
 
+        // Pre-transpose for GEMM
+        let mut data_i8_t = vec![0i8; self.rows * self.cols];
+        for k in 0..self.rows {
+            for n in 0..self.cols {
+                data_i8_t[n * self.rows + k] = data_i8[k * self.cols + n];
+            }
+        }
+
         QuantizedTensor {
             data_i8,
+            data_i8_t,
             scales: self.scales.clone(),
             rows: self.rows,
             cols: self.cols,

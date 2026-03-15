@@ -1047,13 +1047,146 @@ pub fn quantize_row_i8(a: &[f32], scale: f32, out: &mut [i8]) {
     }
 }
 
-/// Int8 GEMM using NEON widening multiply + pairwise accumulate (sdot equivalent): C[M,N] = dequant(A_i8[M,K] @ B_t_i8[N,K]^T)
+/// Inline asm wrapper for ARM SDOT instruction (ARMv8.4+ dot product).
+/// Computes: acc[i] += sum(a[i*4..i*4+4] * b[i*4..i*4+4]) for i in 0..4
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot_s32(mut acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    std::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack)
+    );
+    acc
+}
+
+/// Inner microkernel: compute a 4x4 output tile (4 M-rows x 4 N-cols).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn gemm_i8_sdot_4x4_tile(
+    a: &[i8],
+    b_t: &[i8],
+    out: *mut f32,
+    a_scales: &[f32],
+    w_scales: &[f32],
+    mi: usize,
+    ni: usize,
+    n: usize,
+    k: usize,
+    k16: usize,
+) {
+    let a0_ptr = a.as_ptr().add(mi * k);
+    let a1_ptr = a.as_ptr().add((mi + 1) * k);
+    let a2_ptr = a.as_ptr().add((mi + 2) * k);
+    let a3_ptr = a.as_ptr().add((mi + 3) * k);
+    let b0_ptr = b_t.as_ptr().add(ni * k);
+    let b1_ptr = b_t.as_ptr().add((ni + 1) * k);
+    let b2_ptr = b_t.as_ptr().add((ni + 2) * k);
+    let b3_ptr = b_t.as_ptr().add((ni + 3) * k);
+
+    let mut c00 = vdupq_n_s32(0);
+    let mut c01 = vdupq_n_s32(0);
+    let mut c02 = vdupq_n_s32(0);
+    let mut c03 = vdupq_n_s32(0);
+    let mut c10 = vdupq_n_s32(0);
+    let mut c11 = vdupq_n_s32(0);
+    let mut c12 = vdupq_n_s32(0);
+    let mut c13 = vdupq_n_s32(0);
+    let mut c20 = vdupq_n_s32(0);
+    let mut c21 = vdupq_n_s32(0);
+    let mut c22 = vdupq_n_s32(0);
+    let mut c23 = vdupq_n_s32(0);
+    let mut c30 = vdupq_n_s32(0);
+    let mut c31 = vdupq_n_s32(0);
+    let mut c32 = vdupq_n_s32(0);
+    let mut c33 = vdupq_n_s32(0);
+
+    for kc in 0..k16 {
+        let koff = kc * 16;
+        let va0 = vld1q_s8(a0_ptr.add(koff));
+        let va1 = vld1q_s8(a1_ptr.add(koff));
+        let va2 = vld1q_s8(a2_ptr.add(koff));
+        let va3 = vld1q_s8(a3_ptr.add(koff));
+        let vb0 = vld1q_s8(b0_ptr.add(koff));
+        let vb1 = vld1q_s8(b1_ptr.add(koff));
+        let vb2 = vld1q_s8(b2_ptr.add(koff));
+        let vb3 = vld1q_s8(b3_ptr.add(koff));
+
+        c00 = sdot_s32(c00, va0, vb0);
+        c01 = sdot_s32(c01, va0, vb1);
+        c02 = sdot_s32(c02, va0, vb2);
+        c03 = sdot_s32(c03, va0, vb3);
+        c10 = sdot_s32(c10, va1, vb0);
+        c11 = sdot_s32(c11, va1, vb1);
+        c12 = sdot_s32(c12, va1, vb2);
+        c13 = sdot_s32(c13, va1, vb3);
+        c20 = sdot_s32(c20, va2, vb0);
+        c21 = sdot_s32(c21, va2, vb1);
+        c22 = sdot_s32(c22, va2, vb2);
+        c23 = sdot_s32(c23, va2, vb3);
+        c30 = sdot_s32(c30, va3, vb0);
+        c31 = sdot_s32(c31, va3, vb1);
+        c32 = sdot_s32(c32, va3, vb2);
+        c33 = sdot_s32(c33, va3, vb3);
+    }
+
+    let mut acc = [[0i32; 4]; 4];
+    acc[0][0] = vaddvq_s32(c00);
+    acc[0][1] = vaddvq_s32(c01);
+    acc[0][2] = vaddvq_s32(c02);
+    acc[0][3] = vaddvq_s32(c03);
+    acc[1][0] = vaddvq_s32(c10);
+    acc[1][1] = vaddvq_s32(c11);
+    acc[1][2] = vaddvq_s32(c12);
+    acc[1][3] = vaddvq_s32(c13);
+    acc[2][0] = vaddvq_s32(c20);
+    acc[2][1] = vaddvq_s32(c21);
+    acc[2][2] = vaddvq_s32(c22);
+    acc[2][3] = vaddvq_s32(c23);
+    acc[3][0] = vaddvq_s32(c30);
+    acc[3][1] = vaddvq_s32(c31);
+    acc[3][2] = vaddvq_s32(c32);
+    acc[3][3] = vaddvq_s32(c33);
+
+    // Scalar tail
+    for ki in (k16 * 16)..k {
+        let a_vals = [
+            a[mi * k + ki] as i32,
+            a[(mi + 1) * k + ki] as i32,
+            a[(mi + 2) * k + ki] as i32,
+            a[(mi + 3) * k + ki] as i32,
+        ];
+        let b_vals = [
+            b_t[ni * k + ki] as i32,
+            b_t[(ni + 1) * k + ki] as i32,
+            b_t[(ni + 2) * k + ki] as i32,
+            b_t[(ni + 3) * k + ki] as i32,
+        ];
+        for r in 0..4 {
+            for c in 0..4 {
+                acc[r][c] += a_vals[r] * b_vals[c];
+            }
+        }
+    }
+
+    // Dequantize and store
+    for r in 0..4 {
+        let as_ = a_scales[mi + r];
+        for c in 0..4 {
+            *out.add((mi + r) * n + ni + c) = acc[r][c] as f32 * as_ * w_scales[ni + c];
+        }
+    }
+}
+
+/// Int8 GEMM using ARM SDOT instruction: C[M,N] = dequant(A_i8[M,K] @ B_t_i8[N,K]^T)
 ///
 /// B is pre-transposed (column-major): B_t[n, k] so dot products are contiguous.
 /// Post-loop dequantization: C[m,n] = acc_i32 * a_scales[m] * w_scales[n].
 ///
-/// Uses widening multiply + pairwise add as a stable alternative to vdotq_s32,
-/// processing 16 i8 elements per iteration via vmull_s8 (8→16 widen) + vpadalq_s16 (16→32 accumulate).
+/// Uses 4x4 M/N tiling with SDOT (1 instruction = 16 i8 multiply-accumulates).
+/// Parallelized over M-blocks using rayon for large problems.
 #[cfg(target_arch = "aarch64")]
 pub fn gemm_i8_sdot(
     a: &[i8],       // [M, K] row-major
@@ -1069,114 +1202,69 @@ pub fn gemm_i8_sdot(
     debug_assert_eq!(b_t.len(), n * k);
     debug_assert_eq!(out.len(), m * n);
 
-    // Process 4 rows at a time for better register utilization
-    let m_blocks = m / 4;
+    let m4 = m / 4;
+    let n4 = n / 4;
+    let k16 = k / 16;
 
-    for mb in 0..m_blocks {
-        let mi = mb * 4;
-        for ni in 0..n {
-            let k_chunks = k / 16;
-            let (mut acc0, mut acc1, mut acc2, mut acc3): (i32, i32, i32, i32);
-            unsafe {
-                let b_ptr = b_t.as_ptr().add(ni * k);
-                let a0_ptr = a.as_ptr().add(mi * k);
-                let a1_ptr = a.as_ptr().add((mi + 1) * k);
-                let a2_ptr = a.as_ptr().add((mi + 2) * k);
-                let a3_ptr = a.as_ptr().add((mi + 3) * k);
+    // N-blocking: process N in blocks of NB*4 columns, then sweep all M-blocks.
+    // This keeps each B-column block (~NB*4*K bytes) in cache while reusing it
+    // across all M-blocks, reducing total memory traffic.
+    const NB: usize = 16; // 16*4=64 cols * 1024 bytes/col = 64KB, fits L1
+    let n_outer_blocks = (n4 + NB - 1) / NB;
 
-                let mut vacc0 = vdupq_n_s32(0);
-                let mut vacc1 = vdupq_n_s32(0);
-                let mut vacc2 = vdupq_n_s32(0);
-                let mut vacc3 = vdupq_n_s32(0);
+    let out_ptr = out.as_mut_ptr();
 
-                for kc in 0..k_chunks {
-                    let koff = kc * 16;
-                    // Load 16 bytes (i8x16) for b and each a row
-                    let vb = vld1q_s8(b_ptr.add(koff));
-                    let va0 = vld1q_s8(a0_ptr.add(koff));
-                    let va1 = vld1q_s8(a1_ptr.add(koff));
-                    let va2 = vld1q_s8(a2_ptr.add(koff));
-                    let va3 = vld1q_s8(a3_ptr.add(koff));
+    for nb_outer in 0..n_outer_blocks {
+        let nb_start = nb_outer * NB;
+        let nb_end = (nb_start + NB).min(n4);
 
-                    // Widening multiply low 8 bytes: i8x8 * i8x8 -> i16x8
-                    let vb_lo = vget_low_s8(vb);
-                    let vb_hi = vget_high_s8(vb);
-
-                    // Row 0
-                    let prod0_lo = vmull_s8(vget_low_s8(va0), vb_lo);
-                    let prod0_hi = vmull_s8(vget_high_s8(va0), vb_hi);
-                    vacc0 = vpadalq_s16(vacc0, prod0_lo);
-                    vacc0 = vpadalq_s16(vacc0, prod0_hi);
-
-                    // Row 1
-                    let prod1_lo = vmull_s8(vget_low_s8(va1), vb_lo);
-                    let prod1_hi = vmull_s8(vget_high_s8(va1), vb_hi);
-                    vacc1 = vpadalq_s16(vacc1, prod1_lo);
-                    vacc1 = vpadalq_s16(vacc1, prod1_hi);
-
-                    // Row 2
-                    let prod2_lo = vmull_s8(vget_low_s8(va2), vb_lo);
-                    let prod2_hi = vmull_s8(vget_high_s8(va2), vb_hi);
-                    vacc2 = vpadalq_s16(vacc2, prod2_lo);
-                    vacc2 = vpadalq_s16(vacc2, prod2_hi);
-
-                    // Row 3
-                    let prod3_lo = vmull_s8(vget_low_s8(va3), vb_lo);
-                    let prod3_hi = vmull_s8(vget_high_s8(va3), vb_hi);
-                    vacc3 = vpadalq_s16(vacc3, prod3_lo);
-                    vacc3 = vpadalq_s16(vacc3, prod3_hi);
+        for mb in 0..m4 {
+            let mi = mb * 4;
+            for nb in nb_start..nb_end {
+                let ni = nb * 4;
+                unsafe {
+                    gemm_i8_sdot_4x4_tile(a, b_t, out_ptr, a_scales, w_scales, mi, ni, n, k, k16);
                 }
-
-                // Horizontal sum of each accumulator
-                acc0 = vaddvq_s32(vacc0);
-                acc1 = vaddvq_s32(vacc1);
-                acc2 = vaddvq_s32(vacc2);
-                acc3 = vaddvq_s32(vacc3);
             }
-
-            // Scalar tail for remaining k elements
-            for ki in (k_chunks * 16)..k {
-                let b_val = b_t[ni * k + ki] as i32;
-                acc0 += a[(mi) * k + ki] as i32 * b_val;
-                acc1 += a[(mi + 1) * k + ki] as i32 * b_val;
-                acc2 += a[(mi + 2) * k + ki] as i32 * b_val;
-                acc3 += a[(mi + 3) * k + ki] as i32 * b_val;
-            }
-
-            // Dequantize
-            let ws = w_scales[ni];
-            out[mi * n + ni] = acc0 as f32 * a_scales[mi] * ws;
-            out[(mi + 1) * n + ni] = acc1 as f32 * a_scales[mi + 1] * ws;
-            out[(mi + 2) * n + ni] = acc2 as f32 * a_scales[mi + 2] * ws;
-            out[(mi + 3) * n + ni] = acc3 as f32 * a_scales[mi + 3] * ws;
         }
     }
 
-    // Handle remaining rows
-    for mi in (m_blocks * 4)..m {
-        for ni in 0..n {
-            let k_chunks = k / 16;
+    // Handle remaining N columns (n4*4..n)
+    for mi in 0..m {
+        for ni in (n4 * 4)..n {
             let mut acc: i32;
             unsafe {
                 let b_ptr = b_t.as_ptr().add(ni * k);
                 let a_ptr = a.as_ptr().add(mi * k);
                 let mut vacc = vdupq_n_s32(0);
-
-                for kc in 0..k_chunks {
+                for kc in 0..k16 {
                     let koff = kc * 16;
-                    let vb = vld1q_s8(b_ptr.add(koff));
-                    let va = vld1q_s8(a_ptr.add(koff));
-
-                    let vb_lo = vget_low_s8(vb);
-                    let vb_hi = vget_high_s8(vb);
-                    let prod_lo = vmull_s8(vget_low_s8(va), vb_lo);
-                    let prod_hi = vmull_s8(vget_high_s8(va), vb_hi);
-                    vacc = vpadalq_s16(vacc, prod_lo);
-                    vacc = vpadalq_s16(vacc, prod_hi);
+                    vacc = sdot_s32(vacc, vld1q_s8(a_ptr.add(koff)), vld1q_s8(b_ptr.add(koff)));
                 }
                 acc = vaddvq_s32(vacc);
             }
-            for ki in (k_chunks * 16)..k {
+            for ki in (k16 * 16)..k {
+                acc += a[mi * k + ki] as i32 * b_t[ni * k + ki] as i32;
+            }
+            out[mi * n + ni] = acc as f32 * a_scales[mi] * w_scales[ni];
+        }
+    }
+
+    // Handle remaining M rows (m4*4..m) for main N range
+    for mi in (m4 * 4)..m {
+        for ni in 0..(n4 * 4) {
+            let mut acc: i32;
+            unsafe {
+                let b_ptr = b_t.as_ptr().add(ni * k);
+                let a_ptr = a.as_ptr().add(mi * k);
+                let mut vacc = vdupq_n_s32(0);
+                for kc in 0..k16 {
+                    let koff = kc * 16;
+                    vacc = sdot_s32(vacc, vld1q_s8(a_ptr.add(koff)), vld1q_s8(b_ptr.add(koff)));
+                }
+                acc = vaddvq_s32(vacc);
+            }
+            for ki in (k16 * 16)..k {
                 acc += a[mi * k + ki] as i32 * b_t[ni * k + ki] as i32;
             }
             out[mi * n + ni] = acc as f32 * a_scales[mi] * w_scales[ni];

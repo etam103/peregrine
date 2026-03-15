@@ -7,9 +7,12 @@ use crate::metal::{GpuBuffer, GpuContext};
 /// A weight tensor quantized to int8 with per-column symmetric scales.
 ///
 /// `data_i8[row * cols + col]` stores the quantized value.
+/// `data_i8_t[col * rows + row]` stores the transposed layout for fast GEMM.
 /// `scales[col] = max(|w[:,col]|) / 127` — no zero-point.
 pub struct QuantizedTensor {
     pub data_i8: Vec<i8>,
+    /// Pre-transposed weights: data_i8_t[n * rows + k] = data_i8[k * cols + n]
+    pub data_i8_t: Vec<i8>,
     pub scales: Vec<f32>,
     pub rows: usize,
     pub cols: usize,
@@ -50,8 +53,17 @@ pub fn quantize_weights(data: &[f32], rows: usize, cols: usize) -> QuantizedTens
         }
     }
 
+    // Pre-transpose for GEMM: data_i8_t[n * rows + k] = data_i8[k * cols + n]
+    let mut data_i8_t = vec![0i8; rows * cols];
+    for k in 0..rows {
+        for n in 0..cols {
+            data_i8_t[n * rows + k] = data_i8[k * cols + n];
+        }
+    }
+
     QuantizedTensor {
         data_i8,
+        data_i8_t,
         scales,
         rows,
         cols,
@@ -127,21 +139,15 @@ pub fn matmul_quantized(
     // Quantize activations per-row
     let (a_i8, a_scales) = quantize_activations(a_data, m, k);
 
-    // Pre-transpose weights to column-major (transposed) for the NEON kernel:
-    // b_t[n, k] = w[k, n]
-    let mut b_t = vec![0i8; k * n];
-    for ki in 0..k {
-        for ni in 0..n {
-            b_t[ni * k + ki] = w.data_i8[ki * n + ni];
-        }
-    }
+    // Use pre-transposed weights (computed at quantize_weights time)
+    let b_t = &w.data_i8_t;
 
     let mut out = vec![0.0f32; m * n];
 
     #[cfg(target_arch = "aarch64")]
     {
         crate::simd_kernels::gemm_i8_sdot(
-            &a_i8, &b_t, &mut out, &a_scales, &w.scales, m, n, k,
+            &a_i8, b_t, &mut out, &a_scales, &w.scales, m, n, k,
         );
     }
 

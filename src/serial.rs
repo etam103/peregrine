@@ -200,8 +200,17 @@ pub fn read_quantized_tensor(
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
 
+    // Pre-transpose for GEMM
+    let mut data_i8_t = vec![0i8; rows * cols];
+    for k in 0..rows {
+        for n in 0..cols {
+            data_i8_t[n * rows + k] = data_i8[k * cols + n];
+        }
+    }
+
     Ok((name, crate::quant::QuantizedTensor {
         data_i8,
+        data_i8_t,
         scales,
         rows,
         cols,
