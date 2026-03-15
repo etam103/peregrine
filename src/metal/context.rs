@@ -1002,9 +1002,15 @@ impl GpuContext {
             );
         }
 
-        let grid = MTLSize { width: cols as usize, height: rows as usize, depth: 1 };
-        let tg = MTLSize { width: 16usize.min(cols as usize), height: 16usize.min(rows as usize), depth: 1 };
-        enc.dispatchThreads_threadsPerThreadgroup(grid, tg);
+        // Tiled transpose: dispatch threadgroups of 16x16
+        let tile = 16usize;
+        let num_groups = MTLSize {
+            width: (cols as usize + tile - 1) / tile,
+            height: (rows as usize + tile - 1) / tile,
+            depth: 1,
+        };
+        let tg = MTLSize { width: tile, height: tile, depth: 1 };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(num_groups, tg);
         enc.endEncoding();
     }
 
