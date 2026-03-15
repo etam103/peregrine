@@ -2119,24 +2119,30 @@ pub fn vec_arcsinh_f32(a: &[f32], out: &mut [f32]) {
         let one = vdupq_n_f32(1.0);
         let zero = vdupq_n_f32(0.0);
 
-        for i in 0..chunks {
-            let off = i * 4;
+        let chunks2 = chunks / 2;
+        for i in 0..chunks2 {
+            let off = i * 8;
+            let vx0 = vld1q_f32(a.as_ptr().add(off));
+            let vx1 = vld1q_f32(a.as_ptr().add(off + 4));
+            let abs0 = vabsq_f32(vx0);
+            let abs1 = vabsq_f32(vx1);
+            let sq0 = vsqrtq_f32(vaddq_f32(vmulq_f32(abs0, abs0), one));
+            let sq1 = vsqrtq_f32(vaddq_f32(vmulq_f32(abs1, abs1), one));
+            let log0 = fast_log_f32x4(vaddq_f32(abs0, sq0));
+            let log1 = fast_log_f32x4(vaddq_f32(abs1, sq1));
+            let m0 = vcltq_f32(vx0, zero);
+            let m1 = vcltq_f32(vx1, zero);
+            vst1q_f32(out.as_mut_ptr().add(off), vbslq_f32(m0, vnegq_f32(log0), log0));
+            vst1q_f32(out.as_mut_ptr().add(off + 4), vbslq_f32(m1, vnegq_f32(log1), log1));
+        }
+        if chunks2 * 2 < chunks {
+            let off = chunks2 * 8;
             let vx = vld1q_f32(a.as_ptr().add(off));
             let abs_x = vabsq_f32(vx);
-
-            // sqrt(x^2 + 1)
-            let x2p1 = vaddq_f32(vmulq_f32(abs_x, abs_x), one);
-            let sqrt_val = vsqrtq_f32(x2p1);
-
-            // ln(|x| + sqrt(x^2 + 1))
-            let arg = vaddq_f32(abs_x, sqrt_val);
-            let log_val = fast_log_f32x4(arg);
-
-            // Apply sign: asinh(-x) = -asinh(x)
+            let sqrt_val = vsqrtq_f32(vaddq_f32(vmulq_f32(abs_x, abs_x), one));
+            let log_val = fast_log_f32x4(vaddq_f32(abs_x, sqrt_val));
             let neg_mask = vcltq_f32(vx, zero);
-            let result = vbslq_f32(neg_mask, vnegq_f32(log_val), log_val);
-
-            vst1q_f32(out.as_mut_ptr().add(off), result);
+            vst1q_f32(out.as_mut_ptr().add(off), vbslq_f32(neg_mask, vnegq_f32(log_val), log_val));
         }
     }
     for i in (chunks * 4)..len {
