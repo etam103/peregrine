@@ -456,11 +456,39 @@ pub fn vec_gelu_f32(a: &[f32], out: &mut [f32]) {
         let vq7 = vdupq_n_f32(Q7);
         let vq8 = vdupq_n_f32(Q8);
 
-        for i in 0..chunks {
-            let off = i * 4;
+        let chunks2 = chunks / 2;
+        for i in 0..chunks2 {
+            let off = i * 8;
+            let vx0 = vld1q_f32(a.as_ptr().add(off));
+            let vx1 = vld1q_f32(a.as_ptr().add(off + 4));
+            let x2_0 = vmulq_f32(vx0, vx0);
+            let x2_1 = vmulq_f32(vx1, vx1);
+            let q0 = vmlaq_f32(vq7, vq8, x2_0);
+            let q1 = vmlaq_f32(vq7, vq8, x2_1);
+            let q0 = vmlaq_f32(vq6, q0, x2_0);
+            let q1 = vmlaq_f32(vq6, q1, x2_1);
+            let q0 = vmlaq_f32(vq5, q0, x2_0);
+            let q1 = vmlaq_f32(vq5, q1, x2_1);
+            let q0 = vmlaq_f32(vq4, q0, x2_0);
+            let q1 = vmlaq_f32(vq4, q1, x2_1);
+            let q0 = vmlaq_f32(vq3, q0, x2_0);
+            let q1 = vmlaq_f32(vq3, q1, x2_1);
+            let q0 = vmlaq_f32(vq2, q0, x2_0);
+            let q1 = vmlaq_f32(vq2, q1, x2_1);
+            let q0 = vmlaq_f32(vq1, q0, x2_0);
+            let q1 = vmlaq_f32(vq1, q1, x2_1);
+            let q0 = vmlaq_f32(vq0, q0, x2_0);
+            let q1 = vmlaq_f32(vq0, q1, x2_1);
+            let inner0 = vmaxq_f32(zero, vminq_f32(one, vaddq_f32(vhalf, vmulq_f32(vx0, q0))));
+            let inner1 = vmaxq_f32(zero, vminq_f32(one, vaddq_f32(vhalf, vmulq_f32(vx1, q1))));
+            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vx0, inner0));
+            vst1q_f32(out.as_mut_ptr().add(off + 4), vmulq_f32(vx1, inner1));
+        }
+        // Handle remaining chunk of 4
+        if chunks2 * 2 < chunks {
+            let off = chunks2 * 8;
             let vx = vld1q_f32(a.as_ptr().add(off));
             let x2 = vmulq_f32(vx, vx);
-            // Horner: Q(x²) = q0 + x²*(q1 + x²*(q2 + ... + x²*(q7 + x²*q8)))
             let q = vmlaq_f32(vq7, vq8, x2);
             let q = vmlaq_f32(vq6, q, x2);
             let q = vmlaq_f32(vq5, q, x2);
@@ -469,7 +497,6 @@ pub fn vec_gelu_f32(a: &[f32], out: &mut [f32]) {
             let q = vmlaq_f32(vq2, q, x2);
             let q = vmlaq_f32(vq1, q, x2);
             let q = vmlaq_f32(vq0, q, x2);
-            // gelu = x * clamp(0.5 + x * Q(x²), 0, 1)
             let inner = vmaxq_f32(zero, vminq_f32(one, vaddq_f32(vhalf, vmulq_f32(vx, q))));
             vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vx, inner));
         }
