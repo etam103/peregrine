@@ -3981,7 +3981,7 @@ impl Tensor {
             // Parallel for large sizes — use vvexpf per chunk on macOS
             use rayon::prelude::*;
             let mut data = pool_get(len);
-            let chunk = 50_000;
+            let chunk = 100_000;
             inner.data.par_chunks(chunk)
                 .zip(data.par_chunks_mut(chunk))
                 .for_each(|(src, dst)| {
