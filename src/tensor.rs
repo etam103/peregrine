@@ -1698,7 +1698,7 @@ impl Tensor {
             x_backup[..total].copy_from_slice(&out_data[..total]);
             if total >= 100_000 {
                 use rayon::prelude::*;
-                const GELU_CHUNK: usize = 32768;
+                const GELU_CHUNK: usize = 20000;
                 x_backup[..total].par_chunks(GELU_CHUNK)
                     .zip(out_data[..total].par_chunks_mut(GELU_CHUNK))
                     .for_each(|(src, dst)| {
