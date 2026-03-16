@@ -59,6 +59,22 @@ extern "C" {
         lda: *const i32, ipiv: *const i32, b: *mut f32, ldb: *const i32,
         info: *mut i32,
     );
+    fn ssytrd_(
+        uplo: *const u8, n: *const i32, a: *mut f32, lda: *const i32,
+        d: *mut f32, e: *mut f32, tau: *mut f32, work: *mut f32, lwork: *const i32,
+        info: *mut i32,
+    );
+    fn sstedc_(
+        compz: *const u8, n: *const i32, d: *mut f32, e: *mut f32,
+        z: *mut f32, ldz: *const i32, work: *mut f32, lwork: *const i32,
+        iwork: *mut i32, liwork: *const i32, info: *mut i32,
+    );
+    fn sormtr_(
+        side: *const u8, uplo: *const u8, trans: *const u8, m: *const i32,
+        n: *const i32, a: *const f32, lda: *const i32, tau: *const f32,
+        c: *mut f32, ldc: *const i32, work: *mut f32, lwork: *const i32,
+        info: *mut i32,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -390,28 +406,167 @@ pub fn qr(_a: &Tensor) -> (Tensor, Tensor) {
 /// Returns `(eigenvalues, eigenvectors)` where eigenvalues are sorted ascending.
 /// - `eigenvalues`: `[n]`
 /// - `eigenvectors`: `[n, n]` (columns are eigenvectors, returned in row-major)
+///
+/// For n <= 64: uses manual 3-step decomposition (ssytrd + sstedc + sormtr)
+/// with thread-local cached workspace buffers, avoiding the overhead of
+/// ssyevd's workspace query and internal dispatch.
 #[cfg(target_os = "macos")]
 pub fn eigh(a: &Tensor) -> (Tensor, Tensor) {
     let shape = a.shape();
     assert!(shape.len() == 2 && shape[0] == shape[1], "eigh requires square matrix");
-    let n = shape[0] as i32;
+    let n = shape[0];
+    let ni = n as i32;
 
     let mut a_data = a.data();
-    // Skip input transpose: symmetric matrix A = A^T, so row-major = column-major
-
-    let mut w = vec![0.0f32; n as usize];
+    let mut w = vec![0.0f32; n];
     let mut info = 0i32;
-    let jobz = b'V'; // compute eigenvalues and eigenvectors
     let uplo = b'U';
 
-    // Use divide-and-conquer (ssyevd) — faster than QR iteration (ssyev) at all sizes
+    if n <= 64 {
+        // 3-step eigendecomposition: ssytrd + sstedc + sormtr
+        // Pre-computed workspace sizes (no query calls):
+        //   ssytrd: lwork = n * nb (nb = block size, use n for safety = n^2)
+        //   sstedc(I): lwork = 1 + 4*n + n*n, liwork = 3 + 5*n
+        //   sormtr: lwork = n * nb (use n^2 for safety)
+        let lwork_trd = n * n;     // generous for ssytrd
+        let lwork_dc = 1 + 4 * n + n * n;
+        let liwork_dc = 3 + 5 * n;
+        let lwork_orm = n * n;     // generous for sormtr
+        let total_work = lwork_trd.max(lwork_dc).max(lwork_orm);
+
+        thread_local! {
+            static EIGH_WORK: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+            static EIGH_IWORK: std::cell::RefCell<Vec<i32>> = std::cell::RefCell::new(Vec::new());
+            static EIGH_D: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+            static EIGH_E: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+            static EIGH_TAU: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+            static EIGH_Z: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+        }
+
+        EIGH_WORK.with(|wb| {
+        EIGH_IWORK.with(|ib| {
+        EIGH_D.with(|db| {
+        EIGH_E.with(|eb| {
+        EIGH_TAU.with(|tb| {
+        EIGH_Z.with(|zb| {
+            let mut work = wb.borrow_mut();
+            let mut iwork = ib.borrow_mut();
+            let mut d = db.borrow_mut();
+            let mut e = eb.borrow_mut();
+            let mut tau = tb.borrow_mut();
+            let mut z = zb.borrow_mut();
+
+            if work.len() < total_work { work.resize(total_work, 0.0); }
+            if iwork.len() < liwork_dc { iwork.resize(liwork_dc, 0); }
+            if d.len() < n { d.resize(n, 0.0); }
+            if e.len() < n { e.resize(n, 0.0); }
+            if tau.len() < n { tau.resize(n, 0.0); }
+            if z.len() < n * n { z.resize(n * n, 0.0); }
+
+            unsafe {
+                // Step 1: Reduce to tridiagonal form
+                ssytrd_(
+                    &uplo, &ni, a_data.as_mut_ptr(), &ni,
+                    d.as_mut_ptr(), e.as_mut_ptr(), tau.as_mut_ptr(),
+                    work.as_mut_ptr(), &(lwork_trd as i32), &mut info,
+                );
+                assert!(info == 0, "ssytrd failed with info={}", info);
+
+                // Step 2: Compute eigenvalues and eigenvectors of tridiagonal matrix
+                sstedc_(
+                    &b'I', &ni, d.as_mut_ptr(), e.as_mut_ptr(),
+                    z.as_mut_ptr(), &ni, work.as_mut_ptr(), &(lwork_dc as i32),
+                    iwork.as_mut_ptr(), &(liwork_dc as i32), &mut info,
+                );
+                assert!(info == 0, "sstedc failed with info={}", info);
+
+                // Step 3: Back-transform eigenvectors
+                sormtr_(
+                    &b'L', &uplo, &b'N', &ni, &ni,
+                    a_data.as_ptr(), &ni, tau.as_ptr(),
+                    z.as_mut_ptr(), &ni, work.as_mut_ptr(), &(lwork_orm as i32),
+                    &mut info,
+                );
+                assert!(info == 0, "sormtr failed with info={}", info);
+            }
+
+            // Copy eigenvalues
+            w.copy_from_slice(&d[..n]);
+
+            // Transpose z (column-major) to row-major eigenvectors, reusing a_data
+            // Use NEON 4x4 block transpose for n divisible by 4
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                use std::arch::aarch64::*;
+                let blk = n / 4;
+                for bi in 0..blk {
+                    for bj in 0..blk {
+                        let si = bi * 4;
+                        let sj = bj * 4;
+                        // Load 4 rows of 4 from column-major z
+                        // z[col * n + row] -> we want z[sj*n+si .. sj*n+si+3] etc.
+                        let r0 = vld1q_f32(z.as_ptr().add(sj * n + si));
+                        let r1 = vld1q_f32(z.as_ptr().add((sj + 1) * n + si));
+                        let r2 = vld1q_f32(z.as_ptr().add((sj + 2) * n + si));
+                        let r3 = vld1q_f32(z.as_ptr().add((sj + 3) * n + si));
+                        // Transpose 4x4
+                        let t01 = vtrnq_f32(r0, r1);
+                        let t23 = vtrnq_f32(r2, r3);
+                        // Combine low/high halves
+                        let o0 = vcombine_f32(vget_low_f32(t01.0), vget_low_f32(t23.0));
+                        let o1 = vcombine_f32(vget_low_f32(t01.1), vget_low_f32(t23.1));
+                        let o2 = vcombine_f32(vget_high_f32(t01.0), vget_high_f32(t23.0));
+                        let o3 = vcombine_f32(vget_high_f32(t01.1), vget_high_f32(t23.1));
+                        // Store to row-major a_data
+                        vst1q_f32(a_data.as_mut_ptr().add(si * n + sj), o0);
+                        vst1q_f32(a_data.as_mut_ptr().add((si + 1) * n + sj), o1);
+                        vst1q_f32(a_data.as_mut_ptr().add((si + 2) * n + sj), o2);
+                        vst1q_f32(a_data.as_mut_ptr().add((si + 3) * n + sj), o3);
+                    }
+                }
+                // Handle remainder rows/cols (for n not divisible by 4)
+                let rem = blk * 4;
+                for i in rem..n {
+                    for j in 0..n {
+                        a_data[i * n + j] = z[j * n + i];
+                    }
+                }
+                for i in 0..rem {
+                    for j in rem..n {
+                        a_data[i * n + j] = z[j * n + i];
+                    }
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                for i in 0..n {
+                    for j in 0..n {
+                        a_data[i * n + j] = z[j * n + i];
+                    }
+                }
+            }
+        });
+        });
+        });
+        });
+        });
+        });
+
+        return (
+            Tensor::new(w, vec![n], false),
+            Tensor::new(a_data, vec![n, n], false),
+        );
+    }
+
+    // For larger matrices, use ssyevd with workspace query
+    let jobz = b'V';
     let mut work_query = vec![0.0f32; 1];
     let mut iwork_query = vec![0i32; 1];
     let lwork_query: i32 = -1;
     let liwork_query: i32 = -1;
     unsafe {
         ssyevd_(
-            &jobz, &uplo, &n, a_data.as_mut_ptr(), &n,
+            &jobz, &uplo, &ni, a_data.as_mut_ptr(), &ni,
             w.as_mut_ptr(), work_query.as_mut_ptr(), &lwork_query,
             iwork_query.as_mut_ptr(), &liwork_query, &mut info,
         );
@@ -422,7 +577,7 @@ pub fn eigh(a: &Tensor) -> (Tensor, Tensor) {
     let mut iwork = vec![0i32; liwork as usize];
     unsafe {
         ssyevd_(
-            &jobz, &uplo, &n, a_data.as_mut_ptr(), &n,
+            &jobz, &uplo, &ni, a_data.as_mut_ptr(), &ni,
             w.as_mut_ptr(), work.as_mut_ptr(), &lwork,
             iwork.as_mut_ptr(), &liwork, &mut info,
         );
@@ -430,11 +585,11 @@ pub fn eigh(a: &Tensor) -> (Tensor, Tensor) {
     assert!(info == 0, "LAPACK ssyevd failed with info={}", info);
 
     // a_data now contains eigenvectors in columns (column-major)
-    transpose_buf(&mut a_data, n as usize, n as usize);
+    transpose_buf(&mut a_data, n, n);
 
     (
-        Tensor::new(w, vec![n as usize], false),
-        Tensor::new(a_data, vec![n as usize, n as usize], false),
+        Tensor::new(w, vec![n], false),
+        Tensor::new(a_data, vec![n, n], false),
     )
 }
 
@@ -935,6 +1090,100 @@ mod tests {
         for &v in &vd {
             assert!(approx_eq(v, 1.0, 1e-4));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_eigh_diagonal() {
+        // Diagonal matrix: eigenvalues are the diagonal entries
+        let a = Tensor::new(
+            vec![3.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0],
+            vec![3, 3],
+            false,
+        );
+        let (vals, vecs) = eigh(&a);
+        let vd = vals.data();
+        // Sorted ascending: 1, 2, 3
+        assert!(approx_eq(vd[0], 1.0, 1e-4));
+        assert!(approx_eq(vd[1], 2.0, 1e-4));
+        assert!(approx_eq(vd[2], 3.0, 1e-4));
+
+        // Verify V * diag(eigenvalues) * V^T ≈ A
+        let vd_vec = vecs.data();
+        let n = 3;
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for k in 0..n {
+                    sum += vd_vec[i * n + k] * vd[k] * vd_vec[j * n + k];
+                }
+                let expected = a.data()[i * n + j];
+                assert!(
+                    approx_eq(sum, expected, 1e-3),
+                    "Reconstruction A[{},{}] = {} (expected {})",
+                    i, j, sum, expected,
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_eigh_64x64() {
+        // Generate a symmetric 64x64 matrix: A = B^T * B
+        let n = 64;
+        let mut b = vec![0.0f32; n * n];
+        // Deterministic fill
+        let mut x = 1.0f32;
+        for i in 0..n * n {
+            x = (x * 1.1 + 0.3) % 10.0;
+            b[i] = x - 5.0;
+        }
+        // A = B^T * B (positive semi-definite, symmetric)
+        let mut a_data = vec![0.0f32; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for k in 0..n {
+                    sum += b[k * n + i] * b[k * n + j];
+                }
+                a_data[i * n + j] = sum;
+            }
+        }
+        let a = Tensor::new(a_data.clone(), vec![n, n], false);
+        let (vals, vecs) = eigh(&a);
+        let vd = vals.data();
+        let vv = vecs.data();
+
+        // Eigenvalues should be non-negative (PSD matrix)
+        for &v in &vd {
+            assert!(v >= -1e-3, "eigenvalue {} should be >= 0", v);
+        }
+
+        // Eigenvalues should be sorted ascending
+        for i in 1..n {
+            assert!(vd[i] >= vd[i - 1] - 1e-6, "eigenvalues not sorted");
+        }
+
+        // Verify V * diag(w) * V^T ≈ A (reconstruction)
+        let mut max_err = 0.0f32;
+        for i in 0..n {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for k in 0..n {
+                    sum += vv[i * n + k] * vd[k] * vv[j * n + k];
+                }
+                let err = (sum - a_data[i * n + j]).abs();
+                if err > max_err {
+                    max_err = err;
+                }
+            }
+        }
+        assert!(
+            max_err < 1e-1,
+            "eigh 64x64 reconstruction error too large: {}",
+            max_err,
+        );
     }
 
     #[cfg(target_os = "macos")]
