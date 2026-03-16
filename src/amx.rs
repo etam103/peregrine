@@ -247,6 +247,7 @@ pub fn amx_bench(n: usize, iters: usize) -> (f64, f64) {
 mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
+    #[ignore] // AMX requires Apple Silicon with AMX support — SIGILL on CI runners
     fn test_amx_probe() {
         // This is the first test — just enable/disable AMX.
         // If AMX is blocked, this will SIGILL.
@@ -258,6 +259,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
+    #[ignore]
     fn test_amx_sgemm_identity() {
         use super::amx_sgemm;
 
@@ -278,6 +280,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
+    #[ignore]
     fn test_amx_sgemm_128() {
         use super::amx_sgemm;
 
@@ -307,6 +310,7 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "aarch64")]
+    #[ignore]
     fn test_amx_bench() {
         for &n in &[16, 32, 64, 128, 256] {
             let iters = if n <= 64 { 10000 } else if n <= 128 { 1000 } else { 100 };

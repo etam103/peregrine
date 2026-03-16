@@ -39,11 +39,6 @@ extern "C" {
         lda: *const i32, w: *mut f32, work: *mut f32, lwork: *const i32,
         iwork: *mut i32, liwork: *const i32, info: *mut i32,
     );
-    fn ssyev_(
-        jobz: *const u8, uplo: *const u8, n: *const i32, a: *mut f32,
-        lda: *const i32, w: *mut f32, work: *mut f32, lwork: *const i32,
-        info: *mut i32,
-    );
     fn strtrs_(
         uplo: *const u8, trans: *const u8, diag: *const u8, n: *const i32,
         nrhs: *const i32, a: *const f32, lda: *const i32, b: *mut f32,
