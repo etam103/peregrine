@@ -53,6 +53,11 @@ extern "C" {
         a: *mut f32, lda: *const i32, b: *mut f32, ldb: *const i32,
         work: *mut f32, lwork: *const i32, info: *mut i32,
     );
+    fn sgetrs_(
+        trans: *const u8, n: *const i32, nrhs: *const i32, a: *const f32,
+        lda: *const i32, ipiv: *const i32, b: *mut f32, ldb: *const i32,
+        info: *mut i32,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -113,19 +118,30 @@ pub fn solve(a: &Tensor, b: &Tensor) -> Tensor {
     let mut ipiv = vec![0i32; n as usize];
     let mut info = 0i32;
 
-    // LAPACK uses column-major order
-    transpose_buf(&mut a_data, n as usize, n as usize);
+    // Our data is row-major, LAPACK expects column-major.
+    // Row-major A looks like A^T to LAPACK. Instead of transposing,
+    // we factorize A^T with sgetrf_ then solve with trans='T' so
+    // LAPACK solves (A^T)^T x = A x = b — no transpose needed for A.
+    // For b with nrhs=1, a column vector is the same in both orderings.
     if nrhs > 1 {
         transpose_buf(&mut b_data, n as usize, nrhs as usize);
     }
 
     unsafe {
-        sgesv_(
-            &n, &nrhs, a_data.as_mut_ptr(), &n,
-            ipiv.as_mut_ptr(), b_data.as_mut_ptr(), &n, &mut info,
+        // LU factorize A^T (= row-major A passed directly)
+        sgetrf_(&n, &n, a_data.as_mut_ptr(), &n, ipiv.as_mut_ptr(), &mut info);
+    }
+    assert!(info == 0, "LAPACK sgetrf failed with info={}", info);
+
+    let trans = b'T';
+    unsafe {
+        // Solve (A^T)^T x = b, i.e. A x = b
+        sgetrs_(
+            &trans, &n, &nrhs, a_data.as_ptr(), &n,
+            ipiv.as_ptr(), b_data.as_mut_ptr(), &n, &mut info,
         );
     }
-    assert!(info == 0, "LAPACK sgesv failed with info={}", info);
+    assert!(info == 0, "LAPACK sgetrs failed with info={}", info);
 
     if nrhs > 1 {
         transpose_buf(&mut b_data, nrhs as usize, n as usize);
