@@ -11,6 +11,8 @@ Tensors, reverse-mode autograd, neural network layers, optimizers, and working m
 [![Rust](https://img.shields.io/badge/rust-2021-orange)]()
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
 
+**Platform:** macOS on Apple Silicon (M1/M2/M3/M4). Uses Apple Accelerate for BLAS/FFT/vForce, NEON SIMD intrinsics, and optional Metal GPU compute.
+
 </div>
 
 ---
@@ -53,18 +55,18 @@ pip install ./peregrine-py && python -c "import peregrine"  # Python bindings
 | **`peregrine::hf_hub`** | HuggingFace Hub integration — download and cache safetensors weights, config.json, tokenizer.json. Auth via `HF_TOKEN`, multi-shard support (`--features hf`) |
 | **`peregrine::models::llama`** | Library-level Llama model — `Llama`, `LlamaConfig`, `LlamaBlock`, `LlamaAttention`, `KVCache`, `Tokenizer`. Loadable from GGUF or safetensors. Used by both the CLI example and Python bindings |
 | **`peregrine::metal`** | Metal GPU backend — 108 compute shaders, 41 dispatch methods, fused op pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling, thermal-aware scheduling (`--features metal`) |
-| **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
-| **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
-| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, 12% faster than PyTorch at 224 (0.59s vs 0.67s), 14% faster at 512 (1.95s vs 2.26s). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`scripts/reconstruct_video.py`) |
-| **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
-| **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
-| **`peregrine::sched`** | Request scheduler for managed prefill/decode aggregation — `Priority` (Background/Normal/High), `ChunkedPrefiller`, dynamic chunk-size tuning with EMA latency tracking, `SchedulerAction`-based model-agnostic API. Supports multiple concurrent requests with priority-based interleaving |
-| **`peregrine::thermal`** | Thermal monitoring via Darwin notifications — `ThermalState` (Nominal/Moderate/Heavy/Trapping/Sleeping), rate-limited polling (100ms cache), thread-local singleton. Used by `het_execute_thermal` for thermal-aware GPU/CPU scheduling |
-| **`examples/llama`** | Llama 3.2 inference — auto-detects GGUF, safetensors directories, or HuggingFace Hub repos (`org/repo`). Loads quantized GGUF (Q8_0, Q4_0, Q4_1) or HF safetensors (F32/F16/BF16) with mmap. 16-layer 1B config (2048 dim, GQA 32/8 heads, SwiGLU), RoPE (theta=500000), BPE tokenizer from GGUF metadata or HF tokenizer.json, greedy/temperature/top-p sampling, streaming decode with tok/s stats. `--sustained SECS` for sustained throughput profiling (p50/p95/p99 latency, thermal distribution), `--chunked-prefill SIZE` for chunked prefill via scheduler, `--multi-request N` for N concurrent priority-scheduled requests, `--wandb` for W&B logging |
-| **`examples/rl_demo`** | RL training demos with interactive HTML visualizations — PPO on CartPole, DQN on GridWorld, REINFORCE on BasicArithmetic. Generates learning curve charts and canvas animations |
-| **`examples/moba`** | MOBA 3v3 with LSTM-based PPO and self-play — single-lane map (32x16), heroes, towers, creeps, bases. Train, selfplay, watch (HTML replay), video (MP4 export via FFmpeg) |
-| **`peregrine-py`** | Python bindings via PyO3 — `peregrine.Tensor` with NumPy interop, `peregrine.nn` (Linear, Embedding, RMSNorm, LayerNorm), `peregrine.load_model()` for streaming LLM inference. `pip install peregrine-ml` on macOS arm64 |
-| **`peregrine-bench`** | Reproducible benchmark CLI — 141 ops across 18 categories, hardware auto-detection (Apple Silicon chip/cores/RAM via sysctl), structured JSON output with schema versioning. GitHub Pages dashboard at `docs/index.html` |
+| **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end (97.5% accuracy) |
+| **`examples/rt_detr`** | RT-DETR object detector — ResNet backbone, transformer encoder/decoder, Hungarian matching, wandb logging |
+| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, server mode, parallel workers, Metal GPU, heterogeneous pipeline |
+| **`examples/grok1`** | Grok-1 (314B MoE) inference — GQA, 8 experts top-2, SentencePiece tokenizer, speculative decoding |
+| **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — MLA, compressed KV cache, 256 routed experts, speculative decoding |
+| **`examples/llama`** | Llama 3.2 inference — GGUF/safetensors/HF Hub, streaming decode, sustained profiling, chunked prefill |
+| **`examples/rl_demo`** | RL training demos — PPO on CartPole, DQN on GridWorld, REINFORCE on Arithmetic, HTML visualizations |
+| **`examples/moba`** | MOBA 3v3 with LSTM PPO and self-play — train, selfplay, watch (HTML replay), video (MP4 export) |
+| **`peregrine::sched`** | Request scheduler — priority-based prefill/decode aggregation, chunked prefill, EMA latency tracking |
+| **`peregrine::thermal`** | Thermal monitoring via Darwin notifications — thermal-aware GPU/CPU scheduling |
+| **`peregrine-py`** | Python bindings via PyO3 — `peregrine.Tensor` with NumPy interop, `peregrine.load_model()` for LLM inference |
+| **`peregrine-bench`** | Reproducible benchmark CLI — 141 ops, hardware auto-detection, JSON output, GitHub Pages dashboard |
 
 The entire library is ~37,900 lines of Rust. No macros, no code generation, no proc-macro magic. You can read every line.
 
@@ -185,68 +187,35 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | **4.6** | 6.4 | 21.6 | 49.9 | 417.1 | 86.8 |
-| matmul 512x512 | **135.8** | 134.0 | 172.3 | 572.7 | 423.1 | 516.3 |
-| add 100k | **11.3** | 41.8 | 34.6 | 44.6 | 185.5 | 34.2 |
-| mul 100k | **13.4** | 40.4 | 30.4 | 42.9 | 186.2 | 38.7 |
-| relu 100k | **8.9** | 43.1 | 25.3 | 37.6 | 333.4 | 105.1 |
-| softmax 8x128 | **1.2** | 39.1 | 15.3 | 11.4 | 604.3 | 33.0 |
-| gelu 100k | **57.3** | 68.3 | 141.0 | 235.6 | 857.5 | 221.2 |
-| silu 100k | **48.0** | 74.3 | 93.7 | 233.0 | 338.8 | 52.1 |
-| erf 100k | **50.8** | 59.9 | 100.9 | 55.9 | — | 57.2 |
-| rfft 1k | **2.2** | 4.7 | 18.8 | 45.6 | — | 62.2 |
-| cross_entropy | **2.7** | 35.6 | 22.7 | 636.9 | 3405.7 | 67.2 |
-| train step 64 | **750** | 1250 | 772 | 8412 | 23310 | 5351 |
-| add+layernorm 196x768 | **71.9** | 103.2 | — | 1164.9 | 1151.2 | 242.7 |
-| cholesky 128x128 | **14.4** | 64.5 | 26.5 | 60.2 | — | 36.2 |
-| inv 64x64 | **14.7** | 26.2 | 47.4 | 32.4 | — | 37.6 |
-| solve 128x128 | **34.8** | 43.9 | 184.5 | 76.3 | — | 88.3 |
+| matmul 128x128 | **4.7** | 6.2 | 24.0 | 95.7 | 418.9 | 80.4 |
+| matmul 512x512 | **134.8** | 140.0 | 172.1 | 682.6 | 433.2 | 518.9 |
+| add 100k | **12.5** | 41.1 | 32.3 | 50.1 | 190.5 | 33.4 |
+| mul 100k | **12.5** | 39.0 | 32.0 | 40.7 | 192.3 | 28.4 |
+| relu 100k | **8.5** | 38.5 | 30.5 | 39.7 | 338.9 | 97.7 |
+| softmax 8x128 | **1.1** | 35.2 | 18.4 | 11.3 | 609.4 | 30.9 |
+| gelu 100k | **56.3** | 74.0 | 146.2 | 249.2 | 844.8 | 219.3 |
+| silu 100k | **47.0** | 68.8 | 89.8 | 226.0 | 370.4 | 78.6 |
+| erf 100k | **49.1** | 57.2 | 101.0 | 57.0 | — | 57.0 |
+| rfft 1k | **2.2** | 4.4 | 19.0 | 42.7 | — | 60.5 |
+| cross_entropy | **2.5** | 40.1 | 24.8 | 614.7 | 3622.5 | 56.7 |
+| train step 64 | **747** | 1255 | 810 | 8444 | 24421 | 5209 |
+| add+layernorm 196x768 | **72.0** | 101.0 | — | 1224.3 | 1137.2 | 259.0 |
+| cholesky 128x128 | **14.2** | 46.4 | 26.7 | 58.5 | — | 37.7 |
+| inv 64x64 | **15.2** | 26.6 | 47.4 | 32.8 | — | 45.4 |
+| solve 128x128 | **36.2** | 44.8 | 187.2 | 76.7 | — | 85.8 |
 
 Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.44x** (56% faster), **MLX 0.32x**, TensorFlow 0.24x, tinygrad 0.04x, JAX 0.29x. Peregrine wins 128 of 141 ops.
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
-| Resolution | CPU | GPU | GPU+Pipeline | PyTorch CPU |
-|-----------|----:|----:|-------------:|------------:|
-| 224x224 | 0.59s | 0.53s | **0.54s** | 0.67s |
-| 512x384 | 1.95s | 1.55s | **1.44s** | 2.26s |
-| Weight load | **0.6s** | 0.6s | 0.6s | 1.6s |
+| Resolution | Peregrine CPU | Peregrine GPU+Pipeline | PyTorch CPU |
+|-----------|----:|-------------:|------------:|
+| 224x224 | 0.59s | **0.54s** | 0.67s |
+| 512x384 | 1.95s | **1.44s** | 2.26s |
 
-- **224**: Peregrine is **12% faster** on CPU (0.59s vs 0.67s), **22% faster** with GPU (0.53s)
-- **512**: Peregrine is **13% faster** on CPU (1.95s vs 2.26s), **36% faster** with GPU+Pipeline (1.44s)
-- **NEON vectorized**: floor/ceil/round/sign 5-6x speedup, comparison ops 6-7x speedup via NEON intrinsics
-- **Weight loading**: Peregrine is **2.7x faster** (0.6s vs 1.6s)
+12-36% faster than PyTorch on CPU, up to 36% faster with Metal GPU pipeline. See [`examples/must3r/`](examples/must3r/) for details.
 
-GPU mode (`--gpu`) keeps the entire attention pipeline on Metal — QKV reshape, 2D RoPE, scaled dot-product attention, and output reshape all run as GPU kernels with no CPU round-trips. Pipeline mode (`--pipeline`) overlaps feat1 (GPU) and feat2 (CPU/AMX) decoder processing via `MTLSharedEvent` signaling — single-threaded, no `Send`/`Sync` needed.
-
-### Multi-View Reconstruction Pipeline
-
-`scripts/reconstruct_video.py` extracts frames from video, runs all-pairs MUSt3R inference via Peregrine, then jointly optimizes camera poses and fuses pointmaps into a coherent 3D reconstruction. Supports server mode for persistent weight loading, parallel workers for multi-process inference, and optional Metal GPU acceleration.
-
-```
-python3 scripts/reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all --workers 4
-```
-
-| Mode | Pairs | Inference (12 frames) |
-|------|------:|----------------------:|
-| consecutive | 11 | ~7s (224) |
-| dense | 31 | ~21s (224) |
-| all | 67 | ~45s (224), ~3min (512) |
-
-Server mode (`--server` flag on the Rust binary) loads weights once and processes pairs over stdin/stdout, eliminating ~0.5s overhead per pair. Parallel workers (`--workers N`) distribute pairs across N server processes for near-linear wall-clock scaling.
-
-| Optimization | Impact |
-|-------------|--------|
-| Hand-tuned NEON intrinsics | 24 vectorized kernels — 4-6x speedup on elementwise ops |
-| Cephes-style polynomial exp | Fast exp/sigmoid/tanh/gelu via NEON float32x4_t |
-| NEON Adam optimizer | Vectorized Adam step with fast rsqrt approximation |
-| CPU buffer pool | Thread-local size-bucketed pool — eliminates malloc on elementwise ops |
-| Pool bypass for small tensors | Skip HashMap overhead for tensors < 1024 elements |
-| Rayon threshold tuning | Dual thresholds (500K cheap / 100K expensive) — avoids spawn overhead |
-| Apple Accelerate BLAS | ~10x faster matmul and 1x1 conv2d |
-| Int8 quantized inference | Per-column symmetric weight quantization, per-row dynamic activation quantization, NEON i8 GEMM (vmull+vpadalq, 16 MACs/iter, 4-row blocking), Metal dequant matmul (scalar 16×16 + simdgroup 32×32) |
-| 2:4 structured sparsity | Prune to 2:4 pattern (keep 2 largest-abs per group of 4), nibble-packed indices, NEON sparse GEMM, Metal sparse matmul (scalar + simdgroup 32×32 with shared memory expansion), 1.78x bandwidth reduction |
-| Metal GPU backend | 108 compute shaders with fused op pipelines (matmul+bias+gelu, add+layernorm, double-buffered matmul, int8 dequant matmul, 2:4 sparse matmul), causal masked SDPA with GQA support, command batching, full autograd integration, GPU-resident attention (QKV reshape, RoPE2D, SDPA), and heterogeneous GPU+CPU scheduling via MTLSharedEvent |
+See [`benchmarks/BENCHMARKS.md`](benchmarks/BENCHMARKS.md) for detailed results and methodology.
 
 ---
 
