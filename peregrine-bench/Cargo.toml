@@ -10,10 +10,10 @@ path = "src/main.rs"
 
 [features]
 default = []
-metal = ["peregrine/metal"]
+metal = ["peregrine-ml/metal"]
 
 [dependencies]
-peregrine = { package = "peregrine-ml", path = ".." }
+peregrine-ml = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"

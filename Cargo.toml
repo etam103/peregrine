@@ -13,6 +13,9 @@ keywords = ["deep-learning", "machine-learning", "tensor", "autograd", "neural-n
 categories = ["science", "mathematics"]
 readme = "README.md"
 
+[lib]
+name = "peregrine"
+
 [features]
 default = []
 metal = ["objc2", "objc2-foundation", "objc2-metal"]
