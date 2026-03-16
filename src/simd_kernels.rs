@@ -797,38 +797,69 @@ pub fn vec_elu_backward_f32(input: &[f32], grad: &[f32], alpha: f32, out: &mut [
     }
 }
 
+/// Fast exp for sigmoid: 4th-order polynomial, no range clamp.
+/// For sigmoid use only: exp overflow → inf, sigmoid(x/(1+inf)) → 0, correct.
+/// exp underflow → 0, sigmoid(x/(1+0)) → x, correct for x>0.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn fast_exp_sigmoid_f32x4(x: float32x4_t) -> float32x4_t {
+    let log2e = vdupq_n_f32(1.4426950409);
+    let ln2_hi = vdupq_n_f32(0.6931471806);
+    let ln2_lo = vdupq_n_f32(1.1730463525e-7);
+    let t = vmulq_f32(x, log2e);
+    let n = vrndnq_f32(t);
+    let r = vsubq_f32(vsubq_f32(x, vmulq_f32(n, ln2_hi)), vmulq_f32(n, ln2_lo));
+    // 4th-order Horner: 1 + r + r^2/2 + r^3/6 + r^4/24
+    let p2 = vdupq_n_f32(0.5);
+    let p3 = vdupq_n_f32(0.16666666);
+    let p4 = vdupq_n_f32(0.041666666);
+    let mut y = vmlaq_f32(p3, p4, r);
+    y = vmlaq_f32(p2, y, r);
+    y = vmlaq_f32(vdupq_n_f32(1.0), y, r);
+    y = vmlaq_f32(vdupq_n_f32(1.0), y, r);
+    let ni = vcvtq_s32_f32(n);
+    let pow2n = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(ni, vdupq_n_s32(127))));
+    vmulq_f32(y, pow2n)
+}
+
 /// silu: out[i] = x * sigmoid(x)
+/// 4x unrolled (16 elements/iteration) to hide FDIV latency.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn vec_silu_f32(a: &[f32], out: &mut [f32]) {
     let len = a.len();
     debug_assert_eq!(len, out.len());
-    let chunks8 = len / 8;
+    let chunks16 = len / 16;
     unsafe {
         let one = vdupq_n_f32(1.0);
         let ap = a.as_ptr();
         let op = out.as_mut_ptr();
-        for i in 0..chunks8 {
-            let off = i * 8;
+        for i in 0..chunks16 {
+            let off = i * 16;
             let vx0 = vld1q_f32(ap.add(off));
             let vx1 = vld1q_f32(ap.add(off + 4));
-            let neg0 = vnegq_f32(vx0);
-            let neg1 = vnegq_f32(vx1);
-            let exp0 = fast_exp_f32x4(neg0);
-            let exp1 = fast_exp_f32x4(neg1);
-            let sig0 = vdivq_f32(one, vaddq_f32(one, exp0));
-            let sig1 = vdivq_f32(one, vaddq_f32(one, exp1));
-            vst1q_f32(op.add(off), vmulq_f32(vx0, sig0));
-            vst1q_f32(op.add(off + 4), vmulq_f32(vx1, sig1));
+            let vx2 = vld1q_f32(ap.add(off + 8));
+            let vx3 = vld1q_f32(ap.add(off + 12));
+            let exp0 = fast_exp_sigmoid_f32x4(vnegq_f32(vx0));
+            let exp1 = fast_exp_sigmoid_f32x4(vnegq_f32(vx1));
+            let exp2 = fast_exp_sigmoid_f32x4(vnegq_f32(vx2));
+            let exp3 = fast_exp_sigmoid_f32x4(vnegq_f32(vx3));
+            let d0 = vaddq_f32(one, exp0);
+            let d1 = vaddq_f32(one, exp1);
+            let d2 = vaddq_f32(one, exp2);
+            let d3 = vaddq_f32(one, exp3);
+            vst1q_f32(op.add(off),      vdivq_f32(vx0, d0));
+            vst1q_f32(op.add(off + 4),  vdivq_f32(vx1, d1));
+            vst1q_f32(op.add(off + 8),  vdivq_f32(vx2, d2));
+            vst1q_f32(op.add(off + 12), vdivq_f32(vx3, d3));
         }
-        // Handle remaining chunk of 4 if len % 8 >= 4
-        if chunks8 * 8 + 4 <= len {
-            let off = chunks8 * 8;
+        // Handle remaining in chunks of 4
+        let mut off = chunks16 * 16;
+        while off + 4 <= len {
             let vx = vld1q_f32(ap.add(off));
-            let neg_x = vnegq_f32(vx);
-            let exp_neg_x = fast_exp_f32x4(neg_x);
-            let sigmoid = vdivq_f32(one, vaddq_f32(one, exp_neg_x));
-            vst1q_f32(op.add(off), vmulq_f32(vx, sigmoid));
+            let exp_neg = fast_exp_sigmoid_f32x4(vnegq_f32(vx));
+            vst1q_f32(op.add(off), vdivq_f32(vx, vaddq_f32(one, exp_neg)));
+            off += 4;
         }
     }
     let tail_start = (len / 4) * 4;

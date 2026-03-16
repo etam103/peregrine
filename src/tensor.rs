@@ -6069,6 +6069,8 @@ impl Tensor {
 
     /// SiLU (Swish): x * sigmoid(x).
     pub fn silu(&self) -> Tensor {
+        #[cfg(feature = "metal")]
+        self.sync_gpu_to_cpu();
         let inner = self.0.borrow();
         let len = inner.data.len();
         let mut data = pool_get(len);
