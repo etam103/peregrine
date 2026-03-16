@@ -38,10 +38,10 @@ extern "C" {
         lda: *const i32, tau: *const f32, work: *mut f32, lwork: *const i32,
         info: *mut i32,
     );
-    fn ssyev_(
+    fn ssyevd_(
         jobz: *const u8, uplo: *const u8, n: *const i32, a: *mut f32,
         lda: *const i32, w: *mut f32, work: *mut f32, lwork: *const i32,
-        info: *mut i32,
+        iwork: *mut i32, liwork: *const i32, info: *mut i32,
     );
     fn strtrs_(
         uplo: *const u8, trans: *const u8, diag: *const u8, n: *const i32,
@@ -390,25 +390,31 @@ pub fn eigh(a: &Tensor) -> (Tensor, Tensor) {
     let jobz = b'V'; // compute eigenvalues and eigenvectors
     let uplo = b'U';
 
-    // Workspace query
+    // Workspace query (ssyevd: divide-and-conquer, much faster for n>64)
     let mut work_query = vec![0.0f32; 1];
+    let mut iwork_query = vec![0i32; 1];
     let lwork_query: i32 = -1;
+    let liwork_query: i32 = -1;
     unsafe {
-        ssyev_(
+        ssyevd_(
             &jobz, &uplo, &n, a_data.as_mut_ptr(), &n,
-            w.as_mut_ptr(), work_query.as_mut_ptr(), &lwork_query, &mut info,
+            w.as_mut_ptr(), work_query.as_mut_ptr(), &lwork_query,
+            iwork_query.as_mut_ptr(), &liwork_query, &mut info,
         );
     }
     let lwork = work_query[0] as i32;
+    let liwork = iwork_query[0];
     let mut work = vec![0.0f32; lwork as usize];
+    let mut iwork = vec![0i32; liwork as usize];
 
     unsafe {
-        ssyev_(
+        ssyevd_(
             &jobz, &uplo, &n, a_data.as_mut_ptr(), &n,
-            w.as_mut_ptr(), work.as_mut_ptr(), &lwork, &mut info,
+            w.as_mut_ptr(), work.as_mut_ptr(), &lwork,
+            iwork.as_mut_ptr(), &liwork, &mut info,
         );
     }
-    assert!(info == 0, "LAPACK ssyev failed with info={}", info);
+    assert!(info == 0, "LAPACK ssyevd failed with info={}", info);
 
     // a_data now contains eigenvectors in columns (column-major)
     transpose_buf(&mut a_data, n as usize, n as usize);
