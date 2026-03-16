@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --release --lib
+
+      - name: Build with Metal
+        run: cargo build --release --features metal
+
+      - name: Test with Metal
+        run: cargo test --release --features metal --lib
+
+      - name: Build examples
+        run: |
+          cargo build --release --example mnist
+          cargo build --release --example must3r
+          cargo build --release --example llama
+
+  clippy:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings --allow clippy::too-many-arguments --allow clippy::needless-range-loop --allow clippy::manual-range-contains --allow clippy::type-complexity --allow clippy::collapsible-if --allow clippy::collapsible-else-if --allow dead_code --allow unused_variables --allow unused_assignments --allow unused_imports --allow unused_mut

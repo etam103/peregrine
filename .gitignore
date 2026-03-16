@@ -1,11 +1,43 @@
+# Build artifacts
 /target
+*.so
+*.dylib
+
+# Data and weights
 /runs
 /data
-.env
-*.claude/worktrees/
-.claude/worktrees/
-vids/
 weights/
+vids/
+
+# Python
 __pycache__/
-.DS_Store
 *.pyc
+*.pyo
+.venv/
+
+# Environment
+.env
+.DS_Store
+
+# Claude Code worktrees
+.claude/worktrees/
+
+# Debug/output artifacts
+*.bin
+must3r_output.bin
+must3r_*.png
+must3r_*.html
+debug_*.png
+rl_*.html
+rl_*.mp4
+
+# Autoresearch
+autoresearch/results.tsv
+run.log
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

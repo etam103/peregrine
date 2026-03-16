@@ -5,6 +5,13 @@ members = [".", "peregrine-py", "peregrine-bench"]
 name = "peregrine"
 version = "0.11.0"
 edition = "2021"
+license = "MIT"
+description = "A from-scratch deep learning library in Rust — tensors, autograd, NEON SIMD, Metal GPU, and working models"
+repository = "https://github.com/etam103/peregrine"
+homepage = "https://github.com/etam103/peregrine"
+keywords = ["deep-learning", "machine-learning", "tensor", "autograd", "neural-network"]
+categories = ["science", "mathematics"]
+readme = "README.md"
 
 [features]
 default = []
