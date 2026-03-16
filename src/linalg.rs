@@ -39,6 +39,11 @@ extern "C" {
         lda: *const i32, w: *mut f32, work: *mut f32, lwork: *const i32,
         iwork: *mut i32, liwork: *const i32, info: *mut i32,
     );
+    fn ssyev_(
+        jobz: *const u8, uplo: *const u8, n: *const i32, a: *mut f32,
+        lda: *const i32, w: *mut f32, work: *mut f32, lwork: *const i32,
+        info: *mut i32,
+    );
     fn strtrs_(
         uplo: *const u8, trans: *const u8, diag: *const u8, n: *const i32,
         nrhs: *const i32, a: *const f32, lda: *const i32, b: *mut f32,
@@ -399,7 +404,7 @@ pub fn eigh(a: &Tensor) -> (Tensor, Tensor) {
     let jobz = b'V'; // compute eigenvalues and eigenvectors
     let uplo = b'U';
 
-    // Workspace query (ssyevd: divide-and-conquer, much faster for n>64)
+    // Use divide-and-conquer (ssyevd) — faster than QR iteration (ssyev) at all sizes
     let mut work_query = vec![0.0f32; 1];
     let mut iwork_query = vec![0i32; 1];
     let lwork_query: i32 = -1;
@@ -415,7 +420,6 @@ pub fn eigh(a: &Tensor) -> (Tensor, Tensor) {
     let liwork = iwork_query[0];
     let mut work = vec![0.0f32; lwork as usize];
     let mut iwork = vec![0i32; liwork as usize];
-
     unsafe {
         ssyevd_(
             &jobz, &uplo, &n, a_data.as_mut_ptr(), &n,
