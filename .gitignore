@@ -19,6 +19,14 @@ __pycache__/
 .env
 .DS_Store
 
+# LaTeX artifacts
+*.aux
+*.log
+*.out
+paper*.pdf
+paper*.tex
+missfont.log
+
 # Internal notes
 TODO.md
 Journal.md
