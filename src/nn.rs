@@ -869,46 +869,72 @@ impl LSTM {
             let mut c_data = c0.data();
             let is = self.input_size;
             let mut output_data = pool_get(seq_len * hs);
-            let mut gates = vec![0.0f32; 4 * hs];
+            let gate_len = 4 * hs;
 
-            // Batched input projection: x[seq_len, is] @ W_ih[is, 4*hs] = ih_all[seq_len, 4*hs]
-            // This reduces sgemm calls from 2*seq_len to 1 + seq_len
+            // Batched input projection with fused bias:
+            // gate_buf[t] = x[t] @ W_ih + bih + bhh
+            // Pre-fill each timestep row with bih+bhh, then sgemm(beta=1)
             #[cfg(target_os = "macos")]
-            let ih_all = {
-                let mut buf = vec![0.0f32; seq_len * 4 * hs];
-                crate::tensor::sgemm(false, false, seq_len, 4*hs, is, 1.0, &x_data, is, &wih, 4*hs, 0.0, &mut buf, 4*hs);
+            let mut gate_buf = {
+                let mut buf = pool_get(seq_len * gate_len);
+                // Fill first row with bih + bhh
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    use std::arch::aarch64::*;
+                    let chunks = gate_len / 4;
+                    for c in 0..chunks {
+                        let off = c * 4;
+                        vst1q_f32(buf.as_mut_ptr().add(off),
+                            vaddq_f32(vld1q_f32(bih.as_ptr().add(off)), vld1q_f32(bhh.as_ptr().add(off))));
+                    }
+                    for j in (chunks * 4)..gate_len { buf[j] = bih[j] + bhh[j]; }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                for j in 0..gate_len { buf[j] = bih[j] + bhh[j]; }
+                // Replicate first row to all subsequent rows
+                for t in 1..seq_len {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            buf.as_ptr(),
+                            buf.as_mut_ptr().add(t * gate_len),
+                            gate_len,
+                        );
+                    }
+                }
+                crate::tensor::sgemm(false, false, seq_len, gate_len, is, 1.0, &x_data, is, &wih, gate_len, 1.0, &mut buf, gate_len);
                 buf
             };
+            #[cfg(not(target_os = "macos"))]
+            let mut gate_buf = vec![0.0f32; gate_len];
+
+            // Cache raw pointers for the hot loop to avoid per-iteration bounds checks
+            #[cfg(target_os = "macos")]
+            let (whh_ptr, gate_ptr) = (whh.as_ptr(), gate_buf.as_mut_ptr());
+            let out_ptr: *mut f32 = output_data.as_mut_ptr();
 
             for t in 0..seq_len {
-                // gates = ih_all[t] + b_ih + b_hh + h @ W_hh
-                // Fused: pre-fill gates with ih_t + biases, then sgemm(beta=1) accumulates h@W_hh
+                // Accumulate h @ W_hh directly into gate_buf[t]
+                // Use raw pointers + direct cblas call to minimize Rust overhead
                 #[cfg(target_os = "macos")]
                 {
-                    let ih_t = &ih_all[t * 4 * hs..(t + 1) * 4 * hs];
-                    // Pre-fill gates with ih_t + bih + bhh
-                    #[cfg(target_arch = "aarch64")]
+                    extern "C" {
+                        fn cblas_sgemm(
+                            order: i32, transA: i32, transB: i32,
+                            M: i32, N: i32, K: i32,
+                            alpha: f32, A: *const f32, lda: i32,
+                            B: *const f32, ldb: i32,
+                            beta: f32, C: *mut f32, ldc: i32,
+                        );
+                    }
                     unsafe {
-                        use std::arch::aarch64::*;
-                        let gate_chunks = (4 * hs) / 4;
-                        for c in 0..gate_chunks {
-                            let off = c * 4;
-                            let v = vaddq_f32(
-                                vld1q_f32(ih_t.as_ptr().add(off)),
-                                vaddq_f32(vld1q_f32(bih.as_ptr().add(off)), vld1q_f32(bhh.as_ptr().add(off)))
-                            );
-                            vst1q_f32(gates.as_mut_ptr().add(off), v);
-                        }
-                        for j in (gate_chunks * 4)..4*hs {
-                            gates[j] = ih_t[j] + bih[j] + bhh[j];
-                        }
+                        cblas_sgemm(
+                            101, 111, 111,
+                            1, gate_len as i32, hs as i32,
+                            1.0, h_data.as_ptr(), hs as i32,
+                            whh_ptr, gate_len as i32,
+                            1.0, gate_ptr.add(t * gate_len), gate_len as i32,
+                        );
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    for j in 0..4*hs {
-                        gates[j] = ih_t[j] + bih[j] + bhh[j];
-                    }
-                    // h[1,hs] @ W_hh[hs,4hs] with beta=1 to accumulate onto gates
-                    crate::tensor::sgemm(false, false, 1, 4*hs, hs, 1.0, &h_data, hs, &whh, 4*hs, 1.0, &mut gates, 4*hs);
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -917,10 +943,14 @@ impl LSTM {
                         let mut v = bih[j] + bhh[j];
                         for p in 0..is { v += x_t[p] * wih[p * 4 * hs + j]; }
                         for p in 0..hs { v += h_data[p] * whh[p * 4 * hs + j]; }
-                        gates[j] = v;
+                        gate_buf[j] = v;
                     }
                 }
                 // Apply activations and update c, h
+                #[cfg(target_os = "macos")]
+                let gates_ptr = unsafe { gate_buf.as_ptr().add(t * gate_len) };
+                #[cfg(not(target_os = "macos"))]
+                let gates_ptr = gate_buf.as_ptr();
                 #[cfg(target_arch = "aarch64")]
                 {
                     use std::arch::aarch64::*;
@@ -931,10 +961,10 @@ impl LSTM {
                         for c in 0..chunks {
                             let off = c * 4;
                             // Load gates
-                            let vi = vld1q_f32(gates.as_ptr().add(off));
-                            let vf = vld1q_f32(gates.as_ptr().add(hs + off));
-                            let vg = vld1q_f32(gates.as_ptr().add(2 * hs + off));
-                            let vo = vld1q_f32(gates.as_ptr().add(3 * hs + off));
+                            let vi = vld1q_f32(gates_ptr.add(off));
+                            let vf = vld1q_f32(gates_ptr.add(hs + off));
+                            let vg = vld1q_f32(gates_ptr.add(2 * hs + off));
+                            let vo = vld1q_f32(gates_ptr.add(3 * hs + off));
                             // Sigmoid: 1 / (1 + exp(-x))
                             let ig = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vi))));
                             let fg = vdivq_f32(one, vaddq_f32(one, crate::simd_kernels::fast_exp_f32x4(vnegq_f32(vf))));
@@ -952,10 +982,10 @@ impl LSTM {
                             vst1q_f32(h_data.as_mut_ptr().add(off), vmulq_f32(og, tanh_c));
                         }
                         for j in (chunks * 4)..hs {
-                            let ig = 1.0 / (1.0 + (-gates[j]).exp());
-                            let fg = 1.0 / (1.0 + (-gates[hs + j]).exp());
-                            let gg = gates[2*hs + j].tanh();
-                            let og = 1.0 / (1.0 + (-gates[3*hs + j]).exp());
+                            let ig = 1.0 / (1.0 + (-*gates_ptr.add(j)).exp());
+                            let fg = 1.0 / (1.0 + (-*gates_ptr.add(hs + j)).exp());
+                            let gg = (*gates_ptr.add(2*hs + j)).tanh();
+                            let og = 1.0 / (1.0 + (-*gates_ptr.add(3*hs + j)).exp());
                             c_data[j] = fg * c_data[j] + ig * gg;
                             h_data[j] = og * c_data[j].tanh();
                         }
@@ -964,15 +994,17 @@ impl LSTM {
                 #[cfg(not(target_arch = "aarch64"))]
                 {
                     for j in 0..hs {
-                        let ig = 1.0 / (1.0 + (-gates[j]).exp());
-                        let fg = 1.0 / (1.0 + (-gates[hs + j]).exp());
-                        let gg = gates[2*hs + j].tanh();
-                        let og = 1.0 / (1.0 + (-gates[3*hs + j]).exp());
+                        let ig = 1.0 / (1.0 + (-unsafe{*gates_ptr.add(j)}).exp());
+                        let fg = 1.0 / (1.0 + (-unsafe{*gates_ptr.add(hs + j)}).exp());
+                        let gg = (unsafe{*gates_ptr.add(2*hs + j)}).tanh();
+                        let og = 1.0 / (1.0 + (-unsafe{*gates_ptr.add(3*hs + j)}).exp());
                         c_data[j] = fg * c_data[j] + ig * gg;
                         h_data[j] = og * c_data[j].tanh();
                     }
                 }
-                output_data[t * hs..(t + 1) * hs].copy_from_slice(&h_data[..hs]);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(h_data.as_ptr(), out_ptr.add(t * hs), hs);
+                }
             }
             let output = Tensor::new(output_data, vec![seq_len, hs], false);
             let h_out = Tensor::new(h_data, vec![1, hs], false);
