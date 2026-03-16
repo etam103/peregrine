@@ -1,7 +1,7 @@
 /// Core GQA attention with KV cache, masking, and BLAS-accelerated score computation.
 ///
 /// Extracted from identical patterns in grok1 and gpt_oss examples.
-
+///
 /// KV cache for autoregressive generation.
 /// Layout: k/v are [num_kv_heads, capacity, head_dim] contiguous, with `len` tracking
 /// actual used tokens. Pre-allocates capacity to avoid per-token reallocation.
