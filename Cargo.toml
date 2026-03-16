@@ -2,7 +2,7 @@
 members = [".", "peregrine-py", "peregrine-bench"]
 
 [package]
-name = "peregrine"
+name = "peregrine-ml"
 version = "0.32.0"
 edition = "2021"
 license = "MIT"
