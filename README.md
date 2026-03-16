@@ -6,10 +6,10 @@
 
 Tensors, reverse-mode autograd, neural network layers, optimizers, and working models — built from `f32` arrays and first principles.
 
+[![crates.io](https://img.shields.io/crates/v/peregrine-ml)](https://crates.io/crates/peregrine-ml)
 [![GitHub Repo stars](https://img.shields.io/github/stars/etam103/peregrine)](https://github.com/etam103/peregrine/stargazers)
-[![Build](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Rust](https://img.shields.io/badge/rust-2021-orange)]()
-[![License](https://img.shields.io/badge/license-MIT-blue)]()
+[![Build](https://github.com/etam103/peregrine/actions/workflows/ci.yml/badge.svg)](https://github.com/etam103/peregrine/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 **Platform:** macOS on Apple Silicon (M1/M2/M3/M4). Uses Apple Accelerate for BLAS/FFT/vForce, NEON SIMD intrinsics, and optional Metal GPU compute.
 
