@@ -3,7 +3,7 @@ members = [".", "peregrine-py", "peregrine-bench"]
 
 [package]
 name = "peregrine"
-version = "0.11.0"
+version = "0.32.0"
 edition = "2021"
 license = "MIT"
 description = "A from-scratch deep learning library in Rust — tensors, autograd, NEON SIMD, Metal GPU, and working models"
