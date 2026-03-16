@@ -15,10 +15,6 @@ extern "C" {
         m: *const i32, n: *const i32, a: *mut f32, lda: *const i32,
         ipiv: *mut i32, info: *mut i32,
     );
-    fn sgetri_(
-        n: *const i32, a: *mut f32, lda: *const i32, ipiv: *const i32,
-        work: *mut f32, lwork: *const i32, info: *mut i32,
-    );
     fn spotrf_(
         uplo: *const u8, n: *const i32, a: *mut f32, lda: *const i32,
         info: *mut i32,
@@ -138,46 +134,40 @@ pub fn solve(_a: &Tensor, _b: &Tensor) -> Tensor {
     panic!("linalg::solve requires macOS Accelerate framework");
 }
 
-/// Matrix inverse via LU factorisation.
+/// Matrix inverse via `sgesv` (LU factorisation + triangular solve in one call).
+///
+/// Avoids separate sgetrf+sgetri (and its workspace allocation) by solving A*X = I.
+/// Skips row-major/column-major transposes: LAPACK sees row-major A as A^T,
+/// solves A^T * X = I giving X = inv(A^T) in column-major, which read as row-major
+/// is inv(A^T)^T = inv(A).
 #[cfg(target_os = "macos")]
 pub fn inv(a: &Tensor) -> Tensor {
     let shape = a.shape();
     assert!(shape.len() == 2 && shape[0] == shape[1], "inv requires square matrix");
     let n = shape[0] as i32;
+    let nu = n as usize;
 
-    let mut data = a.data();
-    transpose_buf(&mut data, n as usize, n as usize);
+    // Clone A (sgesv overwrites it with LU factors)
+    let mut a_data = a.data();
 
-    let mut ipiv = vec![0i32; n as usize];
+    // Build identity matrix (column-major = row-major for I)
+    let mut b_data = vec![0.0f32; nu * nu];
+    for i in 0..nu {
+        b_data[i * nu + i] = 1.0;
+    }
+
+    let mut ipiv = vec![0i32; nu];
     let mut info = 0i32;
 
     unsafe {
-        sgetrf_(&n, &n, data.as_mut_ptr(), &n, ipiv.as_mut_ptr(), &mut info);
-    }
-    assert!(info == 0, "LAPACK sgetrf failed with info={}", info);
-
-    // Query optimal workspace
-    let mut work_query = vec![0.0f32; 1];
-    let lwork_query: i32 = -1;
-    unsafe {
-        sgetri_(
-            &n, data.as_mut_ptr(), &n, ipiv.as_ptr(),
-            work_query.as_mut_ptr(), &lwork_query, &mut info,
+        sgesv_(
+            &n, &n, a_data.as_mut_ptr(), &n,
+            ipiv.as_mut_ptr(), b_data.as_mut_ptr(), &n, &mut info,
         );
     }
-    let lwork = work_query[0] as i32;
-    let mut work = vec![0.0f32; lwork as usize];
+    assert!(info == 0, "LAPACK sgesv failed with info={}", info);
 
-    unsafe {
-        sgetri_(
-            &n, data.as_mut_ptr(), &n, ipiv.as_ptr(),
-            work.as_mut_ptr(), &lwork, &mut info,
-        );
-    }
-    assert!(info == 0, "LAPACK sgetri failed with info={}", info);
-
-    transpose_buf(&mut data, n as usize, n as usize);
-    Tensor::new(data, shape.to_vec(), false)
+    Tensor::new(b_data, shape.to_vec(), false)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -191,17 +181,12 @@ pub fn cholesky(a: &Tensor) -> Tensor {
     let shape = a.shape();
     assert!(shape.len() == 2 && shape[0] == shape[1], "cholesky requires square matrix");
     let n = shape[0] as i32;
-    let nu = n as usize;
 
     let mut data = a.data();
-    // A is symmetric so row-major data = column-major data (A^T = A).
-    // Use uplo='U': LAPACK computes U in column-major upper triangle.
-    // Column-major upper triangle positions (j*n+i, i<=j) correspond to
-    // row-major lower triangle (row=j, col=i, col<=row), and the values
-    // are U[i][j] read as (row=j,col=i) = L[j][i] since L = U^T.
-    // Result: L already sits in the row-major lower triangle — no transpose needed.
+    // Symmetric: A = A^T, so skip input transpose
+    // But use uplo='L' to tell LAPACK to read lower triangle of column-major = upper of row-major
 
-    let uplo = b'U';
+    let uplo = b'L';
     let mut info = 0i32;
 
     unsafe {
@@ -209,13 +194,15 @@ pub fn cholesky(a: &Tensor) -> Tensor {
     }
     assert!(info == 0, "LAPACK spotrf failed with info={} (matrix not positive definite?)", info);
 
-    // Zero upper triangle in row-major (positions i*n+j where j > i)
-    for i in 0..nu {
-        for j in (i + 1)..nu {
-            data[i * nu + j] = 0.0;
+    // Zero upper triangle in column-major (= lower in row-major that LAPACK didn't touch)
+    for i in 0..n as usize {
+        for j in (i + 1)..n as usize {
+            data[j * n as usize + i] = 0.0;
         }
     }
 
+    // Transpose result from column-major to row-major
+    transpose_buf(&mut data, n as usize, n as usize);
     Tensor::new(data, shape.to_vec(), false)
 }
 
