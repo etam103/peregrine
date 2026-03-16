@@ -1,12 +1,17 @@
 use crate::cpu_pool::{pool_get, pool_recycle};
 use crate::tensor::Tensor;
+use rayon::prelude::*;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Xoshiro256++ PRNG
 // ---------------------------------------------------------------------------
 
 static GLOBAL_STATE: Mutex<Option<Xoshiro256PlusPlus>> = Mutex::new(None);
+
+// Global counter for Philox — monotonically increasing to avoid repeats.
+static PHILOX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct Xoshiro256PlusPlus {
     s: [u64; 4],
@@ -63,39 +68,253 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Philox 4x32-10 counter-based PRNG (for parallel generation)
+// ---------------------------------------------------------------------------
+
+/// Threshold: use Philox parallel path for arrays >= this size.
+/// At 100K elements rayon overhead is too high relative to the work;
+/// parallelism pays off starting around 200K.
+const PHILOX_THRESHOLD: usize = 200_000;
+
+#[inline(always)]
+fn mulhilo32(a: u32, b: u32) -> (u32, u32) {
+    let product = (a as u64) * (b as u64);
+    (product as u32, (product >> 32) as u32)
+}
+
+/// Philox 4x32-10: takes a 4-word counter and 2-word key, returns 4 pseudo-random u32s.
+#[inline]
+fn philox_4x32_10(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
+    let mut ctr = counter;
+    let mut k = key;
+    for _ in 0..10 {
+        let (lo0, hi0) = mulhilo32(0xD2511F53, ctr[0]);
+        let (lo1, hi1) = mulhilo32(0xCD9E8D57, ctr[2]);
+        ctr = [hi1 ^ ctr[1] ^ k[0], lo1, hi0 ^ ctr[3] ^ k[1], lo0];
+        k[0] = k[0].wrapping_add(0x9E3779B9);
+        k[1] = k[1].wrapping_add(0xBB67AE85);
+    }
+    ctr
+}
+
+/// Generate `n` uniform f32 values in [0, 1) using Philox in parallel.
+fn philox_uniform_parallel(buf: &mut [f32], low: f32, high: f32) {
+    let n = buf.len();
+    // Reserve a contiguous counter range. Each Philox call produces 4 values,
+    // so we need ceil(n/4) counter slots.
+    let num_calls = (n + 3) / 4;
+    let base_counter = PHILOX_COUNTER.fetch_add(num_calls as u64, Ordering::Relaxed);
+    let key: [u32; 2] = [0x12345678, 0x9ABCDEF0];
+    let range = high - low;
+    let scale = 1.0 / (1u64 << 32) as f32;
+
+    // Process in parallel chunks via rayon.
+    const UNIFORM_CHUNK: usize = 65536;
+    buf.par_chunks_mut(UNIFORM_CHUNK).enumerate().for_each(|(chunk_idx, chunk)| {
+        let base_call = (chunk_idx * UNIFORM_CHUNK / 4) as u64;
+        let len = chunk.len();
+        let full_quads = len / 4;
+        let ptr = chunk.as_mut_ptr();
+
+        // Main loop: 4 elements per Philox call, no bounds checks needed
+        for q in 0..full_quads {
+            let ctr_val = base_counter + base_call + q as u64;
+            let counter = [ctr_val as u32, (ctr_val >> 32) as u32, 0, 0];
+            let out = philox_4x32_10(counter, key);
+            unsafe {
+                let off = q * 4;
+                *ptr.add(off)     = low + range * (out[0] as f32 * scale);
+                *ptr.add(off + 1) = low + range * (out[1] as f32 * scale);
+                *ptr.add(off + 2) = low + range * (out[2] as f32 * scale);
+                *ptr.add(off + 3) = low + range * (out[3] as f32 * scale);
+            }
+        }
+        // Handle remainder (0-3 elements)
+        let rem_start = full_quads * 4;
+        if rem_start < len {
+            let ctr_val = base_counter + base_call + full_quads as u64;
+            let counter = [ctr_val as u32, (ctr_val >> 32) as u32, 0, 0];
+            let out = philox_4x32_10(counter, key);
+            for j in 0..(len - rem_start) {
+                chunk[rem_start + j] = low + range * (out[j] as f32 * scale);
+            }
+        }
+    });
+}
+
+/// Generate `n` normal f32 values using Philox uniform generation + vectorized Box-Muller.
+/// Strategy: generate two parallel uniform buffers (u1, u2) via Philox, then apply
+/// the same vectorized Box-Muller transform that the sequential path uses.
+fn philox_normal_parallel(buf: &mut [f32], mean: f32, std: f32) {
+    let n = buf.len();
+    let alloc_n = n + (n & 1);
+    let pairs = alloc_n / 2;
+
+    // Generate u1 and u2 uniform buffers in parallel via Philox.
+    // Use different keys so they are independent streams.
+    let num_calls_per_buf = (pairs + 3) / 4;
+    let base = PHILOX_COUNTER.fetch_add(num_calls_per_buf as u64 * 2, Ordering::Relaxed);
+    let key_u1: [u32; 2] = [0xDEADBEEF, 0xCAFEBABE];
+    let key_u2: [u32; 2] = [0xFEEDFACE, 0xBAADF00D];
+    let scale = 1.0 / (1u64 << 32) as f32;
+
+    let mut u1_buf = pool_get(pairs);
+    let mut u2_buf = pool_get(pairs);
+
+    // Fill u1 and u2 in parallel (rayon join)
+    rayon::join(
+        || {
+            u1_buf.par_chunks_mut(16384).enumerate().for_each(|(ci, chunk)| {
+                let chunk_start = ci * 16384;
+                let mut i = 0;
+                while i < chunk.len() {
+                    let call_idx = (chunk_start + i) / 4;
+                    let ctr_val = base + call_idx as u64;
+                    let counter = [ctr_val as u32, (ctr_val >> 32) as u32, 0, 0];
+                    let out = philox_4x32_10(counter, key_u1);
+                    let rem = (chunk.len() - i).min(4);
+                    for j in 0..rem {
+                        let v = out[j] as f32 * scale;
+                        chunk[i + j] = v.max(1e-10); // clamp for log safety
+                    }
+                    i += 4;
+                }
+            });
+        },
+        || {
+            u2_buf.par_chunks_mut(16384).enumerate().for_each(|(ci, chunk)| {
+                let chunk_start = ci * 16384;
+                let mut i = 0;
+                while i < chunk.len() {
+                    let call_idx = (chunk_start + i) / 4;
+                    let ctr_val = base + num_calls_per_buf as u64 + call_idx as u64;
+                    let counter = [ctr_val as u32, (ctr_val >> 32) as u32, 0, 0];
+                    let out = philox_4x32_10(counter, key_u2);
+                    let rem = (chunk.len() - i).min(4);
+                    for j in 0..rem {
+                        chunk[i + j] = out[j] as f32 * scale;
+                    }
+                    i += 4;
+                }
+            });
+        },
+    );
+
+    // Apply Box-Muller in parallel chunks.
+    // Each chunk independently does: r = sqrt(-2*ln(u1)), theta = 2*PI*u2,
+    // out[2i] = mean + std*r*cos(theta), out[2i+1] = mean + std*r*sin(theta)
+    let two_pi = 2.0 * std::f32::consts::PI;
+
+    // Process in parallel: each thread handles a range of pairs
+    // We work on buf directly, treating it as pair-indexed
+    let chunk_pairs = 8192; // pairs per chunk
+    let num_chunks = (pairs + chunk_pairs - 1) / chunk_pairs;
+
+    // We need to split buf into chunks of 2*chunk_pairs elements
+    // and give each chunk the corresponding u1/u2 slices
+    buf.par_chunks_mut(chunk_pairs * 2).enumerate().for_each(|(ci, out_chunk)| {
+        let pair_start = ci * chunk_pairs;
+        let pair_end = (pair_start + chunk_pairs).min(pairs);
+        let local_pairs = pair_end - pair_start;
+        let u1_slice = &u1_buf[pair_start..pair_end];
+        let u2_slice = &u2_buf[pair_start..pair_end];
+
+        #[cfg(target_os = "macos")]
+        {
+            extern "C" {
+                fn vvlogf(r: *mut f32, x: *const f32, n: *const i32);
+                fn vvcosf(r: *mut f32, x: *const f32, n: *const i32);
+                fn vvsinf(r: *mut f32, x: *const f32, n: *const i32);
+            }
+            let np = local_pairs as i32;
+            // local buffers for this chunk
+            let mut log_buf = vec![0.0f32; local_pairs];
+            let mut theta_buf = vec![0.0f32; local_pairs];
+            let mut cos_buf = vec![0.0f32; local_pairs];
+            let mut sin_buf = vec![0.0f32; local_pairs];
+
+            log_buf.copy_from_slice(u1_slice);
+            unsafe { vvlogf(log_buf.as_mut_ptr(), log_buf.as_ptr(), &np); }
+            for i in 0..local_pairs { log_buf[i] = (-2.0 * log_buf[i]).sqrt(); }
+
+            for i in 0..local_pairs { theta_buf[i] = two_pi * u2_slice[i]; }
+            unsafe {
+                vvcosf(cos_buf.as_mut_ptr(), theta_buf.as_ptr(), &np);
+                vvsinf(sin_buf.as_mut_ptr(), theta_buf.as_ptr(), &np);
+            }
+
+            for i in 0..local_pairs {
+                let r = log_buf[i];
+                let idx = 2 * i;
+                if idx < out_chunk.len() { out_chunk[idx] = mean + std * r * cos_buf[i]; }
+                if idx + 1 < out_chunk.len() { out_chunk[idx + 1] = mean + std * r * sin_buf[i]; }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            for i in 0..local_pairs {
+                let r = (-2.0 * u1_slice[i].ln()).sqrt();
+                let theta = two_pi * u2_slice[i];
+                let idx = 2 * i;
+                if idx < out_chunk.len() { out_chunk[idx] = mean + std * r * theta.cos(); }
+                if idx + 1 < out_chunk.len() { out_chunk[idx + 1] = mean + std * r * theta.sin(); }
+            }
+        }
+    });
+
+    // Handle the case where n is odd — truncation is handled by buf being exactly n elements
+    let _ = num_chunks;
+    pool_recycle(u1_buf);
+    pool_recycle(u2_buf);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Seed the global PRNG.
 pub fn seed(s: u64) {
     *GLOBAL_STATE.lock().unwrap() = Some(Xoshiro256PlusPlus::new(s));
+    // Reset Philox counter with seed-derived value
+    PHILOX_COUNTER.store(s, Ordering::Relaxed);
 }
 
 /// Uniform random tensor in `[low, high)`.
 pub fn uniform(shape: &[usize], low: f32, high: f32, requires_grad: bool) -> Tensor {
     let n: usize = shape.iter().product();
-    let data = with_rng(|rng| {
+    let data = if n >= PHILOX_THRESHOLD {
         let mut buf = pool_get(n);
-        let range = high - low;
-        let scale = 1.0 / (1u32 << 24) as f32;
-        // Generate 2 floats per u64 for throughput
-        let pairs = n / 2;
-        for i in 0..pairs {
-            let u = rng.next_u64();
-            buf[2 * i] = low + range * ((u >> 40) as f32 * scale);
-            buf[2 * i + 1] = low + range * (((u >> 16) & 0xFFFFFF) as f32 * scale);
-        }
-        if n & 1 != 0 {
-            buf[n - 1] = low + range * rng.next_f32();
-        }
+        philox_uniform_parallel(&mut buf, low, high);
         buf
-    });
+    } else {
+        with_rng(|rng| {
+            let mut buf = pool_get(n);
+            let range = high - low;
+            let scale = 1.0 / (1u32 << 24) as f32;
+            // Generate 2 floats per u64 for throughput
+            let pairs = n / 2;
+            for i in 0..pairs {
+                let u = rng.next_u64();
+                buf[2 * i] = low + range * ((u >> 40) as f32 * scale);
+                buf[2 * i + 1] = low + range * (((u >> 16) & 0xFFFFFF) as f32 * scale);
+            }
+            if n & 1 != 0 {
+                buf[n - 1] = low + range * rng.next_f32();
+            }
+            buf
+        })
+    };
     Tensor::new(data, shape.to_vec(), requires_grad)
 }
 
 /// Normal (Gaussian) random tensor via Box-Muller.
 pub fn normal(shape: &[usize], mean: f32, std: f32, requires_grad: bool) -> Tensor {
     let n: usize = shape.iter().product();
+    if n >= PHILOX_THRESHOLD {
+        let mut buf = pool_get(n);
+        philox_normal_parallel(&mut buf, mean, std);
+        return Tensor::new(buf, shape.to_vec(), requires_grad);
+    }
     let data = with_rng(|rng| {
         let alloc_n = n + (n & 1);
         let pairs = alloc_n / 2;
