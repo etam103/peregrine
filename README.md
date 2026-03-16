@@ -55,7 +55,7 @@ pip install ./peregrine-py && python -c "import peregrine"  # Python bindings
 | **`peregrine::metal`** | Metal GPU backend — 108 compute shaders, 41 dispatch methods, fused op pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd integration, buffer pool, heterogeneous GPU+CPU scheduling, thermal-aware scheduling (`--features metal`) |
 | **`examples/mnist`** | MNIST digit classifier — MLP trained end-to-end, validates the full stack |
 | **`examples/rt_detr`** | Full RT-DETR detector — ResNet backbone, Hungarian matching, training loop, wandb logging |
-| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, 12% faster than PyTorch at 224 (0.59s vs 0.67s), 14% faster at 512 (1.95s vs 2.26s). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`reconstruct_video.py`) |
+| **`examples/must3r`** | MUSt3R 3D reconstruction — 423M param ViT-L/B, 12% faster than PyTorch at 224 (0.59s vs 0.67s), 14% faster at 512 (1.95s vs 2.26s). Server mode (`--server`) for persistent weight loading, parallel workers (`--workers N`), Metal GPU (`--gpu`) with full GPU-resident attention (27% faster than CPU at 512), heterogeneous GPU+CPU pipeline (`--pipeline`) overlaps decoder views. Multi-view pipeline with global pose optimization and point fusion (`scripts/reconstruct_video.py`) |
 | **`examples/grok1`** | Grok-1 (314B MoE) inference — 64-layer transformer with GQA (48/8 heads), 8 experts top-2, SwiGLU FFN, RoPE, RMSNorm, KV cache, SentencePiece tokenizer. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
 | **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — 61-layer transformer with MLA (Multi-head Latent Attention), compressed KV cache (512-dim latent), 256 routed experts top-8 with shared expert, YaRN RoPE, sigmoid routing with group-limited selection. `--small` mode for testing without checkpoint, `--speculative N` for speculative decoding |
 | **`peregrine::sched`** | Request scheduler for managed prefill/decode aggregation — `Priority` (Background/Normal/High), `ChunkedPrefiller`, dynamic chunk-size tuning with EMA latency tracking, `SchedulerAction`-based model-agnostic API. Supports multiple concurrent requests with priority-based interleaving |
@@ -254,10 +254,10 @@ GPU mode (`--gpu`) keeps the entire attention pipeline on Metal — QKV reshape,
 
 ### Multi-View Reconstruction Pipeline
 
-`reconstruct_video.py` extracts frames from video, runs all-pairs MUSt3R inference via Peregrine, then jointly optimizes camera poses and fuses pointmaps into a coherent 3D reconstruction. Supports server mode for persistent weight loading, parallel workers for multi-process inference, and optional Metal GPU acceleration.
+`scripts/reconstruct_video.py` extracts frames from video, runs all-pairs MUSt3R inference via Peregrine, then jointly optimizes camera poses and fuses pointmaps into a coherent 3D reconstruction. Supports server mode for persistent weight loading, parallel workers for multi-process inference, and optional Metal GPU acceleration.
 
 ```
-python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all --workers 4
+python3 scripts/reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all --workers 4
 ```
 
 | Mode | Pairs | Inference (12 frames) |
@@ -326,8 +326,6 @@ docs/             GitHub Pages benchmark dashboard
 benches/
   tensor_ops.rs   criterion benchmarks (CPU + Metal GPU)
   wallclock.rs    wall-clock comparison benchmark (JSON output)
-reconstruct_video.py  multi-view 3D reconstruction pipeline (global pose optimization + point fusion)
-visualize_must3r.py   single-pair MUSt3R visualization utility
 scripts/
   bench_compare.sh    orchestrator: builds + runs all framework benchmarks
   bench_pytorch.py    PyTorch wall-clock benchmark
@@ -336,6 +334,8 @@ scripts/
   bench_tinygrad.py   tinygrad wall-clock benchmark
   bench_jax.py        JAX wall-clock benchmark
   compare_bench.py    reads JSONs, renders markdown comparison table
+  reconstruct_video.py  multi-view 3D reconstruction pipeline (global pose optimization + point fusion)
+  visualize_must3r.py   single-pair MUSt3R visualization utility
 examples/
   mnist/          MNIST digit classifier (97.5% test accuracy)
   rt_detr/        RT-DETR training on COCO

@@ -45,7 +45,7 @@ Server mode (`--server`) loads weights once and processes pairs over stdin/stdou
 | 224x224   | ~0.57s/pair | ~0.51s/pair | 1.1x |
 | 512x384   | ~1.90s/pair | ~1.81s/pair | 1.05x |
 
-With `--workers N` in `reconstruct_video.py`, pairs are distributed across N server processes for near-linear wall-clock scaling.
+With `--workers N` in `scripts/reconstruct_video.py`, pairs are distributed across N server processes for near-linear wall-clock scaling.
 
 ### Heterogeneous GPU+CPU Pipeline (v0.22.0)
 
@@ -399,7 +399,7 @@ cargo run --example must3r --release --features metal -- weights/must3r_224.bin 
 cargo run --example must3r --release --features metal -- weights/must3r_224.bin img1.ppm img2.ppm --gpu --pipeline
 
 # Multi-view pipeline with parallel workers
-python3 reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all --workers 4
+python3 scripts/reconstruct_video.py vids/rgb.mp4 --frames 12 --resolution 512 --pairs all --workers 4
 ```
 
 ## Raw Data
