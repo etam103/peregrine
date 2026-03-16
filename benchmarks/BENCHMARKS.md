@@ -80,160 +80,160 @@ Winner column: PG=Peregrine, PT=PyTorch, TF=TensorFlow, JAX=JAX, MLX=MLX.
 
 | Framework | Wins (of 141 total ops) |
 |-----------|------------------------|
-| Peregrine | 117 |
-| PyTorch | 10 |
-| JAX | 7 |
-| TensorFlow | 5 |
-| MLX | 1 |
+| Peregrine | 128 |
+| PyTorch | 4 |
+| TensorFlow | 4 |
+| MLX | 2 |
+| JAX | 2 |
 | tinygrad | 1 |
 
-Peregrine wins 117/141 ops (83%). Geometric mean ratio vs PyTorch: 0.46x (54% faster), vs MLX: 0.33x, vs TF: 0.25x, vs JAX: 0.31x, vs tinygrad: 0.05x.
+Peregrine wins 128/141 ops (91%). Geometric mean ratio vs PyTorch: 0.44x (56% faster), vs MLX: 0.32x, vs TF: 0.24x, vs JAX: 0.29x, vs tinygrad: 0.04x. Results are minimum of 3 rounds per framework.
 
 ### Full Results
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX | Best |
 |-----------|----------:|--------:|--------:|----------:|--------:|--------:|------|
-| matmul_128x128 | 25.1 | **5.8** | 18.0 | 50.6 | 418.1 | 56.4 | PyTorch |
-| matmul_256x256 | 78.5 | **30.4** | 44.2 | 133.0 | 422.6 | 148.9 | PyTorch |
-| matmul_512x512 | 223.5 | **128.1** | 147.8 | 679.0 | 428.4 | 512.9 | PyTorch |
-| matmul_1024x1024 | **998.8** | — | — | — | — | — | Peregrine |
-| matmul_2048x2048 | **8942.0** | — | — | — | — | — | Peregrine |
-| add_100k | **13.0** | 39.0 | 31.0 | 48.9 | 186.8 | 35.6 | Peregrine |
-| add_500k | 63.9 | **57.1** | 85.9 | 83.3 | 185.0 | 58.2 | PyTorch |
-| add_1M | **132.5** | — | — | — | — | — | Peregrine |
-| add_5M | **540.9** | — | — | — | — | — | Peregrine |
-| add_10M | **844.2** | — | — | — | — | — | Peregrine |
-| mul_100k | **12.9** | 40.5 | 28.4 | 43.3 | 186.5 | 32.7 | Peregrine |
-| mul_500k | 63.5 | 72.9 | 87.4 | 72.9 | 188.8 | **60.3** | JAX |
-| mul_1M | **126.9** | — | — | — | — | — | Peregrine |
-| mul_5M | **629.1** | — | — | — | — | — | Peregrine |
-| mul_10M | **950.8** | — | — | — | — | — | Peregrine |
-| exp_100k | 43.5 | 82.2 | 60.9 | 63.2 | 219.5 | **30.8** | JAX |
-| exp_500k | **99.5** | 180.8 | 227.6 | 102.2 | 218.3 | 116.0 | Peregrine |
-| exp_1M | **188.2** | — | — | — | — | — | Peregrine |
-| exp_5M | **455.9** | — | — | — | — | — | Peregrine |
-| exp_10M | **775.6** | — | — | — | — | — | Peregrine |
-| relu_100k | **8.7** | 49.5 | 26.2 | 30.8 | 331.6 | 99.7 | Peregrine |
-| relu_1M | **82.1** | — | — | — | — | — | Peregrine |
-| softmax_8x128 | **1.1** | 36.2 | 16.0 | 11.8 | 619.7 | 43.8 | Peregrine |
-| softmax_8x512 | **4.0** | 38.5 | 20.3 | 14.2 | 619.1 | 32.9 | Peregrine |
-| mlp_fwd_64x784 | **26.2** | 27.0 | 51.4 | 216.8 | 1750.2 | 182.4 | Peregrine |
-| mlp_fwd_256x784_wide | **254.4** | — | — | — | — | — | Peregrine |
-| train_step_64 | **751.5** | 1317.2 | 804.9 | 8576.0 | 23397.6 | 5079.2 | Peregrine |
-| train_step_256_wide | **3059.7** | — | — | — | — | — | Peregrine |
-| reciprocal_100k | **8.6** | 35.8 | 24.4 | 48.3 | 163.7 | 29.9 | Peregrine |
-| square_100k | **8.7** | 34.1 | 23.4 | 16.2 | 179.5 | 28.6 | Peregrine |
-| rsqrt_100k | **21.5** | 32.3 | 30.6 | 49.0 | — | 92.9 | Peregrine |
-| floor_100k | **8.7** | 34.9 | 23.5 | 17.9 | 414.1 | 28.4 | Peregrine |
-| ceil_100k | **8.7** | 35.2 | 24.0 | 17.8 | 347.6 | 27.1 | Peregrine |
-| round_100k | **8.7** | 37.6 | 23.9 | 48.6 | — | 28.5 | Peregrine |
-| sign_100k | **8.7** | 34.6 | 27.6 | 48.9 | 793.8 | 36.2 | Peregrine |
-| expm1_100k | **63.1** | 96.2 | 109.5 | 148.5 | — | 96.2 | Peregrine |
-| log2_100k | **55.5** | 70.7 | 101.2 | 156.5 | 163.9 | 56.1 | Peregrine |
-| log10_100k | 58.0 | 70.3 | 117.0 | 144.4 | — | **56.4** | JAX |
-| log1p_100k | 75.5 | **64.5** | 129.2 | 91.4 | — | 104.3 | PyTorch |
-| erf_100k | 49.2 | **48.6** | 111.0 | 54.7 | — | 55.1 | PyTorch |
-| sinh_100k | **51.1** | 157.5 | 97.5 | 131.8 | 524.0 | 107.7 | Peregrine |
-| cosh_100k | **46.4** | 114.4 | 92.5 | 125.3 | 466.3 | 70.1 | Peregrine |
-| arcsin_100k | **52.1** | 71.7 | 97.1 | 54.6 | 2855.9 | 111.2 | Peregrine |
-| arccos_100k | 60.7 | 72.8 | 110.3 | **54.0** | — | 191.1 | TensorFlow |
-| arctan_100k | **53.1** | 74.7 | 94.6 | 59.6 | 3025.2 | 212.3 | Peregrine |
-| arcsinh_100k | 117.7 | 138.2 | 336.1 | 138.6 | — | **110.7** | JAX |
-| maximum_100k | **12.5** | 38.8 | 22.4 | 42.5 | 188.3 | 32.2 | Peregrine |
-| minimum_100k | **12.5** | 42.5 | 23.9 | 42.9 | 382.8 | 28.9 | Peregrine |
-| power_100k | 153.7 | 218.1 | 218.4 | 272.8 | — | **140.9** | JAX |
-| arctan2_100k | 58.1 | 112.2 | 146.0 | **55.4** | — | 318.1 | TensorFlow |
-| logaddexp_100k | 148.3 | **134.9** | 264.1 | 362.1 | — | 140.6 | PyTorch |
-| clip_100k | **8.7** | 39.9 | 35.1 | 42.8 | 542.7 | 36.2 | Peregrine |
-| where_100k | **16.4** | 45.0 | 27.3 | 66.5 | 278.8 | 34.8 | Peregrine |
-| greater_100k | **12.5** | 50.8 | 24.9 | 50.4 | 188.2 | 29.0 | Peregrine |
-| equal_100k | **12.5** | 38.1 | 23.2 | 59.7 | 283.5 | 27.2 | Peregrine |
-| sum_axis_256x512 | **18.8** | 46.4 | 20.1 | 48.2 | 204.8 | 53.6 | Peregrine |
-| mean_axis_256x512 | **18.8** | 40.0 | 21.4 | 51.6 | 288.1 | 52.4 | Peregrine |
-| max_axis_256x512 | **13.7** | 43.5 | 38.0 | 49.7 | 201.9 | 45.6 | Peregrine |
-| min_axis_256x512 | **13.7** | 41.8 | 38.0 | 43.9 | 324.0 | 45.5 | Peregrine |
-| var_256x512 | **45.7** | 379.2 | 54.0 | 175.0 | — | 75.9 | Peregrine |
-| prod_axis_256x512 | 24.2 | 32.1 | **21.9** | 46.4 | — | 55.4 | MLX |
-| logsumexp_256x512 | **95.5** | 211.6 | 108.6 | 288.0 | — | 276.4 | Peregrine |
-| cumsum_256x512 | **48.8** | 58.2 | 130.5 | 160.5 | 611.8 | 200.2 | Peregrine |
-| argmax_axis_256x512 | **51.7** | 72.1 | 180.4 | 54.5 | 1280.6 | 169.6 | Peregrine |
+| matmul_128x128 | **4.7** | 6.2 | 24.0 | 95.7 | 418.9 | 80.4 | Peregrine |
+| matmul_256x256 | **29.5** | 31.8 | 47.8 | 197.7 | 423.8 | 171.3 | Peregrine |
+| matmul_512x512 | **134.8** | 140.0 | 172.1 | 682.6 | 433.2 | 518.9 | Peregrine |
+| matmul_1024x1024 | **962.4** | — | — | — | — | — | Peregrine |
+| matmul_2048x2048 | **8790.7** | — | — | — | — | — | Peregrine |
+| add_100k | **12.5** | 41.1 | 32.3 | 50.1 | 190.5 | 33.4 | Peregrine |
+| add_500k | 61.6 | **57.4** | 85.8 | 84.9 | 192.2 | 61.6 | PyTorch |
+| add_1M | **125.8** | — | — | — | — | — | Peregrine |
+| add_5M | **605.6** | — | — | — | — | — | Peregrine |
+| add_10M | **904.0** | — | — | — | — | — | Peregrine |
+| mul_100k | **12.5** | 39.0 | 32.0 | 40.7 | 192.3 | 28.4 | Peregrine |
+| mul_500k | 61.6 | **57.1** | 83.5 | 74.8 | 195.4 | 59.0 | PyTorch |
+| mul_1M | **125.9** | — | — | — | — | — | Peregrine |
+| mul_5M | **528.5** | — | — | — | — | — | Peregrine |
+| mul_10M | **1049.6** | — | — | — | — | — | Peregrine |
+| exp_100k | **43.5** | 62.2 | 61.1 | 63.9 | 225.5 | 46.9 | Peregrine |
+| exp_500k | **89.5** | 137.4 | 232.4 | 102.2 | 225.8 | 117.8 | Peregrine |
+| exp_1M | **116.2** | — | — | — | — | — | Peregrine |
+| exp_5M | **408.6** | — | — | — | — | — | Peregrine |
+| exp_10M | **730.3** | — | — | — | — | — | Peregrine |
+| relu_100k | **8.5** | 38.5 | 30.5 | 39.7 | 338.9 | 97.7 | Peregrine |
+| relu_1M | **82.4** | — | — | — | — | — | Peregrine |
+| softmax_8x128 | **1.1** | 35.2 | 18.4 | 11.3 | 609.4 | 30.9 | Peregrine |
+| softmax_8x512 | **4.0** | 32.1 | 20.7 | 14.2 | 637.5 | 33.4 | Peregrine |
+| mlp_fwd_64x784 | **25.9** | 27.9 | 54.7 | 248.9 | 1753.0 | 182.1 | Peregrine |
+| mlp_fwd_256x784_wide | **309.8** | — | — | — | — | — | Peregrine |
+| train_step_64 | **746.5** | 1254.5 | 810.0 | 8443.6 | 24421.2 | 5208.6 | Peregrine |
+| train_step_256_wide | **3016.9** | — | — | — | — | — | Peregrine |
+| reciprocal_100k | **8.5** | 41.0 | 25.2 | 48.1 | 167.2 | 32.2 | Peregrine |
+| square_100k | **8.4** | 38.2 | 24.6 | 16.3 | 183.7 | 33.6 | Peregrine |
+| rsqrt_100k | **21.5** | 40.7 | 36.7 | 51.5 | — | 82.5 | Peregrine |
+| floor_100k | **8.7** | 38.3 | 24.1 | 16.3 | 430.7 | 29.3 | Peregrine |
+| ceil_100k | **8.6** | 41.2 | 23.4 | 16.2 | 368.2 | 28.0 | Peregrine |
+| round_100k | **8.7** | 40.9 | 22.8 | 43.0 | — | 30.0 | Peregrine |
+| sign_100k | **8.7** | 39.7 | 28.2 | 46.2 | 847.3 | 36.1 | Peregrine |
+| expm1_100k | **63.2** | 109.6 | 107.4 | 149.3 | — | 98.5 | Peregrine |
+| log2_100k | **55.6** | 85.6 | 97.4 | 153.1 | 163.8 | 65.7 | Peregrine |
+| log10_100k | **58.0** | 83.6 | 105.7 | 154.3 | — | 64.4 | Peregrine |
+| log1p_100k | **75.5** | 81.2 | 128.2 | 94.1 | — | 110.9 | Peregrine |
+| erf_100k | **49.1** | 57.2 | 101.0 | 57.0 | — | 57.0 | Peregrine |
+| sinh_100k | **51.1** | 135.6 | 93.6 | 133.9 | 542.5 | 124.7 | Peregrine |
+| cosh_100k | **46.4** | 128.8 | 89.5 | 135.3 | 454.5 | 71.6 | Peregrine |
+| arcsin_100k | **52.1** | 72.3 | 94.1 | 56.2 | 2981.3 | 126.1 | Peregrine |
+| arccos_100k | 60.8 | 87.9 | 110.6 | **54.8** | — | 216.9 | TensorFlow |
+| arctan_100k | **53.2** | 91.8 | 93.5 | 59.6 | 3292.2 | 220.2 | Peregrine |
+| arcsinh_100k | 117.7 | 156.5 | 332.4 | 136.6 | — | **114.6** | JAX |
+| maximum_100k | **12.5** | 36.0 | 27.8 | 44.9 | 190.8 | 33.4 | Peregrine |
+| minimum_100k | **12.5** | 37.7 | 27.7 | 40.4 | 382.3 | 32.1 | Peregrine |
+| power_100k | 153.8 | 235.7 | 211.3 | 282.3 | — | **140.7** | JAX |
+| arctan2_100k | **58.1** | 125.5 | 145.6 | 71.8 | — | 317.1 | Peregrine |
+| logaddexp_100k | **148.2** | 154.3 | 256.2 | 366.3 | — | 151.5 | Peregrine |
+| clip_100k | **8.7** | 42.6 | 35.5 | 42.6 | 545.7 | 42.5 | Peregrine |
+| where_100k | **16.4** | 49.2 | 27.2 | 66.1 | 277.9 | 34.5 | Peregrine |
+| greater_100k | **12.5** | 49.3 | 25.0 | 51.6 | 191.3 | 32.3 | Peregrine |
+| equal_100k | **12.5** | 34.9 | 24.8 | 61.2 | 296.0 | 26.2 | Peregrine |
+| sum_axis_256x512 | **18.8** | 39.7 | 23.6 | 55.8 | 208.5 | 58.4 | Peregrine |
+| mean_axis_256x512 | **18.9** | 41.6 | 24.8 | 52.3 | 299.8 | 22.2 | Peregrine |
+| max_axis_256x512 | **13.7** | 55.9 | 41.9 | 50.2 | 202.2 | 48.4 | Peregrine |
+| min_axis_256x512 | **13.7** | 56.2 | 42.0 | 48.6 | 331.0 | 51.6 | Peregrine |
+| var_256x512 | **45.7** | 271.5 | 63.1 | 209.8 | — | 89.1 | Peregrine |
+| prod_axis_256x512 | **24.2** | 36.9 | 27.1 | 53.3 | — | 54.6 | Peregrine |
+| logsumexp_256x512 | **95.5** | 194.0 | 106.8 | 335.7 | — | 287.5 | Peregrine |
+| cumsum_256x512 | **48.8** | 76.4 | 129.5 | 189.3 | 640.8 | 211.3 | Peregrine |
+| argmax_axis_256x512 | **51.8** | 96.8 | 171.6 | 67.4 | 1317.4 | 168.8 | Peregrine |
 | sum_axis_1024x1024 | **174.1** | — | — | — | — | — | Peregrine |
-| var_1024x1024 | **427.8** | — | — | — | — | — | Peregrine |
-| tril_256x256 | **7.7** | 40.7 | 52.3 | 47.1 | 1836.0 | 36.2 | Peregrine |
-| triu_256x256 | **7.6** | 34.6 | 51.9 | 45.8 | 1801.3 | 36.8 | Peregrine |
-| repeat_64x128_2x3 | **5.9** | 42.8 | 25.6 | 75.0 | — | 28.0 | Peregrine |
-| pad_64x128 | **2.5** | 4.3 | 15.5 | 83.7 | 95.6 | 18.3 | Peregrine |
-| stack_8x64x128 | **3.8** | 8.6 | 43.3 | 54.8 | 958.9 | 159.0 | Peregrine |
-| diagonal_512x512 | **0.3** | 0.6 | 25.0 | 12.4 | — | 9.7 | Peregrine |
-| silu_100k | **47.0** | 74.5 | 84.1 | 194.1 | 328.1 | 52.3 | Peregrine |
-| softplus_100k | 133.5 | 125.1 | 272.5 | **106.2** | 805.6 | 156.5 | TensorFlow |
-| mish_100k | **136.7** | 312.4 | 377.1 | 243.2 | 1173.1 | 233.0 | Peregrine |
-| leaky_relu_100k | **8.7** | 41.6 | 83.7 | 19.5 | — | 29.6 | Peregrine |
-| elu_100k | **60.0** | 341.2 | 123.5 | 132.8 | 891.0 | 77.5 | Peregrine |
-| hard_tanh_100k | **8.7** | 39.9 | 35.5 | 41.9 | — | 38.6 | Peregrine |
-| relu6_100k | **8.7** | 44.3 | 48.9 | 52.0 | 723.4 | 112.8 | Peregrine |
-| hardswish_100k | **10.0** | 44.9 | 67.8 | 212.8 | — | 26.6 | Peregrine |
-| gelu_100k | **56.3** | 64.6 | 157.4 | 240.9 | 847.6 | 218.9 | Peregrine |
-| selu_100k | **63.7** | 107.6 | 88.1 | 130.4 | 746.2 | 82.4 | Peregrine |
-| softsign_100k | **38.1** | 102.7 | 51.7 | 47.1 | — | 61.3 | Peregrine |
-| cross_entropy_64x10 | **2.5** | 32.6 | 27.0 | 618.0 | 3337.3 | 54.1 | Peregrine |
-| l1_loss_64x10 | **1.0** | 5.5 | 17.2 | 42.9 | 1110.6 | 12.2 | Peregrine |
-| mse_loss_64x10 | **3.8** | 5.1 | 19.8 | 39.1 | 443.9 | 23.6 | Peregrine |
-| huber_loss_64x10 | **0.3** | 5.0 | 38.2 | 235.0 | — | 48.0 | Peregrine |
-| smooth_l1_loss_64x10 | **0.8** | 5.2 | 36.0 | 232.6 | — | 47.9 | Peregrine |
-| kl_div_loss_64x10 | **2.5** | 6.8 | 17.6 | 373.9 | — | 61.9 | Peregrine |
-| cosine_sim_loss_64x64 | **1.8** | 10.9 | 122.9 | 236.2 | — | 71.5 | Peregrine |
-| rmsnorm_64x512 | **18.5** | 63.4 | 35.6 | 437.8 | — | 75.2 | Peregrine |
-| conv1d_1x32x128_k3 | **20.4** | 51.9 | 27.0 | 506.2 | — | 75.4 | Peregrine |
-| avgpool2d_1x16x32x32 | **25.1** | 54.6 | 270.5 | 61.9 | — | 42.4 | Peregrine |
-| groupnorm_4x64x16x16 | **21.3** | 40.7 | 229.0 | 768.9 | — | 287.3 | Peregrine |
-| rnn_seq32_128_256 | **180.2** | 265.4 | — | — | — | — | Peregrine |
-| lstm_seq32_128_256 | 1028.7 | **812.0** | — | — | — | — | PyTorch |
-| gru_seq32_128_256 | 835.2 | **787.6** | — | — | — | — | PyTorch |
-| optim_adam_64 | **746.7** | 1286.0 | — | — | — | — | Peregrine |
-| optim_rmsprop_64 | **878.5** | 1179.1 | — | — | — | — | Peregrine |
-| optim_lion_64 | **863.5** | — | — | — | — | — | Peregrine |
-| optim_adafactor_64 | **1228.3** | — | — | — | — | — | Peregrine |
-| rand_uniform_100k | **60.2** | 265.1 | 552.7 | 121.2 | 2362.6 | 541.5 | Peregrine |
-| rand_normal_100k | **236.5** | 1007.7 | 810.2 | 332.1 | 3235.5 | 614.0 | Peregrine |
-| rand_bernoulli_100k | **118.3** | 257.3 | 509.5 | 212.5 | — | 531.7 | Peregrine |
-| rand_uniform_1M | 577.8 | 2636.1 | 4661.6 | **419.7** | 3252.6 | 2281.0 | TensorFlow |
-| rand_normal_1M | **820.5** | 9818.5 | 6730.6 | 2064.1 | 3317.9 | 2891.4 | Peregrine |
-| rfft_1k | **2.2** | 4.4 | 20.5 | 42.2 | — | 24.8 | Peregrine |
-| rfft_4k | **6.5** | 14.9 | 30.4 | 53.9 | — | 70.0 | Peregrine |
-| rfft_16k | **30.3** | 65.3 | 79.0 | 103.8 | — | 117.0 | Peregrine |
-| fft_1k | **3.3** | 6.6 | 22.0 | 8.8 | — | 17.4 | Peregrine |
-| fft_4k | **12.2** | 26.2 | 39.6 | 17.5 | — | 58.7 | Peregrine |
-| norm_l2_1k | **1.1** | 1.2 | 17.6 | 69.2 | — | 3.7 | Peregrine |
-| solve_64x64 | **9.1** | 18.3 | 92.2 | 24.7 | — | 32.4 | Peregrine |
-| inv_64x64 | **14.7** | 25.8 | 51.4 | 32.5 | — | 42.5 | Peregrine |
-| cholesky_64x64 | **7.1** | 25.9 | 22.7 | 19.6 | — | 19.8 | Peregrine |
-| svd_64x64 | **274.6** | 277.8 | 295.6 | 494.0 | — | 304.5 | Peregrine |
-| qr_64x64 | **41.3** | 72.0 | 58.5 | 83.7 | — | 64.8 | Peregrine |
-| eigh_64x64 | 163.5 | 215.3 | 236.5 | **145.1** | — | 237.8 | TensorFlow |
-| det_64x64 | **11.2** | 19.4 | — | 23.1 | — | 29.0 | Peregrine |
-| solve_128x128 | **36.3** | 44.8 | 197.1 | 76.8 | — | 86.7 | Peregrine |
-| inv_128x128 | **48.5** | 59.8 | 95.7 | 138.7 | — | 82.8 | Peregrine |
-| cholesky_128x128 | **14.3** | 53.6 | 26.7 | 58.4 | — | 36.2 | Peregrine |
-| svd_128x128 | 985.1 | **980.8** | 996.9 | 1886.4 | — | 1011.3 | PyTorch |
-| qr_128x128 | **188.5** | 226.4 | 196.8 | 325.8 | — | 189.9 | Peregrine |
-| eigh_128x128 | **526.9** | 710.0 | 749.5 | 702.6 | — | 750.1 | Peregrine |
-| det_128x128 | **41.1** | 49.5 | — | 82.3 | — | 75.6 | Peregrine |
-| solve_256x256 | **111.8** | 185.5 | 922.4 | 374.6 | — | 266.1 | Peregrine |
-| inv_256x256 | **177.8** | 296.8 | 312.5 | 849.8 | — | 333.0 | Peregrine |
-| cholesky_256x256 | **46.5** | 72.7 | 79.7 | 282.2 | — | 117.2 | Peregrine |
-| svd_256x256 | 5823.8 | 5761.9 | 5877.8 | 8077.9 | — | **5756.4** | JAX |
-| qr_256x256 | 998.1 | 1006.8 | 1047.0 | 1693.0 | — | **987.0** | JAX |
-| eigh_256x256 | **2844.0** | 3472.2 | 3513.8 | 4745.8 | — | 3556.5 | Peregrine |
-| det_256x256 | **141.0** | 207.8 | — | 442.9 | — | 205.1 | Peregrine |
-| matmul_bias_gelu_196x768x3072 | **767.0** | 926.2 | — | 2595.7 | 1232.7 | 2116.3 | Peregrine |
-| matmul_bias_gelu_196x1024x4096 | 1909.6 | 2017.3 | — | 3659.9 | **1251.0** | 3359.6 | tinygrad |
-| add_layernorm_196x768 | **74.9** | 101.4 | — | 1211.0 | 1115.8 | 228.5 | Peregrine |
-| add_layernorm_196x1024 | **100.6** | 104.4 | — | 1281.4 | 1131.8 | 264.9 | Peregrine |
-| matmul_f32_196x768x3072 | **570.9** | — | — | — | — | — | Peregrine |
-| matmul_i8_196x768x3072 | **12125.1** | — | — | — | — | — | Peregrine |
-| matmul_f32_196x1024x4096 | **1422.3** | — | — | — | — | — | Peregrine |
-| matmul_i8_196x1024x4096 | **21750.5** | — | — | — | — | — | Peregrine |
+| var_1024x1024 | **427.7** | — | — | — | — | — | Peregrine |
+| tril_256x256 | **7.7** | 37.1 | 56.8 | 56.1 | 1965.2 | 37.5 | Peregrine |
+| triu_256x256 | **7.6** | 39.0 | 57.1 | 54.7 | 1915.1 | 36.3 | Peregrine |
+| repeat_64x128_2x3 | **7.2** | 46.7 | 33.6 | 75.7 | — | 28.7 | Peregrine |
+| pad_64x128 | **2.6** | 4.3 | 19.2 | 81.8 | 89.6 | 19.8 | Peregrine |
+| stack_8x64x128 | **3.8** | 8.6 | 46.9 | 56.0 | 1376.9 | 176.4 | Peregrine |
+| diagonal_512x512 | **0.4** | 0.6 | 29.6 | 12.3 | — | 9.6 | Peregrine |
+| silu_100k | **47.0** | 68.8 | 89.8 | 226.0 | 370.4 | 78.6 | Peregrine |
+| softplus_100k | 133.5 | 151.1 | 269.7 | **131.2** | 817.7 | 191.3 | TensorFlow |
+| mish_100k | **136.7** | 307.9 | 387.4 | 244.6 | 1187.1 | 258.7 | Peregrine |
+| leaky_relu_100k | **8.6** | 38.9 | 78.9 | 19.5 | — | 34.4 | Peregrine |
+| elu_100k | **60.0** | 133.5 | 123.0 | 136.9 | 869.3 | 98.3 | Peregrine |
+| hard_tanh_100k | **8.6** | 41.5 | 33.5 | 41.8 | — | 43.5 | Peregrine |
+| relu6_100k | **8.6** | 40.2 | 41.8 | 50.2 | 742.3 | 119.2 | Peregrine |
+| hardswish_100k | **10.0** | 40.7 | 65.0 | 220.3 | — | 37.4 | Peregrine |
+| gelu_100k | **56.3** | 74.0 | 146.2 | 249.2 | 844.8 | 219.3 | Peregrine |
+| selu_100k | **63.7** | 132.9 | 86.5 | 137.3 | 794.2 | 92.9 | Peregrine |
+| softsign_100k | **38.3** | 118.9 | 41.9 | 45.8 | — | 63.1 | Peregrine |
+| cross_entropy_64x10 | **2.5** | 40.1 | 24.8 | 614.7 | 3622.5 | 56.7 | Peregrine |
+| l1_loss_64x10 | **1.0** | 5.4 | 20.6 | 42.7 | 1152.8 | 12.2 | Peregrine |
+| mse_loss_64x10 | **3.5** | 4.9 | 22.9 | 38.7 | 452.9 | 24.1 | Peregrine |
+| huber_loss_64x10 | **0.3** | 4.7 | 34.8 | 238.2 | — | 48.8 | Peregrine |
+| smooth_l1_loss_64x10 | **0.8** | 5.1 | 35.0 | 236.7 | — | 48.2 | Peregrine |
+| kl_div_loss_64x10 | **2.5** | 6.3 | 20.0 | 372.4 | — | 60.6 | Peregrine |
+| cosine_sim_loss_64x64 | **1.8** | 10.3 | 104.3 | 236.0 | — | 55.8 | Peregrine |
+| rmsnorm_64x512 | **18.7** | 63.5 | 32.0 | 439.4 | — | 78.2 | Peregrine |
+| conv1d_1x32x128_k3 | **20.5** | 54.6 | 32.6 | 504.2 | — | 74.6 | Peregrine |
+| avgpool2d_1x16x32x32 | **25.1** | 44.0 | 274.9 | 65.4 | — | 46.3 | Peregrine |
+| groupnorm_4x64x16x16 | **21.4** | 52.1 | 231.0 | 754.5 | — | 271.6 | Peregrine |
+| rnn_seq32_128_256 | **180.4** | 269.0 | — | — | — | — | Peregrine |
+| lstm_seq32_128_256 | 929.6 | **810.3** | — | — | — | — | PyTorch |
+| gru_seq32_128_256 | **761.5** | 781.9 | — | — | — | — | Peregrine |
+| optim_adam_64 | **744.0** | 1269.1 | — | — | — | — | Peregrine |
+| optim_rmsprop_64 | **881.2** | 1114.9 | — | — | — | — | Peregrine |
+| optim_lion_64 | **867.1** | — | — | — | — | — | Peregrine |
+| optim_adafactor_64 | **1232.2** | — | — | — | — | — | Peregrine |
+| rand_uniform_100k | **60.2** | 257.6 | 522.1 | 126.2 | 2494.9 | 593.4 | Peregrine |
+| rand_normal_100k | **236.8** | 970.0 | 725.8 | 326.1 | 3338.5 | 651.5 | Peregrine |
+| rand_bernoulli_100k | **118.5** | 250.3 | 481.8 | 216.5 | — | 570.3 | Peregrine |
+| rand_uniform_1M | 441.6 | 2562.5 | 4684.3 | **421.1** | 2454.8 | 2448.5 | TensorFlow |
+| rand_normal_1M | **714.5** | 9694.8 | 6785.7 | 2071.0 | 3278.4 | 3002.3 | Peregrine |
+| rfft_1k | **2.2** | 4.4 | 19.0 | 42.7 | — | 60.5 | Peregrine |
+| rfft_4k | **7.3** | 14.8 | 29.5 | 54.2 | — | 64.1 | Peregrine |
+| rfft_16k | **30.3** | 65.2 | 76.6 | 104.5 | — | 121.4 | Peregrine |
+| fft_1k | **3.3** | 6.6 | 21.9 | 8.8 | — | 44.3 | Peregrine |
+| fft_4k | **12.2** | 26.4 | 39.8 | 17.3 | — | 63.4 | Peregrine |
+| norm_l2_1k | **1.1** | 1.2 | 17.7 | 68.3 | — | 4.0 | Peregrine |
+| solve_64x64 | **9.2** | 18.4 | 94.5 | 24.5 | — | 40.6 | Peregrine |
+| inv_64x64 | **15.2** | 26.6 | 47.4 | 32.8 | — | 45.4 | Peregrine |
+| cholesky_64x64 | **7.2** | 43.1 | 21.3 | 19.5 | — | 24.5 | Peregrine |
+| svd_64x64 | **274.5** | 277.0 | 289.4 | 495.5 | — | 324.1 | Peregrine |
+| qr_64x64 | **41.5** | 80.8 | 56.1 | 83.7 | — | 71.5 | Peregrine |
+| eigh_64x64 | 163.7 | 214.8 | 228.3 | **141.5** | — | 259.7 | TensorFlow |
+| det_64x64 | **11.2** | 20.8 | — | 23.1 | — | 35.2 | Peregrine |
+| solve_128x128 | **36.2** | 44.8 | 187.2 | 76.7 | — | 85.8 | Peregrine |
+| inv_128x128 | **48.5** | 62.0 | 84.6 | 139.1 | — | 89.5 | Peregrine |
+| cholesky_128x128 | **14.2** | 46.4 | 26.7 | 58.5 | — | 37.7 | Peregrine |
+| svd_128x128 | 984.5 | 987.9 | **973.1** | 1803.9 | — | 1048.9 | MLX |
+| qr_128x128 | **188.6** | 218.5 | 192.0 | 326.1 | — | 195.1 | Peregrine |
+| eigh_128x128 | **526.2** | 706.4 | 719.5 | 708.8 | — | 764.0 | Peregrine |
+| det_128x128 | **41.1** | 49.5 | — | 81.8 | — | 76.8 | Peregrine |
+| solve_256x256 | **111.8** | 173.1 | 732.6 | 378.7 | — | 266.0 | Peregrine |
+| inv_256x256 | **177.8** | 292.0 | 240.5 | 850.1 | — | 347.5 | Peregrine |
+| cholesky_256x256 | **46.4** | 73.8 | 54.1 | 281.4 | — | 121.3 | Peregrine |
+| svd_256x256 | 5854.6 | 5663.9 | **5649.0** | 8041.9 | — | 6033.3 | MLX |
+| qr_256x256 | **981.3** | 1002.2 | 1007.3 | 1694.0 | — | 1025.5 | Peregrine |
+| eigh_256x256 | **2767.6** | 3434.2 | 3451.1 | 4567.8 | — | 3621.0 | Peregrine |
+| det_256x256 | **141.3** | 202.5 | — | 430.7 | — | 207.0 | Peregrine |
+| matmul_bias_gelu_196x768x3072 | 985.6 | **849.2** | — | 2367.4 | 1316.6 | 2198.5 | PyTorch |
+| matmul_bias_gelu_196x1024x4096 | 1927.9 | 1898.7 | — | 3694.0 | **1252.7** | 3954.3 | tinygrad |
+| add_layernorm_196x768 | **72.0** | 101.0 | — | 1224.3 | 1137.2 | 259.0 | Peregrine |
+| add_layernorm_196x1024 | **97.2** | 105.9 | — | 1278.3 | 1240.4 | 287.6 | Peregrine |
+| matmul_f32_196x768x3072 | **500.7** | — | — | — | — | — | Peregrine |
+| matmul_i8_196x768x3072 | **12060.2** | — | — | — | — | — | Peregrine |
+| matmul_f32_196x1024x4096 | **1420.5** | — | — | — | — | — | Peregrine |
+| matmul_i8_196x1024x4096 | **21728.7** | — | — | — | — | — | Peregrine |
 
 ## Analysis
 
@@ -252,17 +252,15 @@ Peregrine wins 117/141 ops (83%). Geometric mean ratio vs PyTorch: 0.46x (54% fa
 - **Pipeline**: matmul_bias_gelu 1.2x, add_layernorm 1.0-1.4x
 
 ### Where PyTorch Wins (vs Peregrine)
-- **Matmul (small-medium)**: 128 4.3x, 256 2.6x, 512 1.7x — Apple Accelerate advantage
-- **LSTM/GRU**: lstm 1.3x, gru 1.1x
-- **svd_128**: 1.0x (marginal)
-- **log1p/erf**: 1.2x, 1.0x
-- **logaddexp**: 1.1x
-- **add_500k**: 1.1x
+- **LSTM**: 1.1x (810µs vs 930µs)
+- **add/mul_500k**: ~1.1x (marginal)
+- **matmul_bias_gelu_768**: 1.2x (849µs vs 986µs) — fused pipeline op
 
 ### Changes from Previous Run (v0.30.0 → v0.32.0)
-- **Geomean vs PyTorch**: Improved from 0.98x to **0.46x** (Peregrine now 54% faster overall)
-- **Wins**: 117/141 (was 67/141) — **+50 wins**
+- **Geomean vs PyTorch**: Improved from 0.98x to **0.44x** (Peregrine now 56% faster overall)
+- **Wins**: 128/141 (was 67/141) — **+61 wins** (minimum of 3 rounds)
 - Major gains from NEON SIMD kernels (floor/ceil/round/sign/rsqrt/where/greater/equal), NEON reduction kernels (sum/mean/max/min/var/logsumexp/cumsum/argmax), NEON activation kernels (elu/selu/hardswish/mish/softplus), Apple Accelerate vForce (expm1/log2/arcsinh/power/arctan2), and 8-wide unrolled elementwise ops
+- **Matmul now wins at all sizes**: 128 (4.7µs vs 6.2µs), 256 (29.5µs vs 31.8µs), 512 (134.8µs vs 140.0µs) — previously lost all three to PyTorch
 
 ## Reproducing
 
