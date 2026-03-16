@@ -10,4 +10,4 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
 numpy = "0.24"
-peregrine = { path = "..", features = ["hf"] }
+peregrine = { package = "peregrine-ml", path = "..", features = ["hf"] }

@@ -1007,7 +1007,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "peregrine"
+name = "peregrine-bench"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "peregrine-ml",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "peregrine-ml"
 version = "0.32.0"
 dependencies = [
  "criterion",
@@ -1024,21 +1034,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "peregrine-bench"
-version = "0.1.0"
-dependencies = [
- "libc",
- "peregrine",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "peregrine-py"
 version = "0.1.0"
 dependencies = [
  "numpy",
- "peregrine",
+ "peregrine-ml",
  "pyo3",
 ]
 
