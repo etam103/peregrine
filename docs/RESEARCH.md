@@ -66,7 +66,7 @@ M4 introduced ARM SME (Scalable Matrix Extension), a standardized version of AMX
 
 Investigated feasibility of adding an ANE compute backend to Peregrine.
 
-**Reference:** `~/Desktop/ANE/` — reverse-engineered private ANE APIs (Obj-C), demonstrates Stories110M training on ANE.
+**Reference:** Based on reverse-engineered private ANE APIs (Obj-C) demonstrating Stories110M training on ANE.
 
 ### What the ANE Offers
 

@@ -395,9 +395,9 @@ tests/
 
 ## Limitations
 
-This is a learning project, not a production framework.
+Known limitations:
 
-- Greedy Hungarian matching (not full O(n³) algorithm)
+- Greedy Hungarian matching in RT-DETR (not full O(n³) Kuhn-Munkres)
 - Attention forward pass breaks autograd graph (output projection still trains)
 - GPU training step is slower than CPU at batch=64 due to `dispatch_reduce` sync in `mean()`; larger batches would favor GPU
 
