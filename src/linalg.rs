@@ -53,11 +53,6 @@ extern "C" {
         a: *mut f32, lda: *const i32, b: *mut f32, ldb: *const i32,
         work: *mut f32, lwork: *const i32, info: *mut i32,
     );
-    fn sgetrs_(
-        trans: *const u8, n: *const i32, nrhs: *const i32, a: *const f32,
-        lda: *const i32, ipiv: *const i32, b: *mut f32, ldb: *const i32,
-        info: *mut i32,
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -118,30 +113,19 @@ pub fn solve(a: &Tensor, b: &Tensor) -> Tensor {
     let mut ipiv = vec![0i32; n as usize];
     let mut info = 0i32;
 
-    // Our data is row-major, LAPACK expects column-major.
-    // Row-major A looks like A^T to LAPACK. Instead of transposing,
-    // we factorize A^T with sgetrf_ then solve with trans='T' so
-    // LAPACK solves (A^T)^T x = A x = b — no transpose needed for A.
-    // For b with nrhs=1, a column vector is the same in both orderings.
+    // LAPACK uses column-major order
+    transpose_buf(&mut a_data, n as usize, n as usize);
     if nrhs > 1 {
         transpose_buf(&mut b_data, n as usize, nrhs as usize);
     }
 
     unsafe {
-        // LU factorize A^T (= row-major A passed directly)
-        sgetrf_(&n, &n, a_data.as_mut_ptr(), &n, ipiv.as_mut_ptr(), &mut info);
-    }
-    assert!(info == 0, "LAPACK sgetrf failed with info={}", info);
-
-    let trans = b'T';
-    unsafe {
-        // Solve (A^T)^T x = b, i.e. A x = b
-        sgetrs_(
-            &trans, &n, &nrhs, a_data.as_ptr(), &n,
-            ipiv.as_ptr(), b_data.as_mut_ptr(), &n, &mut info,
+        sgesv_(
+            &n, &nrhs, a_data.as_mut_ptr(), &n,
+            ipiv.as_mut_ptr(), b_data.as_mut_ptr(), &n, &mut info,
         );
     }
-    assert!(info == 0, "LAPACK sgetrs failed with info={}", info);
+    assert!(info == 0, "LAPACK sgesv failed with info={}", info);
 
     if nrhs > 1 {
         transpose_buf(&mut b_data, nrhs as usize, n as usize);
@@ -207,12 +191,17 @@ pub fn cholesky(a: &Tensor) -> Tensor {
     let shape = a.shape();
     assert!(shape.len() == 2 && shape[0] == shape[1], "cholesky requires square matrix");
     let n = shape[0] as i32;
+    let nu = n as usize;
 
     let mut data = a.data();
-    // Symmetric: A = A^T, so skip input transpose
-    // But use uplo='L' to tell LAPACK to read lower triangle of column-major = upper of row-major
+    // A is symmetric so row-major data = column-major data (A^T = A).
+    // Use uplo='U': LAPACK computes U in column-major upper triangle.
+    // Column-major upper triangle positions (j*n+i, i<=j) correspond to
+    // row-major lower triangle (row=j, col=i, col<=row), and the values
+    // are U[i][j] read as (row=j,col=i) = L[j][i] since L = U^T.
+    // Result: L already sits in the row-major lower triangle — no transpose needed.
 
-    let uplo = b'L';
+    let uplo = b'U';
     let mut info = 0i32;
 
     unsafe {
@@ -220,15 +209,13 @@ pub fn cholesky(a: &Tensor) -> Tensor {
     }
     assert!(info == 0, "LAPACK spotrf failed with info={} (matrix not positive definite?)", info);
 
-    // Zero upper triangle in column-major (= lower in row-major that LAPACK didn't touch)
-    for i in 0..n as usize {
-        for j in (i + 1)..n as usize {
-            data[j * n as usize + i] = 0.0;
+    // Zero upper triangle in row-major (positions i*n+j where j > i)
+    for i in 0..nu {
+        for j in (i + 1)..nu {
+            data[i * nu + j] = 0.0;
         }
     }
 
-    // Transpose result from column-major to row-major
-    transpose_buf(&mut data, n as usize, n as usize);
     Tensor::new(data, shape.to_vec(), false)
 }
 
