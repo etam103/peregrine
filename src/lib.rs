@@ -20,6 +20,7 @@ pub mod fft;
 pub mod linalg;
 pub mod transforms;
 pub mod rl;
+pub mod rlm;
 pub mod envs;
 pub mod attention;
 pub mod speculative;

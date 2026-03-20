@@ -112,3 +112,7 @@ path = "examples/sparse_bench.rs"
 [[example]]
 name = "huffman_bench"
 path = "examples/huffman_bench.rs"
+
+[[example]]
+name = "rlm"
+path = "examples/rlm/main.rs"

@@ -47,7 +47,8 @@ pip install ./peregrine-py && python -c "import peregrine"  # Python bindings
 | **`peregrine::sparse`** | 2:4 structured sparsity — prune to 2:4 pattern, nibble-packed indices, NEON sparse GEMM, Metal sparse matmul (scalar 16x16 + simdgroup 32x32), 1.78x bandwidth reduction |
 | **`peregrine::serial`** | Save/load model weights in compact binary format (f32, int8 quantized, and 2:4 sparse) |
 | **`peregrine::debug`** | Model summary, training health diagnostics, gradient monitoring |
-| **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
+| **`peregrine::rl`** | RL algorithms and infrastructure — PPO, DQN, REINFORCE, GRPO, RLOO, Dr. GRPO, DAPO, CISPO, DPPO, MaxRL, ScaleRL, replay buffers, rollout buffers, Environment/ReasoningEnv traits, action spaces |
+| **`peregrine::rlm`** | Recursive Language Models — `GenerativeLM` trait, `RlmOrchestrator` recursive execution engine, REPL context with peek/grep/partition-map/summarize actions, depth and token budget control |
 | **`peregrine::envs`** | 10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe |
 | **`peregrine::gguf`** | GGUF binary format parser — load quantized model weights (Q8_0, Q4_0, Q4_1, F16, F32), metadata extraction, dequantization |
 | **`peregrine::safetensors`** | Safetensors binary format parser — mmap-based loading on Unix, F32/F16/BF16 dequantization, handwritten JSON header parser |
@@ -62,6 +63,7 @@ pip install ./peregrine-py && python -c "import peregrine"  # Python bindings
 | **`examples/deepseek`** | DeepSeek-V3/R1 (671B MoE) inference — MLA, compressed KV cache, 256 routed experts, speculative decoding |
 | **`examples/llama`** | Llama 3.2 inference — GGUF/safetensors/HF Hub, streaming decode, sustained profiling, chunked prefill |
 | **`examples/rl_demo`** | RL training demos — PPO on CartPole, DQN on GridWorld, REINFORCE on Arithmetic, HTML visualizations |
+| **`examples/rlm`** | Recursive Language Model inference — Llama-backed `GenerativeLM`, recursive context decomposition with depth/token budget control |
 | **`examples/moba`** | MOBA 3v3 with LSTM PPO and self-play — train, selfplay, watch (HTML replay), video (MP4 export) |
 | **`peregrine::sched`** | Request scheduler — priority-based prefill/decode aggregation, chunked prefill, EMA latency tracking |
 | **`peregrine::thermal`** | Thermal monitoring via Darwin notifications — thermal-aware GPU/CPU scheduling |
@@ -187,24 +189,24 @@ CPU ops use Apple Accelerate BLAS and rayon parallelism. GPU ops use Metal compu
 
 | Operation | Peregrine | PyTorch | MLX | TensorFlow | tinygrad | JAX |
 |-----------|----------:|--------:|----:|-----------:|---------:|----:|
-| matmul 128x128 | **4.7** | 6.2 | 24.0 | 95.7 | 418.9 | 80.4 |
-| matmul 512x512 | **134.8** | 140.0 | 172.1 | 682.6 | 433.2 | 518.9 |
-| add 100k | **12.5** | 41.1 | 32.3 | 50.1 | 190.5 | 33.4 |
-| mul 100k | **12.5** | 39.0 | 32.0 | 40.7 | 192.3 | 28.4 |
-| relu 100k | **8.5** | 38.5 | 30.5 | 39.7 | 338.9 | 97.7 |
-| softmax 8x128 | **1.1** | 35.2 | 18.4 | 11.3 | 609.4 | 30.9 |
-| gelu 100k | **56.3** | 74.0 | 146.2 | 249.2 | 844.8 | 219.3 |
-| silu 100k | **47.0** | 68.8 | 89.8 | 226.0 | 370.4 | 78.6 |
-| erf 100k | **49.1** | 57.2 | 101.0 | 57.0 | — | 57.0 |
-| rfft 1k | **2.2** | 4.4 | 19.0 | 42.7 | — | 60.5 |
-| cross_entropy | **2.5** | 40.1 | 24.8 | 614.7 | 3622.5 | 56.7 |
-| train step 64 | **747** | 1255 | 810 | 8444 | 24421 | 5209 |
-| add+layernorm 196x768 | **72.0** | 101.0 | — | 1224.3 | 1137.2 | 259.0 |
-| cholesky 128x128 | **14.2** | 46.4 | 26.7 | 58.5 | — | 37.7 |
-| inv 64x64 | **15.2** | 26.6 | 47.4 | 32.8 | — | 45.4 |
-| solve 128x128 | **36.2** | 44.8 | 187.2 | 76.7 | — | 85.8 |
+| matmul 128x128 | **7.6** | 6.0 | 24.0 | 54.6 | 435.9 | 59.1 |
+| matmul 512x512 | **220.2** | 136.7 | 172.1 | 791.4 | 451.2 | 569.7 |
+| add 100k | **12.9** | 35.7 | 32.3 | 54.1 | 190.9 | 35.2 |
+| mul 100k | **12.8** | 44.0 | 32.0 | 45.1 | 192.8 | 36.6 |
+| relu 100k | **8.3** | 40.4 | 30.5 | 37.7 | 340.6 | 106.6 |
+| softmax 8x128 | **1.2** | 33.3 | 18.4 | 12.4 | 629.3 | 33.4 |
+| gelu 100k | **58.0** | 62.0 | 146.2 | 278.3 | 858.0 | 223.0 |
+| silu 100k | 54.8 | **51.6** | 89.8 | 255.9 | 334.1 | 59.8 |
+| erf 100k | 50.7 | **40.4** | 101.0 | 64.3 | — | 57.8 |
+| rfft 1k | **2.2** | 4.4 | 19.0 | 44.6 | — | 49.5 |
+| cross_entropy | **2.7** | 47.8 | 24.8 | 629.4 | 3436.6 | 58.2 |
+| train step 64 | **771** | 1334 | 810 | 10103 | 25538 | 5310 |
+| add+layernorm 196x768 | **83.9** | 109.7 | — | 1238.5 | 1207.3 | 252.4 |
+| cholesky 128x128 | **17.3** | 62.5 | 26.7 | 58.6 | — | 36.0 |
+| inv 64x64 | **17.1** | 26.5 | 47.4 | 32.5 | — | 44.0 |
+| solve 128x128 | **36.8** | 45.0 | 187.2 | 76.8 | — | 87.3 |
 
-Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.44x** (56% faster), **MLX 0.32x**, TensorFlow 0.24x, tinygrad 0.04x, JAX 0.29x. Peregrine wins 128 of 141 ops.
+Geometric mean ratio across 141 ops (lower = Peregrine faster): **PyTorch 0.47x** (53% faster), **MLX 0.34x**, TensorFlow 0.24x, tinygrad 0.05x, JAX 0.31x. Peregrine wins 116 of 141 ops.
 
 ### MUSt3R 3D Reconstruction (423M params, Apple Silicon)
 
@@ -248,7 +250,8 @@ src/
   thermal.rs      thermal monitoring via Darwin notifications — ThermalState, rate-limited polling, thread-local singleton
   models/
     llama/        Library-level Llama model (attention, decoder, model, tokenizer)
-  rl.rs           RL algorithms — PPO, DQN, REINFORCE, replay/rollout buffers, Environment trait (~1,750 lines)
+  rl.rs           RL algorithms — PPO, DQN, REINFORCE, GRPO, RLOO, Dr. GRPO, DAPO, CISPO, DPPO, MaxRL, ScaleRL, replay/rollout buffers, Environment trait
+  rlm.rs          Recursive Language Models — GenerativeLM trait, RlmOrchestrator, REPL context, 7 action types, recursive execution engine
   envs.rs         10 RL environments — CartPole, MountainCar, GridWorld, FrozenLake, BasicArithmetic, ChainArithmetic, NumberSorting, SequenceCompletion, PropositionalLogic, TicTacToe (~2,150 lines)
   metal/          Metal GPU backend (108 shaders, 41 dispatch methods, fused pipelines, causal masked SDPA with GQA, 2:4 sparse matmul, command batching, autograd, het scheduling, thermal-aware scheduling)
 peregrine-py/     Python bindings (PyO3 + maturin)

@@ -7,6 +7,39 @@ Benchmark numbers included for performance-related changes.
 
 ---
 
+## [Unreleased] - feat/rl
+
+### Added — RL for Reasoning LLMs + Recursive Language Models
+
+**8 new RL algorithms** (`src/rl.rs`) covering the full landscape of LLM-oriented policy optimization:
+
+| Algorithm | Key feature |
+|-----------|-------------|
+| **GRPO** | Group-relative baselines, no critic, sequence-level clipped surrogate + KL penalty |
+| **RLOO** | Leave-one-out baseline `(sum-r_i)/(G-1)`, no clipping, unbiased PG |
+| **Dr. GRPO** | Token-level loss with fixed normalization (divide by total tokens, not per-sequence) |
+| **DAPO** | Asymmetric clipping `[1-eps_lo, 1+eps_hi]`, dynamic sampling, overlong penalty |
+| **CISPO** | Stop-gradient on clipped ratio — gradients flow through log_prob only |
+| **DPPO** | Divergence penalty (KL/ReverseKL/JSD) replaces ratio clipping, reuses RolloutBuffer |
+| **MaxRL** | Truncated harmonic mixture of pass@k objectives for diversity |
+| **ScaleRL** | Async buffer with `add_rollouts()`, prompt-level aggregation, FP32 ratios |
+
+**Shared RL infrastructure**: `SequenceGroup`, `Completion` types for LLM rollouts, `group_relative_advantages()`, `token_level_loss()` helpers.
+
+**Recursive Language Models** (`src/rlm.rs`) — new inference strategy where an LM recursively decomposes unbounded context via a REPL environment (based on Zhang & Khattab, MIT):
+
+- `GenerativeLM` trait — text-in/text-out model interface
+- `RlmOrchestrator` — recursive execution engine with depth and token budget control
+- 7 actions: `RecursiveCall`, `Peek`, `Grep`, `PartitionMap`, `Summarize`, `Final`, `FinalVar`
+- Dependency-free tag parser (no regex crate)
+- `RlmConfig` with builder methods, `RlmError` with Display/Error traits
+
+**New example**: `examples/rlm/` — Llama-backed RLM CLI for recursive context processing.
+
+**Tests**: 37 new RL tests + 41 RLM tests (all passing).
+
+---
+
 ## [0.32.0] - 2026-03-14
 
 ### Added — NEON + Accelerate performance blitz: 67→100 wins, 0.54x vs PyTorch
