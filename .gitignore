@@ -23,8 +23,8 @@ __pycache__/
 *.aux
 *.log
 *.out
-paper*.pdf
 paper*.tex
+!paper.pdf
 missfont.log
 
 # Internal notes
