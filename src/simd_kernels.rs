@@ -456,37 +456,61 @@ pub fn vec_gelu_f32(a: &[f32], out: &mut [f32]) {
         let vq7 = vdupq_n_f32(Q7);
         let vq8 = vdupq_n_f32(Q8);
 
-        let chunks2 = chunks / 2;
-        for i in 0..chunks2 {
-            let off = i * 8;
+        let chunks4 = chunks / 4;
+        for i in 0..chunks4 {
+            let off = i * 16;
             let vx0 = vld1q_f32(a.as_ptr().add(off));
             let vx1 = vld1q_f32(a.as_ptr().add(off + 4));
+            let vx2 = vld1q_f32(a.as_ptr().add(off + 8));
+            let vx3 = vld1q_f32(a.as_ptr().add(off + 12));
             let x2_0 = vmulq_f32(vx0, vx0);
             let x2_1 = vmulq_f32(vx1, vx1);
+            let x2_2 = vmulq_f32(vx2, vx2);
+            let x2_3 = vmulq_f32(vx3, vx3);
             let q0 = vmlaq_f32(vq7, vq8, x2_0);
             let q1 = vmlaq_f32(vq7, vq8, x2_1);
+            let q2 = vmlaq_f32(vq7, vq8, x2_2);
+            let q3 = vmlaq_f32(vq7, vq8, x2_3);
             let q0 = vmlaq_f32(vq6, q0, x2_0);
             let q1 = vmlaq_f32(vq6, q1, x2_1);
+            let q2 = vmlaq_f32(vq6, q2, x2_2);
+            let q3 = vmlaq_f32(vq6, q3, x2_3);
             let q0 = vmlaq_f32(vq5, q0, x2_0);
             let q1 = vmlaq_f32(vq5, q1, x2_1);
+            let q2 = vmlaq_f32(vq5, q2, x2_2);
+            let q3 = vmlaq_f32(vq5, q3, x2_3);
             let q0 = vmlaq_f32(vq4, q0, x2_0);
             let q1 = vmlaq_f32(vq4, q1, x2_1);
+            let q2 = vmlaq_f32(vq4, q2, x2_2);
+            let q3 = vmlaq_f32(vq4, q3, x2_3);
             let q0 = vmlaq_f32(vq3, q0, x2_0);
             let q1 = vmlaq_f32(vq3, q1, x2_1);
+            let q2 = vmlaq_f32(vq3, q2, x2_2);
+            let q3 = vmlaq_f32(vq3, q3, x2_3);
             let q0 = vmlaq_f32(vq2, q0, x2_0);
             let q1 = vmlaq_f32(vq2, q1, x2_1);
+            let q2 = vmlaq_f32(vq2, q2, x2_2);
+            let q3 = vmlaq_f32(vq2, q3, x2_3);
             let q0 = vmlaq_f32(vq1, q0, x2_0);
             let q1 = vmlaq_f32(vq1, q1, x2_1);
+            let q2 = vmlaq_f32(vq1, q2, x2_2);
+            let q3 = vmlaq_f32(vq1, q3, x2_3);
             let q0 = vmlaq_f32(vq0, q0, x2_0);
             let q1 = vmlaq_f32(vq0, q1, x2_1);
-            let inner0 = vmaxq_f32(zero, vminq_f32(one, vaddq_f32(vhalf, vmulq_f32(vx0, q0))));
-            let inner1 = vmaxq_f32(zero, vminq_f32(one, vaddq_f32(vhalf, vmulq_f32(vx1, q1))));
-            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vx0, inner0));
-            vst1q_f32(out.as_mut_ptr().add(off + 4), vmulq_f32(vx1, inner1));
+            let q2 = vmlaq_f32(vq0, q2, x2_2);
+            let q3 = vmlaq_f32(vq0, q3, x2_3);
+            let i0 = vmaxq_f32(zero, vminq_f32(one, vaddq_f32(vhalf, vmulq_f32(vx0, q0))));
+            let i1 = vmaxq_f32(zero, vminq_f32(one, vaddq_f32(vhalf, vmulq_f32(vx1, q1))));
+            let i2 = vmaxq_f32(zero, vminq_f32(one, vaddq_f32(vhalf, vmulq_f32(vx2, q2))));
+            let i3 = vmaxq_f32(zero, vminq_f32(one, vaddq_f32(vhalf, vmulq_f32(vx3, q3))));
+            vst1q_f32(out.as_mut_ptr().add(off), vmulq_f32(vx0, i0));
+            vst1q_f32(out.as_mut_ptr().add(off + 4), vmulq_f32(vx1, i1));
+            vst1q_f32(out.as_mut_ptr().add(off + 8), vmulq_f32(vx2, i2));
+            vst1q_f32(out.as_mut_ptr().add(off + 12), vmulq_f32(vx3, i3));
         }
-        // Handle remaining chunk of 4
-        if chunks2 * 2 < chunks {
-            let off = chunks2 * 8;
+        // Handle remaining chunks of 4
+        for i in (chunks4 * 4)..chunks {
+            let off = i * 4;
             let vx = vld1q_f32(a.as_ptr().add(off));
             let x2 = vmulq_f32(vx, vx);
             let q = vmlaq_f32(vq7, vq8, x2);
@@ -1490,36 +1514,56 @@ pub fn vec_erf_f32(a: &[f32], out: &mut [f32]) {
         let vc7 = vdupq_n_f32(C7);
         let vc8 = vdupq_n_f32(C8);
 
-        let chunks2 = chunks / 2;
-        for i in 0..chunks2 {
-            let off = i * 8;
+        let chunks4 = chunks / 4;
+        for i in 0..chunks4 {
+            let off = i * 16;
             let vx0 = vld1q_f32(a.as_ptr().add(off));
             let vx1 = vld1q_f32(a.as_ptr().add(off + 4));
+            let vx2 = vld1q_f32(a.as_ptr().add(off + 8));
+            let vx3 = vld1q_f32(a.as_ptr().add(off + 12));
             let x2_0 = vmulq_f32(vx0, vx0);
             let x2_1 = vmulq_f32(vx1, vx1);
+            let x2_2 = vmulq_f32(vx2, vx2);
+            let x2_3 = vmulq_f32(vx3, vx3);
             let p0 = vmlaq_f32(vc7, vc8, x2_0);
             let p1 = vmlaq_f32(vc7, vc8, x2_1);
+            let p2 = vmlaq_f32(vc7, vc8, x2_2);
+            let p3 = vmlaq_f32(vc7, vc8, x2_3);
             let p0 = vmlaq_f32(vc6, p0, x2_0);
             let p1 = vmlaq_f32(vc6, p1, x2_1);
+            let p2 = vmlaq_f32(vc6, p2, x2_2);
+            let p3 = vmlaq_f32(vc6, p3, x2_3);
             let p0 = vmlaq_f32(vc5, p0, x2_0);
             let p1 = vmlaq_f32(vc5, p1, x2_1);
+            let p2 = vmlaq_f32(vc5, p2, x2_2);
+            let p3 = vmlaq_f32(vc5, p3, x2_3);
             let p0 = vmlaq_f32(vc4, p0, x2_0);
             let p1 = vmlaq_f32(vc4, p1, x2_1);
+            let p2 = vmlaq_f32(vc4, p2, x2_2);
+            let p3 = vmlaq_f32(vc4, p3, x2_3);
             let p0 = vmlaq_f32(vc3, p0, x2_0);
             let p1 = vmlaq_f32(vc3, p1, x2_1);
+            let p2 = vmlaq_f32(vc3, p2, x2_2);
+            let p3 = vmlaq_f32(vc3, p3, x2_3);
             let p0 = vmlaq_f32(vc2, p0, x2_0);
             let p1 = vmlaq_f32(vc2, p1, x2_1);
+            let p2 = vmlaq_f32(vc2, p2, x2_2);
+            let p3 = vmlaq_f32(vc2, p3, x2_3);
             let p0 = vmlaq_f32(vc1, p0, x2_0);
             let p1 = vmlaq_f32(vc1, p1, x2_1);
+            let p2 = vmlaq_f32(vc1, p2, x2_2);
+            let p3 = vmlaq_f32(vc1, p3, x2_3);
             let p0 = vmlaq_f32(vc0, p0, x2_0);
             let p1 = vmlaq_f32(vc0, p1, x2_1);
-            let y0 = vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vx0, p0)));
-            let y1 = vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vx1, p1)));
-            vst1q_f32(out.as_mut_ptr().add(off), y0);
-            vst1q_f32(out.as_mut_ptr().add(off + 4), y1);
+            let p2 = vmlaq_f32(vc0, p2, x2_2);
+            let p3 = vmlaq_f32(vc0, p3, x2_3);
+            vst1q_f32(out.as_mut_ptr().add(off), vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vx0, p0))));
+            vst1q_f32(out.as_mut_ptr().add(off + 4), vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vx1, p1))));
+            vst1q_f32(out.as_mut_ptr().add(off + 8), vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vx2, p2))));
+            vst1q_f32(out.as_mut_ptr().add(off + 12), vmaxq_f32(neg_one, vminq_f32(one, vmulq_f32(vx3, p3))));
         }
-        if chunks2 * 2 < chunks {
-            let off = chunks2 * 8;
+        for i in (chunks4 * 4)..chunks {
+            let off = i * 4;
             let vx = vld1q_f32(a.as_ptr().add(off));
             let x2 = vmulq_f32(vx, vx);
             let p = vmlaq_f32(vc7, vc8, x2);
@@ -1633,22 +1677,24 @@ pub fn vec_where_f32(cond: &[f32], x: &[f32], y: &[f32], out: &mut [f32]) {
 pub fn vec_sum_axis(data: &[f32], out: &mut [f32], outer_size: usize, reduce_size: usize, inner_size: usize) {
     let stride = reduce_size * inner_size;
     if inner_size == 1 {
-        // Reducing last axis: vectorize along reduce_size
+        // Reducing last axis: f64 upcast accumulation for precision
         let chunks = reduce_size / 4;
         for o in 0..outer_size {
             let base = o * stride;
-            let mut acc = 0.0f32;
             unsafe {
-                let mut vacc = vdupq_n_f32(0.0);
+                let mut acc_lo = vdupq_n_f64(0.0);
+                let mut acc_hi = vdupq_n_f64(0.0);
                 for c in 0..chunks {
-                    vacc = vaddq_f32(vacc, vld1q_f32(data.as_ptr().add(base + c * 4)));
+                    let v = vld1q_f32(data.as_ptr().add(base + c * 4));
+                    acc_lo = vaddq_f64(acc_lo, vcvt_f64_f32(vget_low_f32(v)));
+                    acc_hi = vaddq_f64(acc_hi, vcvt_f64_f32(vget_high_f32(v)));
                 }
-                acc = vaddvq_f32(vacc);
+                let mut acc = vaddvq_f64(vaddq_f64(acc_lo, acc_hi)) as f32;
+                for r in (chunks * 4)..reduce_size {
+                    acc += data[base + r];
+                }
+                out[o] = acc;
             }
-            for r in (chunks * 4)..reduce_size {
-                acc += data[base + r];
-            }
-            out[o] = acc;
         }
     } else {
         for o in 0..outer_size {

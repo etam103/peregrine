@@ -5,6 +5,10 @@
 /// KV cache for autoregressive generation.
 /// Layout: k/v are [num_kv_heads, capacity, head_dim] contiguous, with `len` tracking
 /// actual used tokens. Pre-allocates capacity to avoid per-token reallocation.
+/// 16-float (64-byte) padding between head slices to break L1 cache set aliasing
+/// when K and V are accessed in alternation.
+const KV_CACHE_PAD: usize = 16;
+
 pub struct StandardKVCache {
     pub k: Vec<f32>,
     pub v: Vec<f32>,
@@ -39,15 +43,15 @@ impl StandardKVCache {
         let old_cap = self.capacity;
         let old_len = self.len;
 
-        let total = nkv * new_cap * hd;
+        let total = nkv * (new_cap * hd + KV_CACHE_PAD);
         let mut new_k = vec![0.0f32; total];
         let mut new_v = vec![0.0f32; total];
 
         // Copy existing data from [heads, old_cap, hd] to [heads, new_cap, hd]
         if old_len > 0 {
             for h in 0..nkv {
-                let src_base = h * old_cap * hd;
-                let dst_base = h * new_cap * hd;
+                let src_base = h * (old_cap * hd + KV_CACHE_PAD);
+                let dst_base = h * (new_cap * hd + KV_CACHE_PAD);
                 let copy_bytes = old_len * hd;
                 new_k[dst_base..dst_base + copy_bytes]
                     .copy_from_slice(&self.k[src_base..src_base + copy_bytes]);
@@ -71,7 +75,7 @@ impl StandardKVCache {
         let old_len = self.len;
 
         for h in 0..self.num_kv_heads {
-            let dst_base = h * cap * hd + old_len * hd;
+            let dst_base = h * (cap * hd + KV_CACHE_PAD) + old_len * hd;
             let src_base = h * seq_len * hd;
             self.k[dst_base..dst_base + seq_len * hd]
                 .copy_from_slice(&new_k[src_base..src_base + seq_len * hd]);
@@ -94,7 +98,7 @@ impl StandardKVCache {
     /// This is needed because the buffer may have capacity > len.
     #[inline]
     pub fn head_stride(&self) -> usize {
-        self.capacity * self.head_dim
+        self.capacity * self.head_dim + KV_CACHE_PAD
     }
 }
 

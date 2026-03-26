@@ -511,13 +511,18 @@ kernel void softmax_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float row_max = shared[0];
 
-    // 2. Compute exp(x - max) and sum using simdgroup reduction
+    // 2. Compute exp(x - max) and sum using Neumaier + simdgroup reduction
     float local_sum = 0.0f;
+    float local_comp = 0.0f;
     for (uint i = lid; i < p.dim; i += group_size) {
         float e = exp(row_in[i] - row_max);
         row_out[i] = e;
-        local_sum += e;
+        float t = local_sum + e;
+        float va = t - local_sum;
+        local_comp += (local_sum - (t - va)) + (e - va);
+        local_sum = t;
     }
+    local_sum += local_comp;
     float simd_s = simd_sum(local_sum);
     if (simd_lid == 0) shared[simd_gid] = simd_s;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -668,11 +673,17 @@ kernel void layernorm_f32(
     threadgroup float shared[32];
     uint num_simdgroups = (group_size + 31) / 32;
 
-    // 1. Compute mean using simdgroup reduction
+    // 1. Compute mean using Neumaier + simdgroup reduction
     float local_sum = 0.0f;
+    float local_comp = 0.0f;
     for (uint i = lid; i < p.dim; i += group_size) {
-        local_sum += row_in[i];
+        float val = row_in[i];
+        float t = local_sum + val;
+        float va = t - local_sum;
+        local_comp += (local_sum - (t - va)) + (val - va);
+        local_sum = t;
     }
+    local_sum += local_comp;
     float simd_s = simd_sum(local_sum);
     if (simd_lid == 0) shared[simd_gid] = simd_s;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -684,12 +695,18 @@ kernel void layernorm_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float mean = shared[0] / float(p.dim);
 
-    // 2. Compute variance using simdgroup reduction
+    // 2. Compute variance using Neumaier + simdgroup reduction
     float local_var = 0.0f;
+    float var_comp = 0.0f;
     for (uint i = lid; i < p.dim; i += group_size) {
         float diff = row_in[i] - mean;
-        local_var += diff * diff;
+        float val = diff * diff;
+        float t = local_var + val;
+        float va = t - local_var;
+        var_comp += (local_var - (t - va)) + (val - va);
+        local_var = t;
     }
+    local_var += var_comp;
     simd_s = simd_sum(local_var);
     if (simd_lid == 0) shared[simd_gid] = simd_s;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -816,11 +833,17 @@ kernel void softmax_backward_f32(
     threadgroup float shared[32];
     uint num_simdgroups = (group_size + 31) / 32;
 
-    // Compute dot(grad, y) using simdgroup reduction
+    // Compute dot(grad, y) using Neumaier + simdgroup reduction
     float local_dot = 0.0f;
+    float dot_comp = 0.0f;
     for (uint i = lid; i < p.dim; i += group_size) {
-        local_dot += g[i] * y[i];
+        float val = g[i] * y[i];
+        float t = local_dot + val;
+        float va = t - local_dot;
+        dot_comp += (local_dot - (t - va)) + (val - va);
+        local_dot = t;
     }
+    local_dot += dot_comp;
     float simd_d = simd_sum(local_dot);
     if (simd_lid == 0) shared[simd_gid] = simd_d;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -871,15 +894,28 @@ kernel void layernorm_backward_f32(
 
     // Accumulate grad_gamma, grad_beta and compute mean_dy, mean_dy_xhat
     float local_dy = 0.0f;
+    float dy_comp = 0.0f;
     float local_dy_xhat = 0.0f;
+    float dy_xhat_comp = 0.0f;
     for (uint i = lid; i < p.dim; i += group_size) {
         uint idx = offset + i;
         float g = grad_out[idx];
         float xhat = normalized[idx];
         float dy = g * gamma[i];
-        local_dy += dy;
-        local_dy_xhat += dy * xhat;
+        // Neumaier for local_dy
+        float t1 = local_dy + dy;
+        float va1 = t1 - local_dy;
+        dy_comp += (local_dy - (t1 - va1)) + (dy - va1);
+        local_dy = t1;
+        // Neumaier for local_dy_xhat
+        float val2 = dy * xhat;
+        float t2 = local_dy_xhat + val2;
+        float va2 = t2 - local_dy_xhat;
+        dy_xhat_comp += (local_dy_xhat - (t2 - va2)) + (val2 - va2);
+        local_dy_xhat = t2;
     }
+    local_dy += dy_comp;
+    local_dy_xhat += dy_xhat_comp;
 
     // Reduce mean_dy using simdgroup reduction
     float ss = simd_sum(local_dy);
@@ -1016,11 +1052,17 @@ kernel void log_softmax_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float row_max = shared[0];
 
-    // 2. Compute sum(exp(x - max)) using simdgroup reduction
+    // 2. Compute sum(exp(x - max)) using Neumaier + simdgroup reduction
     float local_sum = 0.0f;
+    float local_comp = 0.0f;
     for (uint i = lid; i < p.dim; i += group_size) {
-        local_sum += exp(row_in[i] - row_max);
+        float e = exp(row_in[i] - row_max);
+        float t = local_sum + e;
+        float va = t - local_sum;
+        local_comp += (local_sum - (t - va)) + (e - va);
+        local_sum = t;
     }
+    local_sum += local_comp;
     float ss = simd_sum(local_sum);
     if (simd_lid == 0) shared[simd_gid] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1061,11 +1103,17 @@ kernel void log_softmax_backward_f32(
     threadgroup float shared[32];
     uint num_simdgroups = (group_size + 31) / 32;
 
-    // Compute sum(grad) using simdgroup reduction
+    // Compute sum(grad) using Neumaier + simdgroup reduction
     float local_sum = 0.0f;
+    float local_comp = 0.0f;
     for (uint i = lid; i < p.dim; i += group_size) {
-        local_sum += g[i];
+        float val = g[i];
+        float t = local_sum + val;
+        float va = t - local_sum;
+        local_comp += (local_sum - (t - va)) + (val - va);
+        local_sum = t;
     }
+    local_sum += local_comp;
     float ss = simd_sum(local_sum);
     if (simd_lid == 0) shared[simd_gid] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1539,10 +1587,15 @@ kernel void sum_axis_f32(
     uint outer = idx / p.inner_size;
     uint inner = idx % p.inner_size;
     float acc = 0.0f;
+    float comp = 0.0f;
     for (uint r = 0; r < p.reduce_size; r++) {
-        acc += input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+        float val = input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+        float t = acc + val;
+        float va = t - acc;
+        comp += (acc - (t - va)) + (val - va);
+        acc = t;
     }
-    output[idx] = acc;
+    output[idx] = acc + comp;
 }
 
 // Mean along axis
@@ -1556,10 +1609,15 @@ kernel void mean_axis_f32(
     uint outer = idx / p.inner_size;
     uint inner = idx % p.inner_size;
     float acc = 0.0f;
+    float comp = 0.0f;
     for (uint r = 0; r < p.reduce_size; r++) {
-        acc += input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+        float val = input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+        float t = acc + val;
+        float va = t - acc;
+        comp += (acc - (t - va)) + (val - va);
+        acc = t;
     }
-    output[idx] = acc / float(p.reduce_size);
+    output[idx] = (acc + comp) / float(p.reduce_size);
 }
 
 // Max along axis
@@ -1710,10 +1768,15 @@ kernel void logsumexp_axis_f32(
         mx = max(mx, input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner]);
     }
     float acc = 0.0f;
+    float comp = 0.0f;
     for (uint r = 0; r < p.reduce_size; r++) {
-        acc += exp(input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner] - mx);
+        float val = exp(input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner] - mx);
+        float t = acc + val;
+        float va = t - acc;
+        comp += (acc - (t - va)) + (val - va);
+        acc = t;
     }
-    output[idx] = mx + log(acc);
+    output[idx] = mx + log(acc + comp);
 }
 
 // Variance along axis
@@ -1733,19 +1796,29 @@ kernel void var_axis_f32(
     if (idx >= p.outer_size * p.inner_size) return;
     uint outer = idx / p.inner_size;
     uint inner = idx % p.inner_size;
-    // Compute mean
+    // Compute mean with Neumaier summation
     float sum = 0.0f;
+    float sum_comp = 0.0f;
     for (uint r = 0; r < p.reduce_size; r++) {
-        sum += input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+        float val = input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner];
+        float t = sum + val;
+        float va = t - sum;
+        sum_comp += (sum - (t - va)) + (val - va);
+        sum = t;
     }
-    float mean = sum / float(p.reduce_size);
-    // Compute variance
+    float mean = (sum + sum_comp) / float(p.reduce_size);
+    // Compute variance with Neumaier summation
     float var_acc = 0.0f;
+    float var_comp = 0.0f;
     for (uint r = 0; r < p.reduce_size; r++) {
         float diff = input[outer * p.reduce_size * p.inner_size + r * p.inner_size + inner] - mean;
-        var_acc += diff * diff;
+        float val = diff * diff;
+        float t = var_acc + val;
+        float va = t - var_acc;
+        var_comp += (var_acc - (t - va)) + (val - va);
+        var_acc = t;
     }
-    output[idx] = var_acc / float(p.reduce_size - p.ddof);
+    output[idx] = (var_acc + var_comp) / float(p.reduce_size - p.ddof);
 }
 
 // ---------------------------------------------------------------------------

@@ -151,13 +151,16 @@ pub fn softmax_rows_inplace(data: &mut [f32], offset: usize, rows: usize, cols: 
             let n = cols as i32;
             unsafe { vvexpf(mptr, mptr as *const f32, &n) };
 
-            // NEON sum-reduction
-            let mut sum_vec = unsafe { vdupq_n_f32(0.0) };
+            // F64 upcast sum-reduction for precision
+            let mut acc_lo = unsafe { vdupq_n_f64(0.0) };
+            let mut acc_hi = unsafe { vdupq_n_f64(0.0) };
             for i in 0..chunks {
                 let v = unsafe { vld1q_f32(mptr.add(i * 4)) };
-                sum_vec = unsafe { vaddq_f32(sum_vec, v) };
+                acc_lo = unsafe { vaddq_f64(acc_lo, vcvt_f64_f32(vget_low_f32(v))) };
+                acc_hi = unsafe { vaddq_f64(acc_hi, vcvt_f64_f32(vget_high_f32(v))) };
             }
-            let mut sum = unsafe { vaddvq_f32(sum_vec) };
+            let sum_f64 = unsafe { vaddvq_f64(vaddq_f64(acc_lo, acc_hi)) };
+            let mut sum = sum_f64 as f32;
             for i in (chunks * 4)..cols {
                 sum += row[i];
             }
@@ -3041,28 +3044,37 @@ impl Tensor {
                 let norm_out = &mut normalized[offset..offset + n];
                 let data_out = &mut data[offset..offset + n];
 
-                // Single-pass: accumulate sum and sum-of-squares via NEON
-                let mut vsum = unsafe { vdupq_n_f32(0.0) };
-                let mut vsum2 = unsafe { vdupq_n_f32(0.0) };
+                // Single-pass: accumulate sum and sum-of-squares via f64 upcast
+                let mut sum_lo = unsafe { vdupq_n_f64(0.0) };
+                let mut sum_hi = unsafe { vdupq_n_f64(0.0) };
+                let mut sum2_lo = unsafe { vdupq_n_f64(0.0) };
+                let mut sum2_hi = unsafe { vdupq_n_f64(0.0) };
                 unsafe {
                     for c in 0..chunks {
                         let off = c * 4;
                         let v = vld1q_f32(slice.as_ptr().add(off));
-                        vsum = vaddq_f32(vsum, v);
-                        vsum2 = vfmaq_f32(vsum2, v, v); // sum2 += v * v
+                        let lo = vcvt_f64_f32(vget_low_f32(v));
+                        let hi = vcvt_f64_f32(vget_high_f32(v));
+                        sum_lo = vaddq_f64(sum_lo, lo);
+                        sum_hi = vaddq_f64(sum_hi, hi);
+                        sum2_lo = vfmaq_f64(sum2_lo, lo, lo);
+                        sum2_hi = vfmaq_f64(sum2_hi, hi, hi);
                     }
                 }
-                let mut sum_val: f32 = unsafe { vaddvq_f32(vsum) };
-                let mut sum2_val: f32 = unsafe { vaddvq_f32(vsum2) };
+                let mut sum_val = unsafe { vaddvq_f64(vaddq_f64(sum_lo, sum_hi)) };
+                let mut sum2_val = unsafe { vaddvq_f64(vaddq_f64(sum2_lo, sum2_hi)) };
                 for j in tail..n {
-                    sum_val += slice[j];
-                    sum2_val += slice[j] * slice[j];
+                    sum_val += slice[j] as f64;
+                    sum2_val += (slice[j] as f64) * (slice[j] as f64);
                 }
 
-                let mean = sum_val / n_f32;
-                // var = E[x^2] - E[x]^2
-                let var = sum2_val / n_f32 - mean * mean;
-                let istd = 1.0 / (var + eps).sqrt();
+                let n_f64 = n as f64;
+                let mean_f64 = sum_val / n_f64;
+                // var = E[x^2] - E[x]^2 (computed in f64 to avoid catastrophic cancellation)
+                let var_f64 = sum2_val / n_f64 - mean_f64 * mean_f64;
+                let mean = mean_f64 as f32;
+                let var = var_f64 as f32;
+                let istd = 1.0f32 / (var + eps).sqrt();
                 inv_std[inst] = istd;
 
                 // Fused normalize + scale + shift pass via NEON
@@ -3096,9 +3108,10 @@ impl Tensor {
                 let offset = inst * normalized_shape;
                 let slice = &inner.data[offset..offset + normalized_shape];
 
-                let mean: f32 = slice.iter().sum::<f32>() / normalized_shape as f32;
-                let var: f32 = slice.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>()
-                    / normalized_shape as f32;
+                let sum_f64: f64 = slice.iter().map(|&x| x as f64).sum::<f64>();
+                let mean = (sum_f64 / normalized_shape as f64) as f32;
+                let var: f32 = (slice.iter().map(|&x| { let d = (x - mean) as f64; d * d }).sum::<f64>()
+                    / normalized_shape as f64) as f32;
                 let istd = 1.0 / (var + eps).sqrt();
                 inv_std[inst] = istd;
 
@@ -3484,38 +3497,32 @@ impl Tensor {
                 use std::arch::aarch64::*;
                 let n_i32 = len as i32;
                 unsafe {
-                    // Pass 1: NEON compute max and exp(-|a-b|)
+                    // Pass 1: NEON compute exp(-|a-b|) into data
                     let chunks = len / 4;
-                    let mut max_buf = pool_get(len);
                     for c in 0..chunks {
                         let off = c * 4;
                         let va = vld1q_f32(a.data.as_ptr().add(off));
                         let vb = vld1q_f32(b.data.as_ptr().add(off));
-                        let vmax = vmaxq_f32(va, vb);
                         let neg_abs_diff = vnegq_f32(vabsq_f32(vsubq_f32(va, vb)));
-                        let exp_val = simd_kernels::fast_exp_f32x4(neg_abs_diff);
-                        vst1q_f32(max_buf.as_mut_ptr().add(off), vmax);
-                        vst1q_f32(data.as_mut_ptr().add(off), exp_val);
+                        vst1q_f32(data.as_mut_ptr().add(off), simd_kernels::fast_exp_f32x4(neg_abs_diff));
                     }
                     for i in (chunks * 4)..len {
-                        max_buf[i] = a.data[i].max(b.data[i]);
                         data[i] = (-(a.data[i] - b.data[i]).abs()).exp();
                     }
-                    // Pass 2: vvlog1pf (Apple optimized)
+                    // Pass 2: vvlog1pf in-place
                     vvlog1pf(data.as_mut_ptr(), data.as_ptr(), &n_i32);
-                    // Pass 3: add max
+                    // Pass 3: add max(a,b) — recompute max from originals (avoids temp buffer)
                     for c in 0..chunks {
                         let off = c * 4;
-                        let result = vaddq_f32(
-                            vld1q_f32(data.as_ptr().add(off)),
-                            vld1q_f32(max_buf.as_ptr().add(off))
+                        let vmax = vmaxq_f32(
+                            vld1q_f32(a.data.as_ptr().add(off)),
+                            vld1q_f32(b.data.as_ptr().add(off))
                         );
-                        vst1q_f32(data.as_mut_ptr().add(off), result);
+                        vst1q_f32(data.as_mut_ptr().add(off), vaddq_f32(vld1q_f32(data.as_ptr().add(off)), vmax));
                     }
                     for i in (chunks * 4)..len {
-                        data[i] += max_buf[i];
+                        data[i] += a.data[i].max(b.data[i]);
                     }
-                    pool_recycle(max_buf);
                 }
             }
             #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -4130,8 +4137,7 @@ impl Tensor {
                     for i in 0..src.len() { dst[i] = src[i].exp(); }
                 });
             Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
-        } else if len >= 100_000 {
-            // Medium arrays: single-threaded vvexpf on macOS (better cache behavior)
+        } else {
             let mut data = pool_get(len);
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             {
@@ -4139,13 +4145,6 @@ impl Tensor {
                 unsafe { vvexpf(data.as_mut_ptr(), inner.data.as_ptr(), &n); }
             }
             #[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
-            simd_kernels::vec_exp_f32(&inner.data, &mut data);
-            #[cfg(not(target_arch = "aarch64"))]
-            for i in 0..len { data[i] = inner.data[i].exp(); }
-            Tensor::from_op(data, inner.shape.clone(), Op::Exp(self.clone()))
-        } else {
-            let mut data = pool_get(len);
-            #[cfg(target_arch = "aarch64")]
             simd_kernels::vec_exp_f32(&inner.data, &mut data);
             #[cfg(not(target_arch = "aarch64"))]
             for i in 0..len { data[i] = inner.data[i].exp(); }
@@ -4643,7 +4642,17 @@ impl Tensor {
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_EXPENSIVE {
-            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.log10()).collect();
+            use rayon::prelude::*;
+            let mut data = pool_get(len);
+            let chunk = 75_000;
+            inner.data.par_chunks(chunk)
+                .zip(data.par_chunks_mut(chunk))
+                .for_each(|(src, dst)| {
+                    #[cfg(target_os = "macos")]
+                    { let n = src.len() as i32; unsafe { vvlog10f(dst.as_mut_ptr(), src.as_ptr(), &n); } }
+                    #[cfg(not(target_os = "macos"))]
+                    for i in 0..src.len() { dst[i] = src[i].log10(); }
+                });
             Tensor::from_op(data, inner.shape.clone(), Op::Log10(self.clone()))
         } else {
             let mut data = pool_get(len);
@@ -4676,7 +4685,17 @@ impl Tensor {
         let inner = self.0.borrow();
         let len = inner.data.len();
         if len >= PAR_THRESHOLD_EXPENSIVE {
-            let data: Vec<f32> = inner.data.par_iter().map(|&x| x.ln_1p()).collect();
+            use rayon::prelude::*;
+            let mut data = pool_get(len);
+            let chunk = 75_000;
+            inner.data.par_chunks(chunk)
+                .zip(data.par_chunks_mut(chunk))
+                .for_each(|(src, dst)| {
+                    #[cfg(target_os = "macos")]
+                    { let n = src.len() as i32; unsafe { vvlog1pf(dst.as_mut_ptr(), src.as_ptr(), &n); } }
+                    #[cfg(not(target_os = "macos"))]
+                    for i in 0..src.len() { dst[i] = src[i].ln_1p(); }
+                });
             Tensor::from_op(data, inner.shape.clone(), Op::Log1p(self.clone()))
         } else {
             let mut data = pool_get(len);
